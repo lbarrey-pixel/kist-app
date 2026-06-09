@@ -149,6 +149,9 @@ export default function App() {
       .then(r => r.json()).then(setStats).catch(() => {});
     fetch(`${API}/proxima-proposta`, { headers: { Authorization: `Bearer ${token}` } })
       .then(r => r.json()).then(d => { if (d.proximo) setNumeroProposta(d.proximo); }).catch(() => {});
+    // Keep-alive: pinga o backend a cada 9 minutos para evitar cold start
+    const keepAlive = setInterval(() => fetch(`${API}/ping`).catch(() => {}), 9 * 60 * 1000);
+    return () => clearInterval(keepAlive);
   }, [token]);
 
   function handleGoogleResponse(response) {

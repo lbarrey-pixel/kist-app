@@ -27,27 +27,47 @@ USUARIOS_PERMITIDOS = set(os.environ.get("USUARIOS_PERMITIDOS", "leonardobarrey@
 
 security = HTTPBearer()
 
+# Cache de tokens verificados (evita chamada ao Google a cada request)
+_token_cache: dict = {}
+
 def verificar_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
+    # Usar cache para evitar chamada HTTP ao Google a cada request
+    if token in _token_cache:
+        return _token_cache[token]
     try:
         info = id_token.verify_oauth2_token(token, google_requests.Request(), GOOGLE_CLIENT_ID)
         email = info.get("email", "").lower()
         if email not in USUARIOS_PERMITIDOS:
             raise HTTPException(status_code=403, detail=f"Acesso negado para {email}")
+        # Cache por 55 minutos (token Google dura 1h)
+        _token_cache[token] = email
+        # Limpar cache antigo se crescer demais
+        if len(_token_cache) > 100:
+            _token_cache.clear()
         return email
     except ValueError as e:
         raise HTTPException(status_code=401, detail=f"Token inválido: {str(e)}")
 
-# ── Clientes ──────────────────────────────────────────────────────────────────
+# ── Clientes singleton (criados uma vez, reutilizados) ────────────────────────
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 SUPABASE_URL  = os.environ.get("SUPABASE_URL", "https://owpmcoithvzdlhmfkvbe.supabase.co")
 SUPABASE_KEY  = os.environ.get("SUPABASE_KEY", "")
 
+_claude_client = None
+_supabase_client = None
+
 def get_claude():
-    return anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    global _claude_client
+    if _claude_client is None:
+        _claude_client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    return _claude_client
 
 def get_supabase():
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+    global _supabase_client
+    if _supabase_client is None:
+        _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _supabase_client
 
 # ── Prompt de sistema ─────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """Você é o assistente comercial da Kist Soluções em Telecom e Energia.
@@ -90,6 +110,11 @@ Regras:
 @app.get("/health")
 def health():
     return {"status": "ok", "banco": SUPABASE_URL}
+
+@app.get("/ping")
+def ping():
+    """Keep-alive endpoint — chamado pelo frontend para evitar cold start"""
+    return {"pong": True}
 
 
 
