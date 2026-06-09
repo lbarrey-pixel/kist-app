@@ -461,14 +461,10 @@ async def sugerir_pn(payload: dict, usuario: str = Depends(verificar_token)):
 
     historico_txt = ""
     if historico:
-        historico_txt = "
-
-Histórico de itens similares já vendidos pela Kist:
-"
+        historico_txt = "\n\nHistórico de itens similares já vendidos pela Kist:\n"
         for h in historico:
             preco = h.get("preco_un", 0)
-            historico_txt += f"- {h.get('descricao','')} | R$ {preco:.2f} | proposta {h.get('proposta_tiny','')} | {h.get('cliente','')}
-"
+            historico_txt += f"- {h.get('descricao','')} | R$ {preco:.2f} | proposta {h.get('proposta_tiny','')} | {h.get('cliente','')}\n"
 
     prompt = f"""Você é especialista em TI e infraestrutura. Um cliente solicitou o seguinte item:
 
@@ -515,8 +511,7 @@ RETORNE APENAS JSON VÁLIDO, sem markdown, sem blocos de código:
         data = json.loads(raw)
         return data
     except Exception as e:
-        raise HTTPException(500, f"Erro ao parsear sugestões: {str(e)}
-Resposta: {raw[:300]}")
+        raise HTTPException(500, f"Erro ao parsear sugestões: {str(e)} | Resposta: {raw[:300]}")
 
 
 @app.get("/proxima-proposta")
