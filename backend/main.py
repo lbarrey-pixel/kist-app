@@ -78,7 +78,11 @@ Regras:
 - Unidade padrão é UN se não especificada
 - quantidade deve ser número (não string)
 - NUNCA envolva o JSON em blocos de código
-- sugerir_pn deve ser true APENAS para equipamentos de alto valor agregado onde o PN/modelo específico importa: notebooks, desktops, servidores, monitores, switches gerenciáveis, roteadores, UPS, câmeras IP, projetores, impressoras, scanners, TVs, tablets. Para commodities (cabos, mouses, teclados, pen drives, abraçadeiras, parafusos, lâmpadas genéricas, ferramentas simples) deixe false.
+- sugerir_pn deve ser true SOMENTE quando AS DUAS condições abaixo forem verdadeiras simultaneamente:
+  1. O item É de alto valor agregado (notebooks, desktops, servidores, monitores, switches gerenciáveis, roteadores, UPS, câmeras IP, projetores, impressoras, scanners, TVs, tablets, storage, access points)
+  2. O item NÃO tem PN/modelo/part number específico já informado na descrição (ex: se já diz "Dell OptiPlex 7020" ou "HP EliteBook 840 G10" ou qualquer código de produto, sugerir_pn = false)
+- Se o item já tem fabricante E modelo específico definidos → sugerir_pn = false (não precisamos sugerir o que já está definido)
+- Se o item é commodity independente do valor (cabos, mouses, teclados, pen drives, abraçadeiras, parafusos, lâmpadas genéricas, ferramentas simples, periféricos básicos) → sugerir_pn = false
 """
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -86,6 +90,40 @@ Regras:
 @app.get("/health")
 def health():
     return {"status": "ok", "banco": SUPABASE_URL}
+
+
+
+def _validar_sugerir_pn(sugerido_pelo_claude: bool, descricao: str) -> bool:
+    """Segunda barreira: confirma que sugerir_pn só é true quando realmente necessário"""
+    if not sugerido_pelo_claude:
+        return False
+
+    import re as _re
+    desc_upper = descricao.upper()
+
+    # Se já tem código alfanumérico específico que parece PN (ex: G10, 7020, 840-G9, ThinkPad)
+    # Padrões: letra(s)+número(s), número(s)+letra(s), traços entre alfanuméricos
+    pn_patterns = [
+        r'\b[A-Z]{2,}\s*\d{3,}\b',      # ex: HP840, DELL7020
+        r'\b\d{3,}[A-Z]{1,3}\b',          # ex: 840G, 7020SFF
+        r'\b[A-Z]+-\d+[A-Z]*\b',          # ex: T14-Gen3, G10
+        r'\bGEN\s*\d+\b',                # ex: Gen4, Gen 3
+        r'\b[A-Z]{4,}\d{2,}\b',           # ex: ELITEBOOK840
+        r'\b\d{4,}\b',                    # número longo = possivelmente PN
+    ]
+    for pat in pn_patterns:
+        if _re.search(pat, desc_upper):
+            return False
+
+    # Commodities que nunca precisam de sugestão
+    commodities = ['CABO', 'MOUSE', 'TECLADO', 'PEN DRIVE', 'PENDRIVE', 'HEADSET',
+                   'WEBCAM', 'HUB USB', 'CARREGADOR', 'ADAPTADOR', 'MOUSE PAD',
+                   'SUPORTE', 'ABRAÇADEIRA', 'PARAFUSO', 'LAMPADA', 'LAMPADA']
+    for c in commodities:
+        if c in desc_upper:
+            return False
+
+    return True
 
 
 @app.post("/extrair")
@@ -250,7 +288,7 @@ async def extrair_email(
             "preco_un": preco_un,
             "obs": obs_item,
             "tem_preco": preco_un > 0,
-            "sugerir_pn": item.get("sugerir_pn", False)
+            "sugerir_pn": _validar_sugerir_pn(item.get("sugerir_pn", False), desc)
         })
 
     return {
