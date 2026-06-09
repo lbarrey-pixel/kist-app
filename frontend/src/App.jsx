@@ -77,26 +77,20 @@ export default function App() {
     setUsuario({ nome: payload.name, email: payload.email, foto: payload.picture });
   }
 
-  function iniciarLoginGoogle() {
-    if (window.google) {
-      window.google.accounts.id.initialize({
-        client_id: GOOGLE_CLIENT_ID,
-        callback: handleGoogleResponse,
-      });
-      window.google.accounts.id.prompt();
-    }
-  }
-
-  function renderBotaoGoogle() {
-    if (!window.google) return;
+  function renderBotaoGoogle(el) {
+    if (!el || !window.google || !GOOGLE_CLIENT_ID) return;
     window.google.accounts.id.initialize({
       client_id: GOOGLE_CLIENT_ID,
       callback: handleGoogleResponse,
+      ux_mode: "popup",
     });
-    window.google.accounts.id.renderButton(
-      document.getElementById("google-btn"),
-      { theme: "outline", size: "large", text: "signin_with", locale: "pt-BR", width: 280 }
-    );
+    window.google.accounts.id.renderButton(el, {
+      theme: "outline",
+      size: "large",
+      text: "signin_with",
+      locale: "pt-BR",
+      width: 280,
+    });
   }
 
   function logout() {
@@ -203,14 +197,10 @@ export default function App() {
           </div>
           <h1 className="text-xl font-semibold text-slate-800 mb-1">Kist Propostas</h1>
           <p className="text-sm text-slate-500 mb-8">Faça login com sua conta Google para acessar</p>
-          <div id="google-btn" className="flex justify-center mb-4" ref={el => { if (el && window.google) renderBotaoGoogle(); }}></div>
-          <button
-            onClick={iniciarLoginGoogle}
-            className="w-full border border-slate-300 rounded-lg py-2.5 text-sm text-slate-700 hover:bg-slate-50 flex items-center justify-center gap-2 transition-colors"
-          >
-            <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#4285F4" d="M44.5 20H24v8.5h11.8C34.7 33.9 30.1 37 24 37c-7.2 0-13-5.8-13-13s5.8-13 13-13c3.1 0 5.9 1.1 8.1 2.9l6.4-6.4C34.6 5.1 29.6 3 24 3 12.9 3 4 11.9 4 23s8.9 20 20 20c11 0 19.7-7.7 19.7-20 0-1.3-.1-2.7-.2-3z"/><path fill="#34A853" d="M6.3 14.7l7 5.1C15.1 16.2 19.2 13 24 13c3.1 0 5.9 1.1 8.1 2.9l6.4-6.4C34.6 5.1 29.6 3 24 3 16.3 3 9.7 7.9 6.3 14.7z"/><path fill="#FBBC05" d="M24 43c5.8 0 10.7-1.9 14.3-5.2l-6.6-5.4C29.8 34.1 27.1 35 24 35c-6 0-11.1-4-12.9-9.5l-7 5.4C7.6 39.1 15.2 43 24 43z"/><path fill="#EA4335" d="M43.6 20H24v8.5h11.8c-.8 2.3-2.3 4.3-4.3 5.8l6.6 5.4C41.8 36.1 44 30 44 24c0-1.3-.1-2.7-.4-4z"/></svg>
-            Entrar com Google
-          </button>
+          <div
+            ref={el => { if (el) { if (window.google) { renderBotaoGoogle(el); } else { const t = setInterval(() => { if (window.google) { clearInterval(t); renderBotaoGoogle(el); } }, 100); setTimeout(() => clearInterval(t), 5000); } } }}
+            className="flex justify-center min-h-[44px] items-center"
+          ></div>
           <p className="text-xs text-slate-400 mt-4">Acesso restrito à equipe Kist</p>
         </div>
       </div>
