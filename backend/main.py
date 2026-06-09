@@ -123,6 +123,21 @@ def ping():
 
 
 
+def _log(etapa: str, duracao_ms: int, status: str = "ok", proposta: str = "", usuario: str = "", detalhe: str = ""):
+    """Registra log no Supabase de forma assíncrona (não bloqueia)"""
+    try:
+        get_supabase().table("logs_requisicoes").insert({
+            "etapa": etapa,
+            "duracao_ms": duracao_ms,
+            "proposta": proposta or None,
+            "usuario": usuario or None,
+            "status": status,
+            "detalhe": detalhe[:500] if detalhe else None,
+        }).execute()
+    except Exception:
+        pass  # Log nunca deve quebrar a aplicação
+
+
 def _validar_sugerir_pn(sugerido_pelo_claude: bool, descricao: str) -> bool:
     """Segunda barreira: confirma que sugerir_pn só é true quando realmente necessário"""
     if not sugerido_pelo_claude:
@@ -254,6 +269,8 @@ async def extrair_email(
         raise HTTPException(400, "Envie texto ou arquivo .msg")
 
     # 2. Claude extrai os itens
+    import time as _time
+    t0 = _time.time()
     claude = get_claude()
     resp = claude.messages.create(
         model="claude-haiku-4-5-20251001",
@@ -262,6 +279,7 @@ async def extrair_email(
         messages=[{"role": "user", "content": f"Número da proposta: {numero_proposta}\n\nE-mail:\n{conteudo[:8000]}"}],
         timeout=30.0
     )
+    _log("claude_extracao", int((_time.time()-t0)*1000), proposta=numero_proposta, usuario=usuario)
 
     import json, re as _re
     try:
@@ -280,6 +298,8 @@ async def extrair_email(
     itens_raw = dados_email.get("itens", [])
 
     # ── Busca em lote no banco (1 query ao invés de N) ────────────────────────
+    import time as _time
+    t_banco = _time.time()
     # Extrai todas as palavras-chave dos itens e busca de uma vez
     banco_cache = {}  # desc_norm -> row
     try:
@@ -304,6 +324,7 @@ async def extrair_email(
             candidatos = res_batch.data or []
     except Exception:
         candidatos = []
+    _log("busca_banco", int((_time.time()-t_banco)*1000), proposta=numero_proposta, usuario=usuario, detalhe=f"{len(candidatos)} candidatos")
 
     def match_local(desc_pedido, candidatos):
         """Faz matching local sem chamada ao banco"""
@@ -344,6 +365,12 @@ async def extrair_email(
             "sugerir_pn": _validar_sugerir_pn(item.get("sugerir_pn", False), desc)
         })
 
+    total_ms = int((_time.time() - t0) * 1000)
+    com_preco = sum(1 for i in itens_com_preco if i["tem_preco"])
+    sem_preco = len(itens_com_preco) - com_preco
+    _log("total_extracao", total_ms, proposta=numero_proposta, usuario=usuario,
+         detalhe=f"{len(itens_com_preco)} itens | {com_preco} com preco | {sem_preco} zerados")
+
     return {
         "cliente": dados_email.get("cliente", ""),
         "cnpj": dados_email.get("cnpj", ""),
@@ -351,8 +378,8 @@ async def extrair_email(
         "proposta": numero_proposta,
         "itens": itens_com_preco,
         "total_itens": len(itens_com_preco),
-        "com_preco": sum(1 for i in itens_com_preco if i["tem_preco"]),
-        "sem_preco": sum(1 for i in itens_com_preco if not i["tem_preco"])
+        "com_preco": com_preco,
+        "sem_preco": sem_preco
     }
 
 
