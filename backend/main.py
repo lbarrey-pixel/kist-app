@@ -65,7 +65,8 @@ Formato de saída:
     {
       "descricao": "descrição completa do item",
       "quantidade": 1,
-      "unidade": "UN"
+      "unidade": "UN",
+      "sugerir_pn": false
     }
   ]
 }
@@ -77,6 +78,7 @@ Regras:
 - Unidade padrão é UN se não especificada
 - quantidade deve ser número (não string)
 - NUNCA envolva o JSON em blocos de código
+- sugerir_pn deve ser true APENAS para equipamentos de alto valor agregado onde o PN/modelo específico importa: notebooks, desktops, servidores, monitores, switches gerenciáveis, roteadores, UPS, câmeras IP, projetores, impressoras, scanners, TVs, tablets. Para commodities (cabos, mouses, teclados, pen drives, abraçadeiras, parafusos, lâmpadas genéricas, ferramentas simples) deixe false.
 """
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -247,7 +249,8 @@ async def extrair_email(
             "unidade": item.get("unidade", "UN"),
             "preco_un": preco_un,
             "obs": obs_item,
-            "tem_preco": preco_un > 0
+            "tem_preco": preco_un > 0,
+            "sugerir_pn": item.get("sugerir_pn", False)
         })
 
     return {
@@ -393,6 +396,89 @@ def banco_stats():
         }
     except Exception as e:
         return {"erro": str(e)}
+
+
+
+@app.post("/sugerir-pn")
+async def sugerir_pn(payload: dict, usuario: str = Depends(verificar_token)):
+    """Sugere PN/modelos específicos para um item de alto valor agregado"""
+    descricao = payload.get("descricao", "")
+    fabricantes = payload.get("fabricantes", "")  # ex: "Dell, Lenovo ou HP"
+
+    if not descricao:
+        raise HTTPException(400, "Descrição obrigatória")
+
+    # Buscar histórico de itens similares no banco para contexto
+    sb = get_supabase()
+    historico = []
+    try:
+        palavras = [p for p in descricao.upper().split() if len(p) > 4][:3]
+        query = sb.table("produtos").select("descricao,preco_un,proposta_tiny,cliente")
+        for p in palavras:
+            query = query.ilike("descricao", f"%{p}%")
+        res = query.order("data_ref", desc=True).limit(5).execute()
+        historico = res.data or []
+    except Exception:
+        pass
+
+    historico_txt = ""
+    if historico:
+        historico_txt = "
+
+Histórico de itens similares já vendidos pela Kist:
+"
+        for h in historico:
+            preco = h.get("preco_un", 0)
+            historico_txt += f"- {h.get('descricao','')} | R$ {preco:.2f} | proposta {h.get('proposta_tiny','')} | {h.get('cliente','')}
+"
+
+    prompt = f"""Você é especialista em TI e infraestrutura. Um cliente solicitou o seguinte item:
+
+ESPECIFICAÇÃO DO CLIENTE:
+{descricao}
+
+{f"Fabricantes aceitos pelo cliente: {fabricantes}" if fabricantes else ""}
+{historico_txt}
+
+Sugira exatamente 3 opções de PN/modelos específicos que atendam a essa especificação.
+Para cada opção informe:
+- Fabricante e modelo/PN exato
+- Principais specs que atendem ao pedido
+- Preço de mercado estimado em reais (valor aproximado)
+- Se está disponível nos fabricantes mencionados pelo cliente
+
+RETORNE APENAS JSON VÁLIDO, sem markdown, sem blocos de código:
+{{
+  "sugestoes": [
+    {{
+      "fabricante": "Dell",
+      "modelo": "OptiPlex 7020 SFF",
+      "pn": "7020-SFF-I5-16-512",
+      "specs": "Core i5-14ª gen, 16GB DDR5, 512GB NVMe, Win11 Pro",
+      "preco_estimado": 4500.00,
+      "atende_fabricante": true
+    }}
+  ]
+}}"""
+
+    claude = get_claude()
+    resp = claude.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1500,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    import json, re as _re
+    raw = resp.content[0].text.strip()
+    raw = _re.sub(r'^```(?:json)?\s*', '', raw)
+    raw = _re.sub(r'\s*```$', '', raw.strip())
+
+    try:
+        data = json.loads(raw)
+        return data
+    except Exception as e:
+        raise HTTPException(500, f"Erro ao parsear sugestões: {str(e)}
+Resposta: {raw[:300]}")
 
 
 @app.get("/proxima-proposta")

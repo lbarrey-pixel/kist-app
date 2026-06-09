@@ -8,29 +8,111 @@ function Badge({ count, tipo }) {
   return <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold ${cores[tipo]}`}>{count}</span>;
 }
 
-function ItemRow({ item, index, onChange }) {
+function ItemRow({ item, index, onChange, token, apiUrl }) {
+  const [loadingPn, setLoadingPn] = useState(false);
+  const [sugestoes, setSugestoes] = useState(null);
+  const [mostrarSugestoes, setMostrarSugestoes] = useState(false);
+
+  async function buscarSugestoes() {
+    setLoadingPn(true);
+    setSugestoes(null);
+    setMostrarSugestoes(true);
+    try {
+      const res = await fetch(`${apiUrl}/sugerir-pn`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ descricao: item.descricao_final }),
+      });
+      const data = await res.json();
+      setSugestoes(data.sugestoes || []);
+    } catch (e) {
+      setSugestoes([]);
+    } finally {
+      setLoadingPn(false);
+    }
+  }
+
+  function aplicarSugestao(s) {
+    onChange(index, "descricao_final", `${s.fabricante} ${s.modelo} ${s.specs}`);
+    if (s.preco_estimado > 0) onChange(index, "preco_un", s.preco_estimado);
+    setMostrarSugestoes(false);
+    setSugestoes(null);
+  }
+
   return (
-    <tr className={index % 2 === 0 ? "bg-white" : "bg-slate-50"}>
-      <td className="px-4 py-2 text-sm text-slate-400 w-8">{index + 1}</td>
-      <td className="px-4 py-2">
-        <input className="w-full text-sm border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5" value={item.descricao_final} onChange={e => onChange(index, "descricao_final", e.target.value)} />
-      </td>
-      <td className="px-4 py-2 w-20">
-        <input type="number" className="w-full text-sm text-center border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5" value={item.quantidade} onChange={e => onChange(index, "quantidade", parseFloat(e.target.value))} />
-      </td>
-      <td className="px-4 py-2 w-16">
-        <input className="w-full text-sm text-center border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5" value={item.unidade} onChange={e => onChange(index, "unidade", e.target.value)} />
-      </td>
-      <td className="px-4 py-2 w-32">
-        <div className="flex items-center gap-1">
-          <span className="text-xs text-slate-400">R$</span>
-          <input type="number" step="0.001" className={`w-full text-sm text-right border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5 ${item.preco_un > 0 ? "text-slate-800" : "text-amber-600 font-medium"}`} value={item.preco_un} onChange={e => onChange(index, "preco_un", parseFloat(e.target.value) || 0)} />
-        </div>
-      </td>
-      <td className="px-4 py-2 w-8">
-        <div className={`w-2 h-2 rounded-full mx-auto ${item.preco_un > 0 ? "bg-emerald-400" : "bg-amber-400"}`} />
-      </td>
-    </tr>
+    <>
+      <tr className={index % 2 === 0 ? "bg-white" : "bg-slate-50"}>
+        <td className="px-4 py-2 text-sm text-slate-400 w-8">{index + 1}</td>
+        <td className="px-4 py-2">
+          <input className="w-full text-sm border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5" value={item.descricao_final} onChange={e => onChange(index, "descricao_final", e.target.value)} />
+          {item.sugerir_pn && (
+            <button
+              onClick={buscarSugestoes}
+              disabled={loadingPn}
+              className="mt-1 text-xs text-blue-500 hover:text-blue-700 flex items-center gap-1 disabled:opacity-50"
+            >
+              {loadingPn ? <><span className="animate-spin inline-block">⟳</span> Buscando PN...</> : "✦ Sugerir PN / modelo"}
+            </button>
+          )}
+        </td>
+        <td className="px-4 py-2 w-20">
+          <input type="number" className="w-full text-sm text-center border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5" value={item.quantidade} onChange={e => onChange(index, "quantidade", parseFloat(e.target.value))} />
+        </td>
+        <td className="px-4 py-2 w-16">
+          <input className="w-full text-sm text-center border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5" value={item.unidade} onChange={e => onChange(index, "unidade", e.target.value)} />
+        </td>
+        <td className="px-4 py-2 w-32">
+          <div className="flex items-center gap-1">
+            <span className="text-xs text-slate-400">R$</span>
+            <input type="number" step="0.001" className={`w-full text-sm text-right border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5 ${item.preco_un > 0 ? "text-slate-800" : "text-amber-600 font-medium"}`} value={item.preco_un} onChange={e => onChange(index, "preco_un", parseFloat(e.target.value) || 0)} />
+          </div>
+        </td>
+        <td className="px-4 py-2 w-8">
+          <div className={`w-2 h-2 rounded-full mx-auto ${item.preco_un > 0 ? "bg-emerald-400" : "bg-amber-400"}`} />
+        </td>
+      </tr>
+      {mostrarSugestoes && (
+        <tr className={index % 2 === 0 ? "bg-white" : "bg-slate-50"}>
+          <td></td>
+          <td colSpan={5} className="px-4 pb-3">
+            <div className="border border-blue-200 rounded-lg bg-blue-50 p-3">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-medium text-blue-700">Sugestões de PN / modelo</span>
+                <button onClick={() => setMostrarSugestoes(false)} className="text-xs text-slate-400 hover:text-red-400">✕ fechar</button>
+              </div>
+              {loadingPn ? (
+                <div className="text-xs text-slate-500 py-2">Consultando banco e gerando sugestões...</div>
+              ) : sugestoes && sugestoes.length > 0 ? (
+                <div className="space-y-2">
+                  {sugestoes.map((s, i) => (
+                    <div key={i} className="bg-white rounded-lg border border-blue-100 p-2.5 flex items-start justify-between gap-3">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-0.5">
+                          <span className="text-xs font-semibold text-slate-800">{s.fabricante} {s.modelo}</span>
+                          {s.atende_fabricante && <span className="text-xs bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded-full">✓ fabricante ok</span>}
+                        </div>
+                        <div className="text-xs text-slate-500 mb-1">{s.specs}</div>
+                        {s.preco_estimado > 0 && (
+                          <div className="text-xs text-slate-600">Estimado: <span className="font-medium">R$ {s.preco_estimado.toLocaleString("pt-BR", {minimumFractionDigits:2})}</span></div>
+                        )}
+                      </div>
+                      <button
+                        onClick={() => aplicarSugestao(s)}
+                        className="text-xs bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-lg flex-shrink-0 transition-colors"
+                      >
+                        Usar
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-xs text-slate-500 py-2">Nenhuma sugestão encontrada. Verifique a descrição.</div>
+              )}
+            </div>
+          </td>
+        </tr>
+      )}
+    </>
   );
 }
 
@@ -333,7 +415,7 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {resultado.itens.map((item, i) => <ItemRow key={i} item={item} index={i} onChange={atualizarItem} />)}
+                  {resultado.itens.map((item, i) => <ItemRow key={i} item={item} index={i} onChange={atualizarItem} token={token} apiUrl={API} />)}
                 </tbody>
               </table>
             </div>
