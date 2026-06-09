@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useCallback } from "react";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
@@ -6,7 +6,7 @@ function Badge({ count, tipo }) {
   const cores = {
     total: "bg-slate-100 text-slate-700",
     preco: "bg-emerald-100 text-emerald-700",
-    sem: "bg-amber-100 text-amber-700",
+    sem:   "bg-amber-100 text-amber-700",
   };
   return (
     <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold ${cores[tipo]}`}>
@@ -18,7 +18,7 @@ function Badge({ count, tipo }) {
 function ItemRow({ item, index, onChange }) {
   return (
     <tr className={index % 2 === 0 ? "bg-white" : "bg-slate-50"}>
-      <td className="px-4 py-2 text-sm text-slate-500 w-8">{index + 1}</td>
+      <td className="px-4 py-2 text-sm text-slate-400 w-8">{index + 1}</td>
       <td className="px-4 py-2">
         <input
           className="w-full text-sm border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5"
@@ -63,27 +63,67 @@ function ItemRow({ item, index, onChange }) {
 }
 
 export default function App() {
-  const [step, setStep] = useState("input"); // input | resultado | download
+  const [step, setStep] = useState("input");
   const [loading, setLoading] = useState(false);
+  const [salvandoBanco, setSalvandoBanco] = useState(false);
   const [erro, setErro] = useState("");
   const [texto, setTexto] = useState("");
   const [arquivo, setArquivo] = useState(null);
+  const [isDragging, setIsDragging] = useState(false);
   const [numeroProposta, setNumeroProposta] = useState("");
   const [resultado, setResultado] = useState(null);
   const [stats, setStats] = useState(null);
+  const [bancoInfo, setBancoInfo] = useState(null);
   const fileRef = useRef();
 
-  // Stats e próximo número ao carregar
   useState(() => {
-    fetch(`${API}/banco/stats`)
-      .then(r => r.json())
-      .then(setStats)
-      .catch(() => {});
+    fetch(`${API}/banco/stats`).then(r => r.json()).then(setStats).catch(() => {});
+    fetch(`${API}/proxima-proposta`).then(r => r.json())
+      .then(d => { if (d.proximo) setNumeroProposta(d.proximo); }).catch(() => {});
+  }, []);
 
-    fetch(`${API}/proxima-proposta`)
-      .then(r => r.json())
-      .then(d => { if (d.proximo) setNumeroProposta(d.proximo); })
-      .catch(() => {});
+  // ── Drag & drop — aceita .msg arrastado do Outlook ────────────────────────
+  const handleDragOver = useCallback((e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e) => {
+    e.preventDefault();
+    setIsDragging(false);
+  }, []);
+
+  const handleDrop = useCallback((e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+
+    // Tentar pegar arquivo do dataTransfer (funciona ao arrastar do explorador)
+    const files = e.dataTransfer.files;
+    if (files && files.length > 0) {
+      const f = files[0];
+      setArquivo(f);
+      setTexto("");
+      return;
+    }
+
+    // Fallback: arrastar do Outlook pode vir como texto/html
+    const html = e.dataTransfer.getData("text/html");
+    const plain = e.dataTransfer.getData("text/plain");
+    if (plain && plain.trim()) {
+      setTexto(plain.trim());
+      setArquivo(null);
+    } else if (html) {
+      // Converter HTML para texto limpo
+      const tmp = document.createElement("div");
+      tmp.innerHTML = html;
+      const txt = tmp.innerText || tmp.textContent || "";
+      if (txt.trim()) {
+        setTexto(txt.trim());
+        setArquivo(null);
+      }
+    }
   }, []);
 
   function handleArquivo(e) {
@@ -93,9 +133,8 @@ export default function App() {
 
   async function processar() {
     if (!numeroProposta.trim()) { setErro("Informe o número da proposta."); return; }
-    if (!texto.trim() && !arquivo) { setErro("Cole o texto do e-mail ou envie um arquivo .msg"); return; }
+    if (!texto.trim() && !arquivo) { setErro("Cole o texto, arraste ou envie um arquivo .msg"); return; }
     setErro(""); setLoading(true);
-
     try {
       const form = new FormData();
       form.append("numero_proposta", numeroProposta);
@@ -120,15 +159,36 @@ export default function App() {
   function atualizarItem(index, campo, valor) {
     setResultado(prev => ({
       ...prev,
-      itens: prev.itens.map((item, i) =>
-        i === index ? { ...item, [campo]: valor } : item
-      ),
+      itens: prev.itens.map((item, i) => i === index ? { ...item, [campo]: valor } : item),
     }));
   }
 
   async function baixarCSV() {
     setLoading(true);
+    setBancoInfo(null);
+
     try {
+      // 1. Atualizar banco de preços ANTES de baixar
+      setSalvandoBanco(true);
+      const itensCom = resultado.itens.filter(i => i.preco_un > 0);
+      if (itensCom.length > 0) {
+        try {
+          const resBanco = await fetch(`${API}/upsert-precos`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(resultado),
+          });
+          if (resBanco.ok) {
+            const info = await resBanco.json();
+            setBancoInfo(info);
+          }
+        } catch (e) {
+          console.warn("Aviso: não foi possível atualizar banco:", e);
+        }
+      }
+      setSalvandoBanco(false);
+
+      // 2. Gerar e baixar CSV
       const res = await fetch(`${API}/gerar-csv`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -147,13 +207,15 @@ export default function App() {
       setErro(e.message);
     } finally {
       setLoading(false);
+      setSalvandoBanco(false);
     }
   }
 
   function reiniciar() {
-    setStep("input"); setResultado(null);
-    setTexto(""); setArquivo(null);
-    setNumeroProposta(""); setErro("");
+    setStep("input"); setResultado(null); setBancoInfo(null);
+    setTexto(""); setArquivo(null); setNumeroProposta(""); setErro("");
+    fetch(`${API}/proxima-proposta`).then(r => r.json())
+      .then(d => { if (d.proximo) setNumeroProposta(d.proximo); }).catch(() => {});
   }
 
   return (
@@ -188,7 +250,7 @@ export default function App() {
           <div className="max-w-2xl mx-auto">
             <div className="mb-8">
               <h1 className="text-2xl font-bold text-slate-800 mb-1">Nova proposta</h1>
-              <p className="text-slate-500 text-sm">Cole o e-mail de cotação ou envie o arquivo .msg</p>
+              <p className="text-slate-500 text-sm">Arraste o e-mail do Outlook, faça upload do .msg ou cole o texto</p>
             </div>
 
             <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-5">
@@ -198,51 +260,86 @@ export default function App() {
                   Número da proposta <span className="text-red-400">*</span>
                 </label>
                 <input
-                  className="w-full border border-slate-300 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                  className="w-full border border-slate-300 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                   placeholder="ex: 1050370"
                   value={numeroProposta}
                   onChange={e => setNumeroProposta(e.target.value)}
                 />
               </div>
 
-              {/* Upload .msg */}
+              {/* Área de drag & drop */}
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1.5">Arquivo .msg</label>
+                <label className="block text-sm font-medium text-slate-700 mb-1.5">
+                  E-mail de cotação
+                </label>
                 <div
-                  onClick={() => fileRef.current.click()}
-                  className={`border-2 border-dashed rounded-lg p-4 text-center cursor-pointer transition-colors ${
-                    arquivo ? "border-blue-300 bg-blue-50" : "border-slate-200 hover:border-slate-300"
+                  onDragOver={handleDragOver}
+                  onDragLeave={handleDragLeave}
+                  onDrop={handleDrop}
+                  onClick={() => !arquivo && !texto && fileRef.current.click()}
+                  className={`border-2 border-dashed rounded-xl transition-all ${
+                    isDragging
+                      ? "border-blue-400 bg-blue-50 scale-[1.01]"
+                      : arquivo
+                      ? "border-blue-300 bg-blue-50"
+                      : "border-slate-200 hover:border-slate-300 hover:bg-slate-50"
                   }`}
                 >
                   {arquivo ? (
-                    <div className="flex items-center justify-center gap-2 text-sm text-blue-600">
-                      <span>📎</span>
-                      <span className="font-medium">{arquivo.name}</span>
-                      <button onClick={e => { e.stopPropagation(); setArquivo(null); }} className="text-slate-400 hover:text-red-400 ml-2">✕</button>
+                    <div className="p-4 flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 bg-blue-100 rounded-lg flex items-center justify-center text-blue-600 text-lg">📧</div>
+                        <div>
+                          <div className="text-sm font-medium text-slate-700">{arquivo.name}</div>
+                          <div className="text-xs text-slate-400">{(arquivo.size / 1024).toFixed(0)} KB</div>
+                        </div>
+                      </div>
+                      <button
+                        onClick={e => { e.stopPropagation(); setArquivo(null); }}
+                        className="text-slate-400 hover:text-red-400 text-lg px-2"
+                      >✕</button>
+                    </div>
+                  ) : texto ? (
+                    <div className="p-4">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-xs font-medium text-slate-500">Texto colado</span>
+                        <button onClick={() => setTexto("")} className="text-slate-400 hover:text-red-400 text-xs">limpar</button>
+                      </div>
+                      <p className="text-xs text-slate-600 line-clamp-3 font-mono">{texto.slice(0, 200)}...</p>
                     </div>
                   ) : (
-                    <p className="text-sm text-slate-400">Clique para selecionar o arquivo .msg</p>
+                    <div className="p-8 text-center">
+                      <div className="text-4xl mb-3">📨</div>
+                      <p className="text-sm font-medium text-slate-600 mb-1">
+                        {isDragging ? "Solte aqui!" : "Arraste o e-mail do Outlook"}
+                      </p>
+                      <p className="text-xs text-slate-400 mb-3">ou clique para selecionar um arquivo .msg</p>
+                      <button
+                        onClick={e => { e.stopPropagation(); fileRef.current.click(); }}
+                        className="text-xs bg-slate-100 hover:bg-slate-200 text-slate-600 px-3 py-1.5 rounded-lg transition-colors"
+                      >
+                        Procurar arquivo
+                      </button>
+                    </div>
                   )}
                 </div>
-                <input ref={fileRef} type="file" accept=".msg" className="hidden" onChange={handleArquivo} />
+                <input ref={fileRef} type="file" accept=".msg,.eml" className="hidden" onChange={handleArquivo} />
               </div>
 
               {/* Divisor */}
               <div className="relative">
                 <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-slate-200" /></div>
-                <div className="relative flex justify-center"><span className="bg-white px-3 text-xs text-slate-400">ou cole o texto</span></div>
+                <div className="relative flex justify-center"><span className="bg-white px-3 text-xs text-slate-400">ou cole o texto do e-mail</span></div>
               </div>
 
-              {/* Texto */}
-              <div>
-                <textarea
-                  rows={8}
-                  className="w-full border border-slate-300 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none font-mono"
-                  placeholder="Cole aqui o conteúdo do e-mail de cotação..."
-                  value={texto}
-                  onChange={e => { setTexto(e.target.value); setArquivo(null); }}
-                />
-              </div>
+              {/* Textarea */}
+              <textarea
+                rows={6}
+                className="w-full border border-slate-300 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none font-mono"
+                placeholder="Cole aqui o conteúdo do e-mail..."
+                value={texto}
+                onChange={e => { setTexto(e.target.value); setArquivo(null); }}
+              />
 
               {erro && (
                 <div className="bg-red-50 border border-red-200 rounded-lg px-4 py-3 text-sm text-red-600">{erro}</div>
@@ -253,11 +350,7 @@ export default function App() {
                 disabled={loading}
                 className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white font-medium py-2.5 rounded-lg text-sm transition-colors flex items-center justify-center gap-2"
               >
-                {loading ? (
-                  <><span className="animate-spin">⟳</span> Processando...</>
-                ) : (
-                  "Processar e-mail"
-                )}
+                {loading ? <><span className="animate-spin inline-block">⟳</span> Processando...</> : "Processar e-mail"}
               </button>
             </div>
           </div>
@@ -266,7 +359,6 @@ export default function App() {
         {/* STEP: RESULTADO */}
         {step === "resultado" && resultado && (
           <div>
-            {/* Cabeçalho da proposta */}
             <div className="flex items-start justify-between mb-6">
               <div>
                 <div className="flex items-center gap-2 mb-1">
@@ -287,25 +379,32 @@ export default function App() {
                 </button>
                 <button
                   onClick={baixarCSV}
-                  disabled={loading}
+                  disabled={loading || salvandoBanco}
                   className="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white rounded-lg font-medium transition-colors flex items-center gap-1.5"
                 >
-                  {loading ? "Gerando..." : "⬇ Baixar CSV Tiny"}
+                  {salvandoBanco
+                    ? <><span className="animate-spin inline-block">⟳</span> Salvando banco...</>
+                    : loading
+                    ? "Gerando..."
+                    : "⬇ Confirmar e baixar CSV"}
                 </button>
               </div>
             </div>
 
             {resultado.sem_preco > 0 && (
               <div className="bg-amber-50 border border-amber-200 rounded-lg px-4 py-3 mb-4 text-sm text-amber-700">
-                <strong>{resultado.sem_preco} {resultado.sem_preco === 1 ? "item" : "itens"} sem preço</strong> — revise ou preencha manualmente antes de baixar.
+                <strong>{resultado.sem_preco} {resultado.sem_preco === 1 ? "item" : "itens"} sem preço</strong> — preencha manualmente antes de baixar ou deixe zerado para cotar depois.
               </div>
             )}
+
+            <div className="bg-blue-50 border border-blue-200 rounded-lg px-4 py-3 mb-4 text-sm text-blue-700">
+              💾 Ao clicar em <strong>"Confirmar e baixar CSV"</strong> os preços serão salvos automaticamente no banco de preços.
+            </div>
 
             {erro && (
               <div className="bg-red-50 border border-red-200 rounded-lg px-4 py-3 mb-4 text-sm text-red-600">{erro}</div>
             )}
 
-            {/* Tabela de itens */}
             <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
               <table className="w-full text-sm">
                 <thead>
@@ -325,10 +424,7 @@ export default function App() {
                 </tbody>
               </table>
             </div>
-
-            <p className="text-xs text-slate-400 mt-3 text-center">
-              Clique em qualquer campo para editar antes de baixar.
-            </p>
+            <p className="text-xs text-slate-400 mt-3 text-center">Clique em qualquer campo para editar antes de baixar.</p>
           </div>
         )}
 
@@ -339,13 +435,15 @@ export default function App() {
               <span className="text-3xl">✓</span>
             </div>
             <h2 className="text-xl font-bold text-slate-800 mb-2">CSV baixado!</h2>
-            <p className="text-slate-500 text-sm mb-8">
+            <p className="text-slate-500 text-sm mb-4">
               Arquivo <code className="bg-slate-100 px-1.5 py-0.5 rounded text-xs">proposta_{resultado?.proposta}.csv</code> pronto para importar no Tiny.
             </p>
-            <button
-              onClick={reiniciar}
-              className="bg-blue-600 hover:bg-blue-700 text-white font-medium py-2.5 px-6 rounded-lg text-sm"
-            >
+            {bancoInfo && (
+              <div className="bg-emerald-50 border border-emerald-200 rounded-lg px-4 py-3 mb-6 text-sm text-emerald-700">
+                💾 Banco de preços atualizado — <strong>{bancoInfo.atualizados}</strong> {bancoInfo.atualizados === 1 ? "preço atualizado" : "preços atualizados"}, <strong>{bancoInfo.inseridos}</strong> {bancoInfo.inseridos === 1 ? "novo inserido" : "novos inseridos"}
+              </div>
+            )}
+            <button onClick={reiniciar} className="bg-blue-600 hover:bg-blue-700 text-white font-medium py-2.5 px-6 rounded-lg text-sm">
               Processar outra proposta
             </button>
           </div>

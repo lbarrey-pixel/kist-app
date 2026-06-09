@@ -241,6 +241,62 @@ async def extrair_email(
     }
 
 
+
+@app.post("/upsert-precos")
+async def upsert_precos(payload: dict):
+    """Atualiza/insere preços no banco após confirmação do usuário"""
+    sb = get_supabase()
+    proposta = payload.get("proposta", "")
+    cliente  = payload.get("cliente", "")
+    itens    = payload.get("itens", [])
+    hoje     = date.today().isoformat()
+
+    atualizados, inseridos, ignorados = 0, 0, 0
+
+    for item in itens:
+        preco = item.get("preco_un", 0)
+        desc  = item.get("descricao_final", "").strip()
+        if not desc or not preco or float(preco) <= 0:
+            ignorados += 1
+            continue
+
+        try:
+            # Verificar se já existe pela descrição (ILIKE)
+            res = sb.table("produtos").select("id,preco_un,data_ref")                .ilike("descricao", desc).limit(1).execute()
+
+            if res.data:
+                # Atualizar preço existente
+                sb.table("produtos").update({
+                    "preco_un":     float(preco),
+                    "data_ref":     hoje,
+                    "proposta_tiny": proposta,
+                    "cliente":      cliente,
+                }).eq("id", res.data[0]["id"]).execute()
+                atualizados += 1
+            else:
+                # Inserir novo
+                sb.table("produtos").insert({
+                    "descricao":    desc,
+                    "variante":     item.get("unidade", "UN"),
+                    "un":           item.get("unidade", "UN"),
+                    "preco_un":     float(preco),
+                    "data_ref":     hoje,
+                    "proposta_tiny": proposta,
+                    "cliente":      cliente,
+                    "obs":          "inserido automaticamente via app",
+                }).execute()
+                inseridos += 1
+        except Exception as e:
+            ignorados += 1
+
+    return {
+        "atualizados": atualizados,
+        "inseridos":   inseridos,
+        "ignorados":   ignorados,
+        "total":       len(itens)
+    }
+
+
 @app.post("/gerar-csv")
 async def gerar_csv(payload: dict):
     """Gera CSV no formato Tiny a partir do payload confirmado"""
