@@ -33,7 +33,7 @@ def get_supabase():
 SYSTEM_PROMPT = """Você é o assistente comercial da Kist Soluções em Telecom e Energia.
 Sua tarefa é extrair itens de cotação de e-mails e retornar um JSON estruturado.
 
-RETORNE APENAS JSON VÁLIDO, sem texto antes ou depois, sem markdown, sem blocos de código.
+RETORNE APENAS JSON VÁLIDO. NUNCA use blocos de código markdown. NUNCA use ```json. NUNCA use ```. Retorne SOMENTE o objeto JSON puro, começando com { e terminando com }.
 
 Formato de saída:
 {
@@ -56,6 +56,7 @@ Regras:
 - Se não encontrar CNPJ, deixe null
 - Unidade padrão é UN se não especificada
 - quantidade deve ser número (não string)
+- NUNCA envolva o JSON em blocos de código
 """
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -95,9 +96,13 @@ async def extrair_email(
         messages=[{"role": "user", "content": f"Número da proposta: {numero_proposta}\n\nE-mail:\n{conteudo}"}]
     )
 
-    import json
+    import json, re as _re
     try:
-        dados_email = json.loads(resp.content[0].text)
+        raw = resp.content[0].text.strip()
+        # Remove blocos markdown ```json ... ``` ou ``` ... ```
+        raw = _re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = _re.sub(r'\s*```$', '', raw.strip())
+        dados_email = json.loads(raw)
     except Exception as e:
         raise HTTPException(500, f"Erro ao parsear resposta do Claude: {str(e)}\nResposta: {resp.content[0].text[:500]}")
 
