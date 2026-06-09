@@ -9,3 +9,4 @@ pdfplumber
 openpyxl
 xlrd
 google-auth
+requests
