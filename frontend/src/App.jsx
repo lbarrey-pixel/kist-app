@@ -147,7 +147,7 @@ export default function App() {
     if (!token) return;
     fetch(`${API}/banco/stats`, { headers: { Authorization: `Bearer ${token}` } })
       .then(r => r.json()).then(setStats).catch(() => {});
-    fetch(`${API}/proxima-proposta`, { headers: { Authorization: `Bearer ${token}` } })
+    fetch(`${API}/proxima-proposta`)
       .then(r => r.json()).then(d => { if (d.proximo) setNumeroProposta(d.proximo); }).catch(() => {});
     // Keep-alive: pinga o backend a cada 9 minutos para evitar cold start
     const keepAlive = setInterval(() => fetch(`${API}/ping`).catch(() => {}), 9 * 60 * 1000);
@@ -156,10 +156,30 @@ export default function App() {
 
   function handleGoogleResponse(response) {
     const credential = response.credential;
-    // Decodificar JWT para pegar nome/email (sem verificar — só display)
     const payload = JSON.parse(atob(credential.split('.')[1]));
     setToken(credential);
     setUsuario({ nome: payload.name, email: payload.email, foto: payload.picture });
+
+    // Renovar token automaticamente 5 minutos antes de expirar
+    const expMs = payload.exp * 1000;
+    const renovarEm = expMs - Date.now() - 5 * 60 * 1000;
+    if (renovarEm > 0) {
+      setTimeout(() => {
+        if (window.google) {
+          window.google.accounts.id.initialize({
+            client_id: GOOGLE_CLIENT_ID,
+            callback: handleGoogleResponse,
+            ux_mode: "popup",
+          });
+          window.google.accounts.id.prompt((notification) => {
+            // Se não conseguir renovar silenciosamente, força logout
+            if (notification.isNotDisplayed() || notification.isSkippedMoment()) {
+              console.log("Token expirado — necessário novo login");
+            }
+          });
+        }
+      }, renovarEm);
+    }
   }
 
   function renderBotaoGoogle(el) {
@@ -218,9 +238,20 @@ export default function App() {
       form.append("numero_proposta", numeroProposta);
       if (arquivo) form.append("arquivo", arquivo);
       else form.append("texto", texto);
-      const res = await fetch(`${API}/extrair`, { method: "POST", headers: authHeaders(), body: form });
+      // Timeout de 60s para não ficar travado indefinidamente
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 60000);
+      let res;
+      try {
+        res = await fetch(`${API}/extrair`, { method: "POST", headers: authHeaders(), body: form, signal: controller.signal });
+      } catch (fetchErr) {
+        clearTimeout(timeoutId);
+        if (fetchErr.name === "AbortError") throw new Error("Tempo limite excedido (60s). Tente novamente ou use um e-mail mais curto.");
+        throw fetchErr;
+      }
+      clearTimeout(timeoutId);
       if (!res.ok) {
-        const err = await res.json();
+        const err = await res.json().catch(() => ({ detail: `Erro HTTP ${res.status}` }));
         if (res.status === 401 || res.status === 403) { setErro("Sessão expirada. Faça login novamente."); logout(); return; }
         throw new Error(err.detail || "Erro no servidor");
       }
@@ -268,7 +299,7 @@ export default function App() {
   function reiniciar() {
     setStep("input"); setResultado(null); setBancoInfo(null);
     setTexto(""); setArquivo(null); setNumeroProposta(""); setErro("");
-    fetch(`${API}/proxima-proposta`, { headers: authHeaders() })
+    fetch(`${API}/proxima-proposta`)
       .then(r => r.json()).then(d => { if (d.proximo) setNumeroProposta(d.proximo); }).catch(() => {});
   }
 

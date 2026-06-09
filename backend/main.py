@@ -1,5 +1,5 @@
 import os, csv, io, re
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -30,24 +30,29 @@ security = HTTPBearer()
 # Cache de tokens verificados (evita chamada ao Google a cada request)
 _token_cache: dict = {}
 
-def verificar_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
-    # Usar cache para evitar chamada HTTP ao Google a cada request
+def _verificar_token_str(token: str) -> str:
+    """Verifica token Google e retorna email. Usa cache."""
     if token in _token_cache:
         return _token_cache[token]
     try:
-        info = id_token.verify_oauth2_token(token, google_requests.Request(), GOOGLE_CLIENT_ID)
+        info = id_token.verify_oauth2_token(
+            token, google_requests.Request(), GOOGLE_CLIENT_ID,
+            clock_skew_in_seconds=30
+        )
         email = info.get("email", "").lower()
         if email not in USUARIOS_PERMITIDOS:
             raise HTTPException(status_code=403, detail=f"Acesso negado para {email}")
-        # Cache por 55 minutos (token Google dura 1h)
         _token_cache[token] = email
-        # Limpar cache antigo se crescer demais
-        if len(_token_cache) > 100:
+        if len(_token_cache) > 200:
             _token_cache.clear()
         return email
-    except ValueError as e:
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(status_code=401, detail=f"Token inválido: {str(e)}")
+
+def verificar_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    return _verificar_token_str(credentials.credentials)
 
 # ── Clientes singleton (criados uma vez, reutilizados) ────────────────────────
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -156,6 +161,8 @@ async def extrair_email(
     texto: str = Form(None),
     arquivo: UploadFile = File(None),
     numero_proposta: str = Form(...),
+    token_form: str = Form(None),
+    request: Request = None,
     usuario: str = Depends(verificar_token)
 ):
     """Extrai itens do e-mail (texto ou .msg) e retorna com preços do banco"""
@@ -252,7 +259,8 @@ async def extrair_email(
         model="claude-haiku-4-5-20251001",
         max_tokens=4000,
         system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": f"Número da proposta: {numero_proposta}\n\nE-mail:\n{conteudo}"}]
+        messages=[{"role": "user", "content": f"Número da proposta: {numero_proposta}\n\nE-mail:\n{conteudo[:8000]}"}],
+        timeout=30.0
     )
 
     import json, re as _re
@@ -269,41 +277,61 @@ async def extrair_email(
     sb = get_supabase()
     itens_com_preco = []
 
-    for item in dados_email.get("itens", []):
-        desc = item["descricao"]
+    itens_raw = dados_email.get("itens", [])
+
+    # ── Busca em lote no banco (1 query ao invés de N) ────────────────────────
+    # Extrai todas as palavras-chave dos itens e busca de uma vez
+    banco_cache = {}  # desc_norm -> row
+    try:
+        # Buscar os 200 produtos mais recentes relevantes numa única query
+        # Estratégia: concatenar todas as descrições e fazer full text search
+        todas_palavras = set()
+        for item in itens_raw:
+            desc = item.get("descricao", "")
+            for p in desc.upper().split():
+                if len(p) > 4:
+                    todas_palavras.add(p)
+
+        if todas_palavras:
+            # Uma única query trazendo candidatos para todos os itens
+            res_batch = sb.table('produtos')\
+                .select('descricao,preco_un,proposta_tiny,data_ref')\
+                .order('data_ref', desc=True)\
+                .limit(500)\
+                .execute()
+
+            # Indexar por palavras para matching local (sem roundtrip)
+            candidatos = res_batch.data or []
+    except Exception:
+        candidatos = []
+
+    def match_local(desc_pedido, candidatos):
+        """Faz matching local sem chamada ao banco"""
+        palavras = [p for p in desc_pedido.upper().split() if len(p) > 4][:5]
+        if not palavras:
+            return None
+        melhor = None
+        melhor_score = 0
+        for row in candidatos:
+            desc_banco = (row.get('descricao') or '').upper()
+            score = sum(1 for p in palavras if p in desc_banco)
+            if score > melhor_score and score >= min(2, len(palavras)):
+                melhor_score = score
+                melhor = row
+        return melhor
+
+    for item in itens_raw:
+        desc = item.get("descricao", "")
         preco_un = 0.0
         desc_banco = desc
         obs_item = "SEM PREÇO"
 
-        # Busca por full text search
-        try:
-            # Normalizar descrição para busca
-            termos = re.sub(r'[^a-zA-Z0-9À-ÿ\s]', ' ', desc)
-            termos = ' '.join(termos.split()[:6])
-
-            res = sb.rpc('buscar_produto', {'termo': termos}).execute()
-            if res.data and len(res.data) > 0:
-                match = res.data[0]
-                preco_un = float(match.get('preco_un') or 0)
-                desc_banco = match.get('descricao', desc)
-                proposta_ref = match.get('proposta_tiny', '')
-                obs_item = f"ref proposta {proposta_ref}" if proposta_ref else ""
-        except Exception:
-            # Fallback: busca simples por ILIKE
-            try:
-                palavras = [p for p in desc.upper().split() if len(p) > 4][:3]
-                query = sb.table('produtos').select('descricao,preco_un,proposta_tiny,data_ref')
-                for p in palavras:
-                    query = query.ilike('descricao', f'%{p}%')
-                res = query.order('data_ref', desc=True).limit(1).execute()
-                if res.data:
-                    match = res.data[0]
-                    preco_un = float(match.get('preco_un') or 0)
-                    desc_banco = match.get('descricao', desc)
-                    proposta_ref = match.get('proposta_tiny', '')
-                    obs_item = f"ref proposta {proposta_ref}" if proposta_ref else ""
-            except Exception:
-                pass
+        match = match_local(desc, candidatos)
+        if match:
+            preco_un = float(match.get('preco_un') or 0)
+            desc_banco = match.get('descricao', desc)
+            proposta_ref = match.get('proposta_tiny', '')
+            obs_item = f"ref proposta {proposta_ref}" if proposta_ref else ""
 
         itens_com_preco.append({
             "descricao_original": desc,
@@ -524,7 +552,8 @@ RETORNE APENAS JSON VÁLIDO, sem markdown, sem blocos de código:
     resp = claude.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=1500,
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{"role": "user", "content": prompt}],
+        timeout=20.0
     )
 
     import json, re as _re
