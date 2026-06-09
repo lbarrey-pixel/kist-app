@@ -238,3 +238,28 @@ def banco_stats():
         }
     except Exception as e:
         return {"erro": str(e)}
+
+
+@app.get("/proxima-proposta")
+def proxima_proposta():
+    """Retorna o próximo número de proposta baseado no banco"""
+    sb = get_supabase()
+    try:
+        res = sb.table('produtos')\
+            .select('proposta_tiny')\
+            .not_.is_('proposta_tiny', 'null')\
+            .order('proposta_tiny', desc=True)\
+            .limit(50)\
+            .execute()
+        numeros = []
+        for r in res.data:
+            try:
+                n = int(r['proposta_tiny'])
+                numeros.append(n)
+            except:
+                pass
+        if numeros:
+            return {"proximo": str(max(numeros) + 1)}
+    except Exception as e:
+        return {"erro": str(e)}
+    return {"proximo": ""}

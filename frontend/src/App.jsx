@@ -73,11 +73,16 @@ export default function App() {
   const [stats, setStats] = useState(null);
   const fileRef = useRef();
 
-  // Stats do banco ao carregar
+  // Stats e próximo número ao carregar
   useState(() => {
     fetch(`${API}/banco/stats`)
       .then(r => r.json())
       .then(setStats)
+      .catch(() => {});
+
+    fetch(`${API}/proxima-proposta`)
+      .then(r => r.json())
+      .then(d => { if (d.proximo) setNumeroProposta(d.proximo); })
       .catch(() => {});
   }, []);
 
