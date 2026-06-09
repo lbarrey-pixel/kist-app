@@ -1,18 +1,11 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 
 function Badge({ count, tipo }) {
-  const cores = {
-    total: "bg-slate-100 text-slate-700",
-    preco: "bg-emerald-100 text-emerald-700",
-    sem:   "bg-amber-100 text-amber-700",
-  };
-  return (
-    <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold ${cores[tipo]}`}>
-      {count}
-    </span>
-  );
+  const cores = { total:"bg-slate-100 text-slate-700", preco:"bg-emerald-100 text-emerald-700", sem:"bg-amber-100 text-amber-700" };
+  return <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold ${cores[tipo]}`}>{count}</span>;
 }
 
 function ItemRow({ item, index, onChange }) {
@@ -20,39 +13,18 @@ function ItemRow({ item, index, onChange }) {
     <tr className={index % 2 === 0 ? "bg-white" : "bg-slate-50"}>
       <td className="px-4 py-2 text-sm text-slate-400 w-8">{index + 1}</td>
       <td className="px-4 py-2">
-        <input
-          className="w-full text-sm border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5"
-          value={item.descricao_final}
-          onChange={e => onChange(index, "descricao_final", e.target.value)}
-        />
+        <input className="w-full text-sm border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5" value={item.descricao_final} onChange={e => onChange(index, "descricao_final", e.target.value)} />
       </td>
       <td className="px-4 py-2 w-20">
-        <input
-          type="number"
-          className="w-full text-sm text-center border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5"
-          value={item.quantidade}
-          onChange={e => onChange(index, "quantidade", parseFloat(e.target.value))}
-        />
+        <input type="number" className="w-full text-sm text-center border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5" value={item.quantidade} onChange={e => onChange(index, "quantidade", parseFloat(e.target.value))} />
       </td>
       <td className="px-4 py-2 w-16">
-        <input
-          className="w-full text-sm text-center border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5"
-          value={item.unidade}
-          onChange={e => onChange(index, "unidade", e.target.value)}
-        />
+        <input className="w-full text-sm text-center border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5" value={item.unidade} onChange={e => onChange(index, "unidade", e.target.value)} />
       </td>
       <td className="px-4 py-2 w-32">
         <div className="flex items-center gap-1">
           <span className="text-xs text-slate-400">R$</span>
-          <input
-            type="number"
-            step="0.001"
-            className={`w-full text-sm text-right border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5 ${
-              item.preco_un > 0 ? "text-slate-800" : "text-amber-600 font-medium"
-            }`}
-            value={item.preco_un}
-            onChange={e => onChange(index, "preco_un", parseFloat(e.target.value) || 0)}
-          />
+          <input type="number" step="0.001" className={`w-full text-sm text-right border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5 ${item.preco_un > 0 ? "text-slate-800" : "text-amber-600 font-medium"}`} value={item.preco_un} onChange={e => onChange(index, "preco_un", parseFloat(e.target.value) || 0)} />
         </div>
       </td>
       <td className="px-4 py-2 w-8">
@@ -63,6 +35,8 @@ function ItemRow({ item, index, onChange }) {
 }
 
 export default function App() {
+  const [usuario, setUsuario] = useState(null);
+  const [token, setToken] = useState(null);
   const [step, setStep] = useState("input");
   const [loading, setLoading] = useState(false);
   const [salvandoBanco, setSalvandoBanco] = useState(false);
@@ -76,53 +50,78 @@ export default function App() {
   const [bancoInfo, setBancoInfo] = useState(null);
   const fileRef = useRef();
 
-  useState(() => {
-    fetch(`${API}/banco/stats`).then(r => r.json()).then(setStats).catch(() => {});
-    fetch(`${API}/proxima-proposta`).then(r => r.json())
-      .then(d => { if (d.proximo) setNumeroProposta(d.proximo); }).catch(() => {});
+  // Carregar Google Identity Services
+  useEffect(() => {
+    const script = document.createElement("script");
+    script.src = "https://accounts.google.com/gsi/client";
+    script.async = true;
+    script.defer = true;
+    document.head.appendChild(script);
+    return () => document.head.removeChild(script);
   }, []);
 
-  // ── Drag & drop — aceita .msg arrastado do Outlook ────────────────────────
-  const handleDragOver = useCallback((e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(true);
-  }, []);
+  // Stats e próximo número (só após login)
+  useEffect(() => {
+    if (!token) return;
+    fetch(`${API}/banco/stats`, { headers: { Authorization: `Bearer ${token}` } })
+      .then(r => r.json()).then(setStats).catch(() => {});
+    fetch(`${API}/proxima-proposta`, { headers: { Authorization: `Bearer ${token}` } })
+      .then(r => r.json()).then(d => { if (d.proximo) setNumeroProposta(d.proximo); }).catch(() => {});
+  }, [token]);
 
-  const handleDragLeave = useCallback((e) => {
-    e.preventDefault();
-    setIsDragging(false);
-  }, []);
+  function handleGoogleResponse(response) {
+    const credential = response.credential;
+    // Decodificar JWT para pegar nome/email (sem verificar — só display)
+    const payload = JSON.parse(atob(credential.split('.')[1]));
+    setToken(credential);
+    setUsuario({ nome: payload.name, email: payload.email, foto: payload.picture });
+  }
 
-  const handleDrop = useCallback((e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(false);
-
-    // Tentar pegar arquivo do dataTransfer (funciona ao arrastar do explorador)
-    const files = e.dataTransfer.files;
-    if (files && files.length > 0) {
-      const f = files[0];
-      setArquivo(f);
-      setTexto("");
-      return;
+  function iniciarLoginGoogle() {
+    if (window.google) {
+      window.google.accounts.id.initialize({
+        client_id: GOOGLE_CLIENT_ID,
+        callback: handleGoogleResponse,
+      });
+      window.google.accounts.id.prompt();
     }
+  }
 
-    // Fallback: arrastar do Outlook pode vir como texto/html
-    const html = e.dataTransfer.getData("text/html");
+  function renderBotaoGoogle() {
+    if (!window.google) return;
+    window.google.accounts.id.initialize({
+      client_id: GOOGLE_CLIENT_ID,
+      callback: handleGoogleResponse,
+    });
+    window.google.accounts.id.renderButton(
+      document.getElementById("google-btn"),
+      { theme: "outline", size: "large", text: "signin_with", locale: "pt-BR", width: 280 }
+    );
+  }
+
+  function logout() {
+    setUsuario(null); setToken(null);
+    setStep("input"); setResultado(null);
+    setTexto(""); setArquivo(null);
+    setNumeroProposta(""); setErro("");
+  }
+
+  const authHeaders = () => ({ Authorization: `Bearer ${token}` });
+
+  const handleDragOver = useCallback((e) => { e.preventDefault(); setIsDragging(true); }, []);
+  const handleDragLeave = useCallback((e) => { e.preventDefault(); setIsDragging(false); }, []);
+  const handleDrop = useCallback((e) => {
+    e.preventDefault(); setIsDragging(false);
+    const files = e.dataTransfer.files;
+    if (files && files.length > 0) { setArquivo(files[0]); setTexto(""); return; }
     const plain = e.dataTransfer.getData("text/plain");
-    if (plain && plain.trim()) {
-      setTexto(plain.trim());
-      setArquivo(null);
-    } else if (html) {
-      // Converter HTML para texto limpo
+    const html = e.dataTransfer.getData("text/html");
+    if (plain?.trim()) { setTexto(plain.trim()); setArquivo(null); }
+    else if (html) {
       const tmp = document.createElement("div");
       tmp.innerHTML = html;
       const txt = tmp.innerText || tmp.textContent || "";
-      if (txt.trim()) {
-        setTexto(txt.trim());
-        setArquivo(null);
-      }
+      if (txt.trim()) { setTexto(txt.trim()); setArquivo(null); }
     }
   }, []);
 
@@ -140,88 +139,88 @@ export default function App() {
       form.append("numero_proposta", numeroProposta);
       if (arquivo) form.append("arquivo", arquivo);
       else form.append("texto", texto);
-
-      const res = await fetch(`${API}/extrair`, { method: "POST", body: form });
+      const res = await fetch(`${API}/extrair`, { method: "POST", headers: authHeaders(), body: form });
       if (!res.ok) {
         const err = await res.json();
+        if (res.status === 401 || res.status === 403) { setErro("Sessão expirada. Faça login novamente."); logout(); return; }
         throw new Error(err.detail || "Erro no servidor");
       }
       const data = await res.json();
-      setResultado(data);
-      setStep("resultado");
-    } catch (e) {
-      setErro(e.message);
-    } finally {
-      setLoading(false);
-    }
+      setResultado(data); setStep("resultado");
+    } catch (e) { setErro(e.message); }
+    finally { setLoading(false); }
   }
 
   function atualizarItem(index, campo, valor) {
-    setResultado(prev => ({
-      ...prev,
-      itens: prev.itens.map((item, i) => i === index ? { ...item, [campo]: valor } : item),
-    }));
+    setResultado(prev => ({ ...prev, itens: prev.itens.map((item, i) => i === index ? { ...item, [campo]: valor } : item) }));
   }
 
   async function baixarCSV() {
-    setLoading(true);
-    setBancoInfo(null);
-
+    setLoading(true); setSalvandoBanco(true); setBancoInfo(null);
     try {
-      // 1. Atualizar banco de preços ANTES de baixar
-      setSalvandoBanco(true);
       const itensCom = resultado.itens.filter(i => i.preco_un > 0);
       if (itensCom.length > 0) {
         try {
           const resBanco = await fetch(`${API}/upsert-precos`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", ...authHeaders() },
             body: JSON.stringify(resultado),
           });
-          if (resBanco.ok) {
-            const info = await resBanco.json();
-            setBancoInfo(info);
-          }
-        } catch (e) {
-          console.warn("Aviso: não foi possível atualizar banco:", e);
-        }
+          if (resBanco.ok) setBancoInfo(await resBanco.json());
+        } catch (e) { console.warn("Aviso banco:", e); }
       }
       setSalvandoBanco(false);
-
-      // 2. Gerar e baixar CSV
       const res = await fetch(`${API}/gerar-csv`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify(resultado),
       });
       if (!res.ok) throw new Error("Erro ao gerar CSV");
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
-      a.href = url;
-      a.download = `proposta_${resultado.proposta}.csv`;
-      a.click();
+      a.href = url; a.download = `proposta_${resultado.proposta}.csv`; a.click();
       URL.revokeObjectURL(url);
       setStep("download");
-    } catch (e) {
-      setErro(e.message);
-    } finally {
-      setLoading(false);
-      setSalvandoBanco(false);
-    }
+    } catch (e) { setErro(e.message); }
+    finally { setLoading(false); setSalvandoBanco(false); }
   }
 
   function reiniciar() {
     setStep("input"); setResultado(null); setBancoInfo(null);
     setTexto(""); setArquivo(null); setNumeroProposta(""); setErro("");
-    fetch(`${API}/proxima-proposta`).then(r => r.json())
-      .then(d => { if (d.proximo) setNumeroProposta(d.proximo); }).catch(() => {});
+    fetch(`${API}/proxima-proposta`, { headers: authHeaders() })
+      .then(r => r.json()).then(d => { if (d.proximo) setNumeroProposta(d.proximo); }).catch(() => {});
   }
 
+  // ── TELA DE LOGIN ─────────────────────────────────────────────────────────
+  if (!usuario) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center font-sans">
+        <div className="bg-white rounded-2xl border border-slate-200 p-10 w-full max-w-sm text-center shadow-sm">
+          <div className="w-14 h-14 bg-blue-600 rounded-2xl flex items-center justify-center mx-auto mb-5">
+            <span className="text-white font-bold text-2xl">K</span>
+          </div>
+          <h1 className="text-xl font-semibold text-slate-800 mb-1">Kist Propostas</h1>
+          <p className="text-sm text-slate-500 mb-8">Faça login com sua conta Google para acessar</p>
+          <div id="google-btn" className="flex justify-center mb-4" ref={el => { if (el && window.google) renderBotaoGoogle(); }}></div>
+          <button
+            onClick={iniciarLoginGoogle}
+            className="w-full border border-slate-300 rounded-lg py-2.5 text-sm text-slate-700 hover:bg-slate-50 flex items-center justify-center gap-2 transition-colors"
+          >
+            <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#4285F4" d="M44.5 20H24v8.5h11.8C34.7 33.9 30.1 37 24 37c-7.2 0-13-5.8-13-13s5.8-13 13-13c3.1 0 5.9 1.1 8.1 2.9l6.4-6.4C34.6 5.1 29.6 3 24 3 12.9 3 4 11.9 4 23s8.9 20 20 20c11 0 19.7-7.7 19.7-20 0-1.3-.1-2.7-.2-3z"/><path fill="#34A853" d="M6.3 14.7l7 5.1C15.1 16.2 19.2 13 24 13c3.1 0 5.9 1.1 8.1 2.9l6.4-6.4C34.6 5.1 29.6 3 24 3 16.3 3 9.7 7.9 6.3 14.7z"/><path fill="#FBBC05" d="M24 43c5.8 0 10.7-1.9 14.3-5.2l-6.6-5.4C29.8 34.1 27.1 35 24 35c-6 0-11.1-4-12.9-9.5l-7 5.4C7.6 39.1 15.2 43 24 43z"/><path fill="#EA4335" d="M43.6 20H24v8.5h11.8c-.8 2.3-2.3 4.3-4.3 5.8l6.6 5.4C41.8 36.1 44 30 44 24c0-1.3-.1-2.7-.4-4z"/></svg>
+            Entrar com Google
+          </button>
+          <p className="text-xs text-slate-400 mt-4">Acesso restrito à equipe Kist</p>
+        </div>
+      </div>
+    );
+  }
+
+  // ── APP PRINCIPAL ──────────────────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-slate-50 font-sans">
-      {/* Header */}
-      <header className="bg-white border-b border-slate-200 px-6 py-4">
+      <header className="bg-white border-b border-slate-200 px-6 py-3">
         <div className="max-w-5xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center">
@@ -232,72 +231,46 @@ export default function App() {
               <div className="text-xs text-slate-400">Gerador de Propostas</div>
             </div>
           </div>
-          {stats && (
-            <div className="hidden sm:flex items-center gap-4 text-xs text-slate-500">
-              <span>{stats.total_produtos?.toLocaleString()} produtos no banco</span>
-              {stats.desatualizados_90d > 0 && (
-                <span className="text-amber-500">⚠ {stats.desatualizados_90d} preços desatualizados</span>
-              )}
+          <div className="flex items-center gap-4">
+            {stats && (
+              <div className="hidden sm:flex items-center gap-4 text-xs text-slate-500">
+                <span>{stats.total_produtos?.toLocaleString()} produtos no banco</span>
+                {stats.desatualizados_90d > 0 && <span className="text-amber-500">⚠ {stats.desatualizados_90d} desatualizados</span>}
+              </div>
+            )}
+            <div className="flex items-center gap-2">
+              {usuario.foto && <img src={usuario.foto} alt="" className="w-7 h-7 rounded-full" />}
+              <span className="text-xs text-slate-600 hidden sm:block">{usuario.nome}</span>
+              <button onClick={logout} className="text-xs text-slate-400 hover:text-red-400 ml-1 transition-colors">Sair</button>
             </div>
-          )}
+          </div>
         </div>
       </header>
 
       <main className="max-w-5xl mx-auto px-6 py-8">
 
-        {/* STEP: INPUT */}
         {step === "input" && (
           <div className="max-w-2xl mx-auto">
             <div className="mb-8">
               <h1 className="text-2xl font-bold text-slate-800 mb-1">Nova proposta</h1>
               <p className="text-slate-500 text-sm">Arraste o e-mail do Outlook, faça upload do .msg ou cole o texto</p>
             </div>
-
             <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-5">
-              {/* Número da proposta */}
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1.5">
-                  Número da proposta <span className="text-red-400">*</span>
-                </label>
-                <input
-                  className="w-full border border-slate-300 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  placeholder="ex: 1050370"
-                  value={numeroProposta}
-                  onChange={e => setNumeroProposta(e.target.value)}
-                />
+                <label className="block text-sm font-medium text-slate-700 mb-1.5">Número da proposta <span className="text-red-400">*</span></label>
+                <input className="w-full border border-slate-300 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="ex: 1050370" value={numeroProposta} onChange={e => setNumeroProposta(e.target.value)} />
               </div>
-
-              {/* Área de drag & drop */}
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1.5">
-                  E-mail de cotação
-                </label>
-                <div
-                  onDragOver={handleDragOver}
-                  onDragLeave={handleDragLeave}
-                  onDrop={handleDrop}
-                  onClick={() => !arquivo && !texto && fileRef.current.click()}
-                  className={`border-2 border-dashed rounded-xl transition-all ${
-                    isDragging
-                      ? "border-blue-400 bg-blue-50 scale-[1.01]"
-                      : arquivo
-                      ? "border-blue-300 bg-blue-50"
-                      : "border-slate-200 hover:border-slate-300 hover:bg-slate-50"
-                  }`}
-                >
+                <label className="block text-sm font-medium text-slate-700 mb-1.5">E-mail de cotação</label>
+                <div onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop} onClick={() => !arquivo && !texto && fileRef.current.click()}
+                  className={`border-2 border-dashed rounded-xl transition-all cursor-pointer ${isDragging ? "border-blue-400 bg-blue-50 scale-[1.01]" : arquivo ? "border-blue-300 bg-blue-50" : "border-slate-200 hover:border-slate-300 hover:bg-slate-50"}`}>
                   {arquivo ? (
                     <div className="p-4 flex items-center justify-between">
                       <div className="flex items-center gap-3">
                         <div className="w-10 h-10 bg-blue-100 rounded-lg flex items-center justify-center text-blue-600 text-lg">📧</div>
-                        <div>
-                          <div className="text-sm font-medium text-slate-700">{arquivo.name}</div>
-                          <div className="text-xs text-slate-400">{(arquivo.size / 1024).toFixed(0)} KB</div>
-                        </div>
+                        <div><div className="text-sm font-medium text-slate-700">{arquivo.name}</div><div className="text-xs text-slate-400">{(arquivo.size/1024).toFixed(0)} KB</div></div>
                       </div>
-                      <button
-                        onClick={e => { e.stopPropagation(); setArquivo(null); }}
-                        className="text-slate-400 hover:text-red-400 text-lg px-2"
-                      >✕</button>
+                      <button onClick={e => { e.stopPropagation(); setArquivo(null); }} className="text-slate-400 hover:text-red-400 text-lg px-2">✕</button>
                     </div>
                   ) : texto ? (
                     <div className="p-4">
@@ -305,58 +278,32 @@ export default function App() {
                         <span className="text-xs font-medium text-slate-500">Texto colado</span>
                         <button onClick={() => setTexto("")} className="text-slate-400 hover:text-red-400 text-xs">limpar</button>
                       </div>
-                      <p className="text-xs text-slate-600 line-clamp-3 font-mono">{texto.slice(0, 200)}...</p>
+                      <p className="text-xs text-slate-600 line-clamp-3 font-mono">{texto.slice(0,200)}...</p>
                     </div>
                   ) : (
                     <div className="p-8 text-center">
                       <div className="text-4xl mb-3">📨</div>
-                      <p className="text-sm font-medium text-slate-600 mb-1">
-                        {isDragging ? "Solte aqui!" : "Arraste o e-mail do Outlook"}
-                      </p>
+                      <p className="text-sm font-medium text-slate-600 mb-1">{isDragging ? "Solte aqui!" : "Arraste o e-mail do Outlook"}</p>
                       <p className="text-xs text-slate-400 mb-3">ou clique para selecionar um arquivo .msg</p>
-                      <button
-                        onClick={e => { e.stopPropagation(); fileRef.current.click(); }}
-                        className="text-xs bg-slate-100 hover:bg-slate-200 text-slate-600 px-3 py-1.5 rounded-lg transition-colors"
-                      >
-                        Procurar arquivo
-                      </button>
+                      <button onClick={e => { e.stopPropagation(); fileRef.current.click(); }} className="text-xs bg-slate-100 hover:bg-slate-200 text-slate-600 px-3 py-1.5 rounded-lg transition-colors">Procurar arquivo</button>
                     </div>
                   )}
                 </div>
                 <input ref={fileRef} type="file" accept=".msg,.eml" className="hidden" onChange={handleArquivo} />
               </div>
-
-              {/* Divisor */}
               <div className="relative">
                 <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-slate-200" /></div>
                 <div className="relative flex justify-center"><span className="bg-white px-3 text-xs text-slate-400">ou cole o texto do e-mail</span></div>
               </div>
-
-              {/* Textarea */}
-              <textarea
-                rows={6}
-                className="w-full border border-slate-300 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none font-mono"
-                placeholder="Cole aqui o conteúdo do e-mail..."
-                value={texto}
-                onChange={e => { setTexto(e.target.value); setArquivo(null); }}
-              />
-
-              {erro && (
-                <div className="bg-red-50 border border-red-200 rounded-lg px-4 py-3 text-sm text-red-600">{erro}</div>
-              )}
-
-              <button
-                onClick={processar}
-                disabled={loading}
-                className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white font-medium py-2.5 rounded-lg text-sm transition-colors flex items-center justify-center gap-2"
-              >
+              <textarea rows={6} className="w-full border border-slate-300 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none font-mono" placeholder="Cole aqui o conteúdo do e-mail..." value={texto} onChange={e => { setTexto(e.target.value); setArquivo(null); }} />
+              {erro && <div className="bg-red-50 border border-red-200 rounded-lg px-4 py-3 text-sm text-red-600">{erro}</div>}
+              <button onClick={processar} disabled={loading} className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white font-medium py-2.5 rounded-lg text-sm transition-colors flex items-center justify-center gap-2">
                 {loading ? <><span className="animate-spin inline-block">⟳</span> Processando...</> : "Processar e-mail"}
               </button>
             </div>
           </div>
         )}
 
-        {/* STEP: RESULTADO */}
         {step === "resultado" && resultado && (
           <div>
             <div className="flex items-start justify-between mb-6">
@@ -374,37 +321,15 @@ export default function App() {
                 </div>
               </div>
               <div className="flex gap-2">
-                <button onClick={reiniciar} className="px-4 py-2 text-sm border border-slate-300 rounded-lg hover:bg-slate-50 text-slate-600">
-                  Nova proposta
-                </button>
-                <button
-                  onClick={baixarCSV}
-                  disabled={loading || salvandoBanco}
-                  className="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white rounded-lg font-medium transition-colors flex items-center gap-1.5"
-                >
-                  {salvandoBanco
-                    ? <><span className="animate-spin inline-block">⟳</span> Salvando banco...</>
-                    : loading
-                    ? "Gerando..."
-                    : "⬇ Confirmar e baixar CSV"}
+                <button onClick={reiniciar} className="px-4 py-2 text-sm border border-slate-300 rounded-lg hover:bg-slate-50 text-slate-600">Nova proposta</button>
+                <button onClick={baixarCSV} disabled={loading || salvandoBanco} className="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white rounded-lg font-medium transition-colors flex items-center gap-1.5">
+                  {salvandoBanco ? <><span className="animate-spin inline-block">⟳</span> Salvando banco...</> : loading ? "Gerando..." : "⬇ Confirmar e baixar CSV"}
                 </button>
               </div>
             </div>
-
-            {resultado.sem_preco > 0 && (
-              <div className="bg-amber-50 border border-amber-200 rounded-lg px-4 py-3 mb-4 text-sm text-amber-700">
-                <strong>{resultado.sem_preco} {resultado.sem_preco === 1 ? "item" : "itens"} sem preço</strong> — preencha manualmente antes de baixar ou deixe zerado para cotar depois.
-              </div>
-            )}
-
-            <div className="bg-blue-50 border border-blue-200 rounded-lg px-4 py-3 mb-4 text-sm text-blue-700">
-              💾 Ao clicar em <strong>"Confirmar e baixar CSV"</strong> os preços serão salvos automaticamente no banco de preços.
-            </div>
-
-            {erro && (
-              <div className="bg-red-50 border border-red-200 rounded-lg px-4 py-3 mb-4 text-sm text-red-600">{erro}</div>
-            )}
-
+            {resultado.sem_preco > 0 && <div className="bg-amber-50 border border-amber-200 rounded-lg px-4 py-3 mb-4 text-sm text-amber-700"><strong>{resultado.sem_preco} {resultado.sem_preco === 1 ? "item" : "itens"} sem preço</strong> — preencha manualmente antes de baixar.</div>}
+            <div className="bg-blue-50 border border-blue-200 rounded-lg px-4 py-3 mb-4 text-sm text-blue-700">💾 Ao confirmar, os preços serão salvos automaticamente no banco de preços.</div>
+            {erro && <div className="bg-red-50 border border-red-200 rounded-lg px-4 py-3 mb-4 text-sm text-red-600">{erro}</div>}
             <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
               <table className="w-full text-sm">
                 <thead>
@@ -418,9 +343,7 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {resultado.itens.map((item, i) => (
-                    <ItemRow key={i} item={item} index={i} onChange={atualizarItem} />
-                  ))}
+                  {resultado.itens.map((item, i) => <ItemRow key={i} item={item} index={i} onChange={atualizarItem} />)}
                 </tbody>
               </table>
             </div>
@@ -428,24 +351,13 @@ export default function App() {
           </div>
         )}
 
-        {/* STEP: DOWNLOAD */}
         {step === "download" && (
           <div className="max-w-md mx-auto text-center py-16">
-            <div className="w-16 h-16 bg-emerald-100 rounded-full flex items-center justify-center mx-auto mb-4">
-              <span className="text-3xl">✓</span>
-            </div>
+            <div className="w-16 h-16 bg-emerald-100 rounded-full flex items-center justify-center mx-auto mb-4"><span className="text-3xl">✓</span></div>
             <h2 className="text-xl font-bold text-slate-800 mb-2">CSV baixado!</h2>
-            <p className="text-slate-500 text-sm mb-4">
-              Arquivo <code className="bg-slate-100 px-1.5 py-0.5 rounded text-xs">proposta_{resultado?.proposta}.csv</code> pronto para importar no Tiny.
-            </p>
-            {bancoInfo && (
-              <div className="bg-emerald-50 border border-emerald-200 rounded-lg px-4 py-3 mb-6 text-sm text-emerald-700">
-                💾 Banco de preços atualizado — <strong>{bancoInfo.atualizados}</strong> {bancoInfo.atualizados === 1 ? "preço atualizado" : "preços atualizados"}, <strong>{bancoInfo.inseridos}</strong> {bancoInfo.inseridos === 1 ? "novo inserido" : "novos inseridos"}
-              </div>
-            )}
-            <button onClick={reiniciar} className="bg-blue-600 hover:bg-blue-700 text-white font-medium py-2.5 px-6 rounded-lg text-sm">
-              Processar outra proposta
-            </button>
+            <p className="text-slate-500 text-sm mb-4">Arquivo <code className="bg-slate-100 px-1.5 py-0.5 rounded text-xs">proposta_{resultado?.proposta}.csv</code> pronto para importar no Tiny.</p>
+            {bancoInfo && <div className="bg-emerald-50 border border-emerald-200 rounded-lg px-4 py-3 mb-6 text-sm text-emerald-700">💾 Banco atualizado — <strong>{bancoInfo.atualizados}</strong> preços atualizados, <strong>{bancoInfo.inseridos}</strong> novos inseridos</div>}
+            <button onClick={reiniciar} className="bg-blue-600 hover:bg-blue-700 text-white font-medium py-2.5 px-6 rounded-lg text-sm">Processar outra proposta</button>
           </div>
         )}
       </main>

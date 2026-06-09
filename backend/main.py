@@ -1,13 +1,16 @@
 import os, csv, io, re
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional
 import anthropic
 from supabase import create_client
 from datetime import date
 import extract_msg
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 
 app = FastAPI(title="Kist Cotações API")
 
@@ -17,6 +20,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+GOOGLE_CLIENT_ID  = os.environ.get("GOOGLE_CLIENT_ID", "822792475898-4l9ctl5jc1urpi2tvbuaut2tpelgevfo.apps.googleusercontent.com")
+USUARIOS_PERMITIDOS = set(os.environ.get("USUARIOS_PERMITIDOS", "leonardobarrey@gmail.com,thiagokist@gmail.com,fabiokist@gmail.com").split(","))
+
+security = HTTPBearer()
+
+def verificar_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    try:
+        info = id_token.verify_oauth2_token(token, google_requests.Request(), GOOGLE_CLIENT_ID)
+        email = info.get("email", "").lower()
+        if email not in USUARIOS_PERMITIDOS:
+            raise HTTPException(status_code=403, detail=f"Acesso negado para {email}")
+        return email
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=f"Token inválido: {str(e)}")
 
 # ── Clientes ──────────────────────────────────────────────────────────────────
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -70,7 +90,8 @@ def health():
 async def extrair_email(
     texto: str = Form(None),
     arquivo: UploadFile = File(None),
-    numero_proposta: str = Form(...)
+    numero_proposta: str = Form(...),
+    usuario: str = Depends(verificar_token)
 ):
     """Extrai itens do e-mail (texto ou .msg) e retorna com preços do banco"""
 
@@ -243,7 +264,7 @@ async def extrair_email(
 
 
 @app.post("/upsert-precos")
-async def upsert_precos(payload: dict):
+async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
     """Atualiza/insere preços no banco após confirmação do usuário"""
     sb = get_supabase()
     proposta = payload.get("proposta", "")
@@ -298,7 +319,7 @@ async def upsert_precos(payload: dict):
 
 
 @app.post("/gerar-csv")
-async def gerar_csv(payload: dict):
+async def gerar_csv(payload: dict, usuario: str = Depends(verificar_token)):
     """Gera CSV no formato Tiny a partir do payload confirmado"""
 
     COLUNAS = [

@@ -8,3 +8,4 @@ pydantic
 pdfplumber
 openpyxl
 xlrd
+google-auth
