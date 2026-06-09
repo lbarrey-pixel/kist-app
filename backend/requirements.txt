@@ -1,7 +1,7 @@
-fastapi==0.115.0
-uvicorn==0.30.6
-python-multipart==0.0.9
-anthropic==0.40.0
-supabase==2.10.0
-extract-msg==0.52.0
-pydantic==2.9.2
+fastapi
+uvicorn
+python-multipart
+anthropic
+supabase
+extract-msg
+pydantic
