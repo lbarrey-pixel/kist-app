@@ -81,7 +81,80 @@ async def extrair_email(
         with open("/tmp/upload.msg", "wb") as f:
             f.write(dados)
         msg = extract_msg.openMsg("/tmp/upload.msg")
-        conteudo = f"Assunto: {msg.subject}\n\n{msg.body}"
+        corpo = (msg.body or "").strip()
+        conteudo = f"Assunto: {msg.subject}\n\nCorpo:\n{corpo}"
+
+        # Extrair conteúdo de todos os anexos relevantes
+        textos_anexos = []
+        for att in msg.attachments:
+            fname = (att.longFilename or att.shortFilename or "")
+            fname_lower = fname.lower()
+            if not att.data:
+                continue
+
+            # PDF
+            if fname_lower.endswith(".pdf"):
+                try:
+                    import pdfplumber, io as _io
+                    with pdfplumber.open(_io.BytesIO(att.data)) as pdf:
+                        texto_pdf = ""
+                        for page in pdf.pages:
+                            t = page.extract_text()
+                            if t:
+                                texto_pdf += t + "\n"
+                    if texto_pdf.strip():
+                        textos_anexos.append(f"[ANEXO PDF: {fname}]\n{texto_pdf.strip()}")
+                    else:
+                        textos_anexos.append(f"[ANEXO PDF: {fname} - sem texto extraível (possível imagem escaneada)]")
+                except Exception as e:
+                    textos_anexos.append(f"[ANEXO PDF: {fname} - erro: {str(e)}]")
+
+            # Excel (.xlsx / .xls / .xlsm)
+            elif fname_lower.endswith((".xlsx", ".xls", ".xlsm")):
+                try:
+                    import openpyxl, io as _io
+                    wb = openpyxl.load_workbook(_io.BytesIO(att.data), read_only=True, data_only=True)
+                    linhas_excel = []
+                    for sheet_name in wb.sheetnames:
+                        ws = wb[sheet_name]
+                        sheet_linhas = []
+                        for row in ws.iter_rows(values_only=True):
+                            # Filtrar linhas completamente vazias
+                            vals = [str(c).strip() if c is not None else "" for c in row]
+                            if any(v for v in vals):
+                                sheet_linhas.append(" | ".join(vals))
+                        if sheet_linhas:
+                            linhas_excel.append(f"--- Aba: {sheet_name} ---\n" + "\n".join(sheet_linhas[:200]))
+                    if linhas_excel:
+                        textos_anexos.append(f"[ANEXO EXCEL: {fname}]\n" + "\n\n".join(linhas_excel))
+                except Exception as e:
+                    # Fallback: tentar com xlrd para .xls antigo
+                    try:
+                        import xlrd, io as _io
+                        wb = xlrd.open_workbook(file_contents=att.data)
+                        linhas = []
+                        for sheet in wb.sheets():
+                            for rx in range(sheet.nrows):
+                                row = sheet.row(rx)
+                                vals = [str(c.value).strip() for c in row if str(c.value).strip()]
+                                if vals:
+                                    linhas.append(" | ".join(vals))
+                        if linhas:
+                            textos_anexos.append(f"[ANEXO EXCEL: {fname}]\n" + "\n".join(linhas[:200]))
+                    except Exception as e2:
+                        textos_anexos.append(f"[ANEXO EXCEL: {fname} - erro: {str(e2)}]")
+
+            # CSV
+            elif fname_lower.endswith(".csv"):
+                try:
+                    texto_csv = att.data.decode("utf-8-sig", errors="replace")
+                    textos_anexos.append(f"[ANEXO CSV: {fname}]\n{texto_csv[:3000]}")
+                except Exception as e:
+                    textos_anexos.append(f"[ANEXO CSV: {fname} - erro: {str(e)}]")
+
+        if textos_anexos:
+            conteudo += "\n\n" + "\n\n".join(textos_anexos)
+
     elif texto:
         conteudo = texto
     else:

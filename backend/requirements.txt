@@ -5,3 +5,6 @@ anthropic
 supabase
 extract-msg
 pydantic
+pdfplumber
+openpyxl
+xlrd
