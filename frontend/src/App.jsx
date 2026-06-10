@@ -51,11 +51,15 @@ function ItemRow({ item, index, onChange, token, apiUrl }) {
         <td className="px-3 py-2">
           <input className="w-full text-sm border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5"
             value={item.descricao_final} onChange={e => onChange(index, "descricao_final", e.target.value)} />
+          {confianca === "baixa" && item.banco_candidato && (
+            <div className="mt-1 text-xs text-amber-600">
+              ⚠ match incerto — ref. banco: <span className="text-slate-600">{item.banco_candidato}</span>
+            </div>
+          )}
           <div className="flex items-center gap-2 mt-0.5">
             <span className={`text-xs px-1.5 py-0.5 rounded ${CONFIANCA_STYLE[confianca]}`}>
               {CONFIANCA_LABEL[confianca]}
             </span>
-            {item.obs && <span className="text-xs text-slate-400 truncate max-w-[200px]">{item.obs}</span>}
             {item.sugerir_pn && (
               <button onClick={buscarSugestoes} disabled={loadingPn}
                 className="text-xs text-blue-500 hover:text-blue-700 disabled:opacity-50">
@@ -485,11 +489,20 @@ export default function App() {
               </div>
             </div>
 
-            {resultado.sem_preco > 0 && (
-              <div className="bg-amber-50 border border-amber-200 rounded-lg px-4 py-3 mb-3 text-sm text-amber-700">
-                <strong>{resultado.sem_preco} {resultado.sem_preco === 1 ? "item" : "itens"} sem preço</strong> — preencha manualmente ou deixe zerado para cotar depois.
-              </div>
-            )}
+            {(() => {
+              const semPreco = resultado.itens.filter(i => !i.tem_preco).length;
+              const incertos = resultado.itens.filter(i => i.confianca_match === "baixa").length;
+              if (semPreco === 0 && incertos === 0) return null;
+              return (
+                <div className="bg-amber-50 border border-amber-200 rounded-lg px-4 py-3 mb-3 text-sm text-amber-700">
+                  <div className="font-medium mb-1">⚠ Atenção — revisão necessária antes de baixar:</div>
+                  <ul className="list-disc list-inside space-y-0.5 text-amber-600">
+                    {semPreco > 0 && <li><strong>{semPreco} {semPreco === 1 ? "item" : "itens"} sem preço</strong> — não encontrado no banco, cotar manualmente</li>}
+                    {incertos > 0 && <li><strong>{incertos} {incertos === 1 ? "item com match incerto" : "itens com match incerto"}</strong> — confirme se o candidato sugerido é realmente o mesmo produto</li>}
+                  </ul>
+                </div>
+              );
+            })()}
             <div className="bg-blue-50 border border-blue-200 rounded-lg px-4 py-3 mb-3 text-sm text-blue-700">
               💾 Ao confirmar, os preços serão salvos automaticamente no banco.
             </div>
