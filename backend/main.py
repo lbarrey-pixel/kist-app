@@ -363,6 +363,7 @@ Lembre: fabricante diferente = null. Categoria diferente = null. Seja rigoroso."
         max_tokens=3000,
         system=SYSTEM_MATCHING,
         messages=[{"role": "user", "content": prompt_matching}],
+        temperature=0.0,  # matching analítico — máxima consistência
         timeout=30.0
     )
 
@@ -389,14 +390,17 @@ Lembre: fabricante diferente = null. Categoria diferente = null. Seja rigoroso."
         obs_item = "SEM PREÇO"
 
         if confianca in ("alta", "media") and match.get("banco_descricao"):
+            # Match confiável: usa descrição do banco (mais completa/canônica)
             desc_final = match["banco_descricao"]
             preco_un = float(match.get("banco_preco") or 0)
             proposta_ref = match.get("banco_proposta", "")
             obs_item = f"{'✓' if confianca == 'alta' else '~'} ref {proposta_ref}" if proposta_ref else ""
         elif confianca == "baixa" and match.get("banco_descricao"):
-            desc_final = match["banco_descricao"]
+            # Match incerto: PRESERVA descrição original do cliente
+            # mas guarda o candidato do banco para o operador conferir
+            desc_final = desc  # descrição original do cliente, sem alterar
             preco_un = float(match.get("banco_preco") or 0)
-            obs_item = f"⚠ match incerto: {match.get('motivo','')[:60]}"
+            obs_item = f"⚠ CONFIRA — candidato no banco: {match['banco_descricao']} | motivo: {match.get('motivo','')}"
 
         itens_com_preco.append({
             "descricao_original": desc_original,
@@ -407,6 +411,9 @@ Lembre: fabricante diferente = null. Categoria diferente = null. Seja rigoroso."
             "preco_un": preco_un,
             "obs": obs_item,
             "confianca_match": confianca,
+            "banco_candidato": match.get("banco_descricao") if confianca == "baixa" else None,
+            "banco_candidato_preco": float(match.get("banco_preco") or 0) if confianca == "baixa" else None,
+            "motivo_incerto": match.get("motivo", "") if confianca == "baixa" else None,
             "tem_preco": preco_un > 0,
             "sugerir_pn": _validar_sugerir_pn(item.get("sugerir_pn", False), desc)
         })
