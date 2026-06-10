@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from "react";
+import Docs from "./Docs.jsx";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
@@ -140,6 +141,7 @@ function ItemRow({ item, index, onChange, token, apiUrl }) {
 
 export default function App() {
   const [usuario, setUsuario] = useState(null);
+  const [showDocs, setShowDocs] = useState(false);
   const [token, setToken] = useState(null);
   const [step, setStep] = useState("input");
   const [loading, setLoading] = useState(false);
@@ -370,13 +372,19 @@ export default function App() {
             <div className="flex items-center gap-2">
               {usuario.foto && <img src={usuario.foto} alt="" className="w-7 h-7 rounded-full" />}
               <span className="text-xs text-slate-600 hidden sm:block">{usuario.nome}</span>
+              <button onClick={() => setShowDocs(v => !v)} className={`text-xs px-2 py-1 rounded transition-colors ${showDocs ? "bg-blue-100 text-blue-600" : "text-slate-400 hover:text-slate-600"}`}>Docs</button>
               <button onClick={logout} className="text-xs text-slate-400 hover:text-red-400 ml-1">Sair</button>
             </div>
           </div>
         </div>
       </header>
 
-      <main className="max-w-5xl mx-auto px-6 py-8">
+      {showDocs && (
+        <div className="border-b border-slate-200 bg-white">
+          <Docs />
+        </div>
+      )}
+      {!showDocs && <main className="max-w-5xl mx-auto px-6 py-8">
 
         {/* INPUT */}
         {step === "input" && (
@@ -552,7 +560,8 @@ export default function App() {
             </button>
           </div>
         )}
-      </main>
+      </main>}
     </div>
   );
 }
+
