@@ -569,6 +569,27 @@ export default function App() {
 
                 <div className="mt-6"><CertaintyStrip itens={resultado.itens} /></div>
 
+                {/* Dados da proposta para o Tiny — preenchidos aqui, exportados no CSV */}
+                <div className="mt-4 rounded-xl border border-line bg-surface p-4">
+                  <div className="eyebrow text-[10px] font-bold uppercase text-faint">Dados da proposta (Tiny)</div>
+                  <div className="mt-2 grid grid-cols-2 gap-3">
+                    <label className="block">
+                      <div className="text-[11.5px] text-sub">Prazo de entrega</div>
+                      <input value={resultado.prazo_entrega || ""}
+                        onChange={(e) => setResultado((p) => ({ ...p, prazo_entrega: e.target.value }))}
+                        placeholder="ex: 15 dias úteis"
+                        className="mt-1 w-full rounded-lg border border-line2 bg-paper px-2.5 py-1.5 text-[13px] text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
+                    </label>
+                    <label className="block">
+                      <div className="text-[11.5px] text-sub">Frete (R$)</div>
+                      <input inputMode="decimal" value={resultado.frete ?? ""}
+                        onChange={(e) => setResultado((p) => ({ ...p, frete: e.target.value }))}
+                        placeholder="0,00"
+                        className="mt-1 w-full rounded-lg border border-line2 bg-paper px-2.5 py-1.5 font-mono text-[13px] text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
+                    </label>
+                  </div>
+                </div>
+
                 {erro && <div className="mt-3 rounded-lg border border-rose/30 bg-rosebg px-4 py-3 text-[13px] text-rose">{erro}</div>}
 
                 <div className="mt-4 overflow-hidden rounded-xl border border-line bg-surface">

@@ -469,6 +469,45 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
     return {"atualizados": atualizados, "inseridos": inseridos, "ignorados": ignorados}
 
 
+def _cnpj_valido(cnpj: str) -> bool:
+    """Valida CNPJ pelos dígitos verificadores (independe de formatação)."""
+    n = re.sub(r"\D", "", cnpj or "")
+    if len(n) != 14 or n == n[0] * 14:
+        return False
+    def dv(base, pesos):
+        s = sum(int(d) * p for d, p in zip(base, pesos)); r = s % 11
+        return "0" if r < 2 else str(11 - r)
+    p1 = [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]; p2 = [6] + p1
+    return n[12] == dv(n[:12], p1) and n[13] == dv(n[:13], p2)
+
+
+def _cnpj_formatado(cnpj: str) -> str:
+    """Reformata os 14 dígitos no padrão 00.000.000/0000-00."""
+    n = re.sub(r"\D", "", cnpj or "")
+    if len(n) != 14:
+        return cnpj or ""
+    return f"{n[:2]}.{n[2:5]}.{n[5:8]}/{n[8:12]}-{n[12:]}"
+
+
+def _cep_formatado(cep: str) -> str:
+    n = re.sub(r"\D", "", str(cep or ""))
+    return f"{n[:5]}-{n[5:]}" if len(n) == 8 else (str(cep or ""))
+
+
+def _consulta_receita(cnpj_digitos: str) -> dict:
+    """Busca dados cadastrais na BrasilAPI (base da Receita Federal).
+    Retorna {} em QUALQUER falha (timeout, fora do ar, CNPJ não achado) —
+    a geração da proposta nunca é bloqueada por causa disto."""
+    try:
+        import urllib.request, json as _json
+        url = f"https://brasilapi.com.br/api/cnpj/v1/{cnpj_digitos}"
+        req = urllib.request.Request(url, headers={"User-Agent": "kist-cabine/1.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            return _json.load(resp) or {}
+    except Exception:
+        return {}
+
+
 @app.post("/gerar-csv")
 async def gerar_csv(payload: dict, usuario: str = Depends(verificar_token)):
     COLUNAS = [
@@ -493,18 +532,64 @@ async def gerar_csv(payload: dict, usuario: str = Depends(verificar_token)):
             return "0,000"
 
     hoje = date.today().strftime('%d/%m/%Y')
+
+    # Tratamento do CNPJ: válido entra formatado; inválido fica vazio (pra não
+    # travar a importação) e o valor captado é sinalizado nas Observações.
+    cnpj_raw = (payload.get("cnpj", "") or "").strip()
+    cnpj_ok = _cnpj_valido(cnpj_raw)
+    cnpj_saida = _cnpj_formatado(cnpj_raw) if cnpj_ok else ""
+    aviso_cnpj = "" if (cnpj_ok or not cnpj_raw) else f"CNPJ captado (INVÁLIDO, conferir): {cnpj_raw}"
+
+    # Para CNPJ válido, busca dados cadastrais na Receita (BrasilAPI).
+    # Regra: a cotação manda — só preenchemos campos que vierem VAZIOS.
+    # Se a consulta falhar, segue com o que tem (rec = {}).
+    rec = _consulta_receita(re.sub(r"\D", "", cnpj_raw)) if cnpj_ok else {}
+    def _vazio_ou(atual, receita):
+        a = (atual or "").strip()
+        return a if a else (str(receita).strip() if receita else "")
+
+    nome_contato = _vazio_ou(payload.get("cliente", ""), rec.get("razao_social"))
+    cep_val      = _vazio_ou("", _cep_formatado(rec.get("cep")) if rec.get("cep") else "")
+    municipio_val= _vazio_ou("", rec.get("municipio"))
+    uf_val       = _vazio_ou("", rec.get("uf"))
+    endereco_val = _vazio_ou("", rec.get("logradouro"))
+    numero_val   = _vazio_ou("", rec.get("numero"))
+    bairro_val   = _vazio_ou("", rec.get("bairro"))
+
+    # Campos preenchidos na tela de conferência
+    prazo_entrega = (str(payload.get("prazo_entrega", "") or "")).strip()
+    def _frete_fmt(v):
+        s = str(v or "").strip()
+        if not s:
+            return "0,00"
+        if "," in s:
+            s = s.replace(".", "").replace(",", ".")
+        try:
+            return f"{float(s):.2f}".replace(".", ",")
+        except Exception:
+            return "0,00"
+    frete_val = _frete_fmt(payload.get("frete"))
+
     rows = []
     for item in payload.get("itens", []):
         r = {c: '' for c in COLUNAS}
         r['Número da proposta'] = payload.get("proposta", "")
         r['Data'] = hoje
-        r['Nome do contato'] = payload.get("cliente", "")
+        r['Nome do contato'] = nome_contato
         r['Tipo de Pessoa'] = 'J'
-        r['CPF/CNPJ'] = payload.get("cnpj", "") or ""
+        r['CPF/CNPJ'] = cnpj_saida
+        r['CEP'] = cep_val
+        r['Município'] = municipio_val
+        r['UF'] = uf_val
+        r['Endereço'] = endereco_val
+        r['Endereço Nro'] = numero_val
+        r['Bairro'] = bairro_val
         r['Desconto'] = '0,00'
-        r['Frete'] = '0,00'
-        r['Observações'] = payload.get("rc_neg", "") or ""
+        r['Frete'] = frete_val
+        obs_base = payload.get("rc_neg", "") or ""
+        r['Observações'] = f"{obs_base} | {aviso_cnpj}".strip(" |") if aviso_cnpj else obs_base
         r['Validade'] = '5'
+        r['Prazo de Entrega'] = prazo_entrega
         r['Situação'] = 'Rascunho'
         r['ID produto'] = '0'
         r['Descrição'] = item.get("descricao_final", "")
