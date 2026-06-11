@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { createPortal } from "react-dom";
 import {
   brl, btnPrimary, btnGhost, Eyebrow, PageHeader, PoChip, CopyPo,
   IconSearch, IconBoard, IconList, IconDownload, IconX, IconLink, IconTrash, IconCheck,
@@ -6,14 +7,19 @@ import {
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
-// Trilhas do quadro (agrupam status finos). Ajuste livremente.
+// Trilhas do quadro (agrupam status finos). `drop` = status aplicado ao arrastar pra cá.
 const LANES = [
-  { key: "rascunho",   label: "Rascunho",   tint: "#9FA8B8", status: ["rascunho"] },
-  { key: "confirmada", label: "Confirmada", tint: "#1F6FEB", status: ["confirmada"] },
-  { key: "compra",     label: "Em compra",  tint: "#7A5AF0", status: ["parcialmente_comprada", "comprada", "entregue_parcial"] },
-  { key: "disponivel", label: "Disponível", tint: "#4FA62E", status: ["disponivel"] },
+  { key: "rascunho",   label: "Rascunho",   tint: "#9FA8B8", drop: "rascunho",   status: ["rascunho"] },
+  { key: "confirmada", label: "Confirmada", tint: "#1F6FEB", drop: "confirmada", status: ["confirmada"] },
+  { key: "compra",     label: "Em compra",  tint: "#7A5AF0", drop: "comprada",   status: ["parcialmente_comprada", "comprada", "entregue_parcial"] },
+  { key: "disponivel", label: "Disponível", tint: "#4FA62E", drop: "disponivel", status: ["disponivel"] },
 ];
 const laneDe = (status) => LANES.find((l) => l.status.includes(status)) || LANES[0];
+const STATUS_OPCOES = [
+  ["rascunho", "Rascunho"], ["confirmada", "Confirmada"],
+  ["parcialmente_comprada", "Parc. comprada"], ["comprada", "Comprada"],
+  ["entregue_parcial", "Entr. parcial"], ["disponivel", "Disponível"], ["arquivada", "Arquivada"],
+];
 const STATUS_LABEL = {
   rascunho: "rascunho", confirmada: "confirmada", parcialmente_comprada: "parc. comprada",
   comprada: "comprada", entregue_parcial: "entr. parcial", disponivel: "disponível", arquivada: "arquivada",
@@ -90,6 +96,14 @@ export default function OrdensCompra({ token, usuario, novaOC, onNovaOCProcessad
     setSel(null);
   }
 
+  async function moverStatus(id, status) {
+    setOcs((prev) => prev.map((o) => (o.id === id ? { ...o, status } : o)));   // otimista
+    setSel((s) => (s && s.id === id ? { ...s, status } : s));
+    try {
+      await fetch(`${API}/ordens-compra/${id}`, { method: "PUT", headers: jsonHeaders(), body: JSON.stringify({ status }) });
+    } catch (e) { carregar(); }
+  }
+
   return (
     <div className="mx-auto max-w-6xl px-8 py-9 rise">
       <PageHeader eyebrow="Compras" title="Ordens de compra"
@@ -121,7 +135,7 @@ export default function OrdensCompra({ token, usuario, novaOC, onNovaOCProcessad
       {loading ? (
         <div className="mt-8 text-center text-[13px] text-faint">Carregando…</div>
       ) : vista === "kanban" ? (
-        <Kanban ocs={filtrados} onSelect={setSel} />
+        <Kanban ocs={filtrados} onSelect={setSel} onMove={moverStatus} />
       ) : vista === "lista" ? (
         <Lista ocs={filtrados} onSelect={setSel} />
       ) : (
@@ -138,23 +152,36 @@ export default function OrdensCompra({ token, usuario, novaOC, onNovaOCProcessad
   );
 }
 
-/* ── Vista Kanban ──────────────────────────────────────────────────────────── */
-function Kanban({ ocs, onSelect }) {
+/* ── Vista Kanban (com arrastar entre colunas) ─────────────────────────────── */
+function Kanban({ ocs, onSelect, onMove }) {
+  const [over, setOver] = useState(null);
   return (
     <div className="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
       {LANES.map((lane) => {
         const cards = ocs.filter((o) => laneDe(o.status).key === lane.key);
+        const ativo = over === lane.key;
         return (
-          <div key={lane.key} className="flex flex-col">
+          <div key={lane.key} className="flex flex-col"
+            onDragOver={(e) => { e.preventDefault(); setOver(lane.key); }}
+            onDragLeave={() => setOver((o) => (o === lane.key ? null : o))}
+            onDrop={(e) => {
+              e.preventDefault(); setOver(null);
+              const raw = e.dataTransfer.getData("text/plain");
+              if (!raw) return;
+              const id = isNaN(Number(raw)) ? raw : Number(raw);
+              onMove(id, lane.drop);
+            }}>
             <div className="mb-2.5 flex items-center gap-2 px-1">
               <span className="h-2 w-2 rounded-full" style={{ background: lane.tint }} />
               <span className="text-[12px] font-semibold text-ink">{lane.label}</span>
               <span className="font-mono text-[11px] text-faint">{cards.length}</span>
             </div>
-            <div className="flex flex-col gap-2.5">
+            <div className={`flex min-h-[88px] flex-col gap-2.5 rounded-xl p-1 transition-colors ${ativo ? "bg-kist/[0.06] ring-1 ring-inset ring-kist/30" : ""}`}>
               {cards.map((oc) => <OCCard key={oc.id} oc={oc} onClick={() => onSelect(oc)} />)}
               {cards.length === 0 && (
-                <div className="rounded-xl border border-dashed border-line2 px-3 py-6 text-center text-[11.5px] text-faint">vazio</div>
+                <div className="rounded-xl border border-dashed border-line2 px-3 py-6 text-center text-[11.5px] text-faint">
+                  {ativo ? "soltar aqui" : "vazio"}
+                </div>
               )}
             </div>
           </div>
@@ -170,8 +197,11 @@ function OCCard({ oc, onClick }) {
   const margem = venda > 0 ? ((venda - custo) / venda) * 100 : 0;
   const tint = laneDe(oc.status).tint;
   return (
-    <button onClick={onClick}
-      className="w-full rounded-xl border border-line bg-surface p-3.5 text-left transition-all hover:border-line2 hover:shadow-[0_1px_3px_rgba(11,31,58,0.06)]">
+    <div role="button" tabIndex={0} draggable
+      onClick={onClick}
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onClick(); } }}
+      onDragStart={(e) => { e.dataTransfer.setData("text/plain", String(oc.id)); e.dataTransfer.effectAllowed = "move"; }}
+      className="w-full cursor-grab select-none rounded-xl border border-line bg-surface p-3.5 text-left transition-all hover:border-line2 hover:shadow-[0_1px_3px_rgba(11,31,58,0.06)] active:cursor-grabbing">
       <div className="flex items-center justify-between gap-2">
         <PoChip po={oc.numero_po} />
         <span className="flex-shrink-0 font-mono text-[11px] text-faint">{oc.id}</span>
@@ -188,7 +218,7 @@ function OCCard({ oc, onClick }) {
           </div>
         )}
       </div>
-    </button>
+    </div>
   );
 }
 
@@ -268,6 +298,7 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
   const [loading, setLoading] = useState(true);
   const [po, setPo] = useState(oc.numero_po || null);
   const [poInput, setPoInput] = useState("");
+  const [status, setStatus] = useState(oc.status || "rascunho");
   const [frete, setFrete] = useState(oc.frete_real ?? oc.frete_estimado ?? 0);
   const [confirmDel, setConfirmDel] = useState(false);
 
@@ -294,6 +325,9 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
     const v = poInput.trim(); if (!v) return;
     setPo(v); salvarOC({ numero_po: v });
   }
+  function mudarStatus(novo) {
+    setStatus(novo); salvarOC({ status: novo });
+  }
   async function salvarItem(itemId, campos) {
     setItens((prev) => prev.map((i) => (i.id === itemId ? { ...i, ...campos } : i)));
     try {
@@ -307,10 +341,10 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
     } catch (e) {}
   }
 
-  return (
-    <div className="fixed inset-0 z-40 flex justify-end">
+  return createPortal(
+    <div className="fixed inset-0 z-50 flex justify-end">
       <div className="absolute inset-0 bg-ink/30" onClick={onClose} />
-      <div className="slide-in relative flex h-full w-[460px] flex-col bg-surface shadow-2xl">
+      <div className="slide-in relative flex h-screen w-[460px] flex-col bg-surface shadow-2xl">
         {/* Cabeçalho — PO em destaque */}
         <div className="border-b border-line px-5 py-4">
           <div className="flex items-start justify-between gap-3">
@@ -320,10 +354,14 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
                 {po && <CopyPo po={po} />}
               </div>
               <h3 className="mt-2 text-[16px] font-semibold tracking-tight text-ink">{oc.titulo}</h3>
-              <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11.5px] text-faint">
+              <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11.5px] text-faint">
                 <span className="font-mono text-sub">{oc.id}</span>
                 {oc.cliente && <><span>·</span><span>{oc.cliente}</span></>}
-                <span>·</span><span>{STATUS_LABEL[oc.status] || oc.status}</span>
+                <span>·</span>
+                <select value={status} onChange={(e) => mudarStatus(e.target.value)}
+                  className="rounded-md border border-line2 bg-paper px-1.5 py-0.5 text-[11px] font-medium text-ink outline-none focus:ring-1 focus:ring-kist">
+                  {STATUS_OPCOES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                </select>
               </div>
             </div>
             <button onClick={onClose} className="flex-shrink-0 rounded-md p-1 text-faint hover:bg-paper hover:text-ink"><IconX size={18} /></button>
@@ -454,12 +492,13 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
               <IconTrash size={15} />
             </button>
             <button onClick={() => window.print()} className={`${btnGhost} flex-1 justify-center`}><IconDownload size={14} /> Exportar / PDF</button>
-            <button onClick={() => salvarOC({ status: "confirmada" })} className={`${btnPrimary} flex-1 justify-center`}>
+            <button onClick={() => mudarStatus("confirmada")} className={`${btnPrimary} flex-1 justify-center`}>
               <IconCheck size={14} /> Confirmar OC
             </button>
           </div>
         )}
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
