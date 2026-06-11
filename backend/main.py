@@ -713,6 +713,7 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
 
 @app.get("/propostas")
 async def listar_propostas(
+    busca: str = None,
     numero: str = None,
     cnpj: str = None,
     usuario_email: str = None,
@@ -722,13 +723,40 @@ async def listar_propostas(
     limit: int = 50,
     usuario: str = Depends(verificar_token)
 ):
-    """Lista propostas com filtros"""
+    """Lista propostas com filtros.
+    `busca` é a busca única da barra de pesquisa: casa com número da proposta,
+    cliente, CNPJ OU descrição de item (ex.: 'Convergint' ou 'MC200L')."""
     sb = get_supabase()
     q = sb.table("propostas").select("*").order("data_geracao", desc=True).limit(limit)
 
     # Por padrão mostra só do usuário autenticado, salvo se todos=True
     if not todos:
         q = q.eq("usuario_email", usuario)
+
+    if busca and busca.strip():
+        # sanitiza p/ não quebrar a sintaxe do filtro OR do PostgREST
+        termo = re.sub(r"[,()*]", " ", busca.strip()).strip()
+        if termo:
+            # propostas cujos ITENS casam na descrição
+            ids_por_item = []
+            try:
+                it = (sb.table("itens_proposta")
+                        .select("proposta_id")
+                        .or_(f"descricao_final.ilike.*{termo}*,descricao_original.ilike.*{termo}*")
+                        .limit(500).execute())
+                ids_por_item = list({r["proposta_id"] for r in (it.data or []) if r.get("proposta_id") is not None})
+            except Exception:
+                ids_por_item = []
+            or_parts = [
+                f"numero_proposta.ilike.*{termo}*",
+                f"cliente.ilike.*{termo}*",
+                f"cnpj.ilike.*{termo}*",
+            ]
+            if ids_por_item:
+                or_parts.append(f"id.in.({','.join(str(i) for i in ids_por_item)})")
+            q = q.or_(",".join(or_parts))
+
+    # filtros específicos (compatibilidade / uso programático)
     if numero:
         q = q.ilike("numero_proposta", f"%{numero}%")
     if cnpj:

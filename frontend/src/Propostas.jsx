@@ -124,8 +124,8 @@ export default function Propostas({ token, usuario, onCriarOC }) {
         <div className="flex items-center gap-2 rounded-lg border border-line2 bg-surface px-3 py-2 text-[13px] text-faint">
           <IconSearch size={15} />
           <input value={busca} onChange={(e) => setBusca(e.target.value)} onKeyDown={(e) => e.key === "Enter" && carregar()}
-            className="w-52 bg-transparent text-ink outline-none placeholder:text-faint"
-            placeholder="número, cliente, CNPJ…" />
+            className="w-64 bg-transparent text-ink outline-none placeholder:text-faint"
+            placeholder="número, cliente, CNPJ ou item (ex: MC200L)" />
         </div>
         <input type="date" value={dataInicio} onChange={(e) => setDataInicio(e.target.value)}
           className="rounded-lg border border-line2 bg-surface px-3 py-2 text-[12.5px] text-sub outline-none" />
