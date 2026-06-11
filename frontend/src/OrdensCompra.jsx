@@ -69,6 +69,7 @@ export default function OrdensCompra({ token, usuario, novaOC, onNovaOCProcessad
         quantidade_comprar: i.quantidade,
         unidade: i.unidade,
         preco_venda: i.preco_venda,
+        preco_custo: i.preco_custo || 0,
         // origem do preço viaja junto pra facilitar a compra:
         nome_fornecedor: i.fornecedor || null,
         link_fornecedor: i.link_fornecedor || null,

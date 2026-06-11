@@ -684,6 +684,7 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
         "com_preco":       payload.get("com_preco", 0),
         "sem_preco":       payload.get("sem_preco", 0),
         "valor_total_estimado": valor_total,
+        "frete_recebimento": float(payload.get("frete_recebimento") or 0),
     }).execute()
 
     proposta_id = res.data[0]["id"]
@@ -699,6 +700,7 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
                 "quantidade":        float(i.get("quantidade") or 1),
                 "unidade":           i.get("unidade", "UN"),
                 "preco_venda":       float(i.get("preco_un") or 0),
+                "preco_custo":       float(i.get("preco_custo") or 0),
                 "confianca_match":   i.get("confianca_match", ""),
                 "specs_complementares": i.get("specs_complementares", ""),
                 "fornecedor":        i.get("fornecedor", ""),
@@ -824,6 +826,7 @@ async def criar_oc(payload: dict, usuario: str = Depends(verificar_token)):
                 "quantidade_comprar":  float(i.get("quantidade_comprar") or i.get("quantidade_proposta") or 1),
                 "unidade":             i.get("unidade", "UN"),
                 "preco_venda":         float(i.get("preco_venda") or 0),
+                "preco_custo":         float(i.get("preco_custo") or 0),
                 # origem do preço herdada da proposta (aceita as duas nomenclaturas):
                 "nome_fornecedor":     i.get("nome_fornecedor") or i.get("fornecedor", ""),
                 "link_fornecedor":     i.get("link_fornecedor", ""),
