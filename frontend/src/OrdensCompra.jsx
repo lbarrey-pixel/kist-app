@@ -2,27 +2,30 @@ import { useState, useEffect, useCallback } from "react";
 import { createPortal } from "react-dom";
 import {
   brl, btnPrimary, btnGhost, Eyebrow, PageHeader, PoChip, CopyPo,
-  IconSearch, IconBoard, IconList, IconDownload, IconX, IconLink, IconTrash, IconCheck,
+  IconSearch, IconBoard, IconList, IconDownload, IconX, IconLink, IconTrash, IconCheck, IconCopy,
 } from "./kist-ui.jsx";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
-// Trilhas do quadro (agrupam status finos). `drop` = status aplicado ao arrastar pra cá.
+// Etapas do funil (colunas do quadro). `drop` = status aplicado ao arrastar pra cá.
+// "Aguardando compra" também acolhe OCs recém-criadas (status rascunho).
 const LANES = [
-  { key: "rascunho",   label: "Rascunho",   tint: "#9FA8B8", drop: "rascunho",   status: ["rascunho"] },
-  { key: "confirmada", label: "Confirmada", tint: "#1F6FEB", drop: "confirmada", status: ["confirmada"] },
-  { key: "compra",     label: "Em compra",  tint: "#7A5AF0", drop: "comprada",   status: ["parcialmente_comprada", "comprada", "entregue_parcial"] },
-  { key: "disponivel", label: "Disponível", tint: "#4FA62E", drop: "disponivel", status: ["disponivel"] },
+  { key: "aguardando", label: "Aguardando compra",  tint: "#1F6FEB", drop: "confirmada",            status: ["rascunho", "confirmada"] },
+  { key: "parcial",    label: "Comprado parcial",   tint: "#7A5AF0", drop: "parcialmente_comprada", status: ["parcialmente_comprada"] },
+  { key: "entrega",    label: "Aguardando entrega", tint: "#0E9AAE", drop: "comprada",              status: ["comprada"] },
+  { key: "entrega_p",  label: "Entrega parcial",    tint: "#B7791F", drop: "entregue_parcial",      status: ["entregue_parcial"] },
+  { key: "disponivel", label: "Disponível",         tint: "#4FA62E", drop: "disponivel",            status: ["disponivel"] },
 ];
 const laneDe = (status) => LANES.find((l) => l.status.includes(status)) || LANES[0];
 const STATUS_OPCOES = [
-  ["rascunho", "Rascunho"], ["confirmada", "Confirmada"],
-  ["parcialmente_comprada", "Parc. comprada"], ["comprada", "Comprada"],
-  ["entregue_parcial", "Entr. parcial"], ["disponivel", "Disponível"], ["arquivada", "Arquivada"],
+  ["rascunho", "Rascunho"], ["confirmada", "Aguardando compra"],
+  ["parcialmente_comprada", "Comprado parcial"], ["comprada", "Aguardando entrega"],
+  ["entregue_parcial", "Entrega parcial"], ["disponivel", "Disponível"], ["arquivada", "Arquivada"],
 ];
 const STATUS_LABEL = {
-  rascunho: "rascunho", confirmada: "confirmada", parcialmente_comprada: "parc. comprada",
-  comprada: "comprada", entregue_parcial: "entr. parcial", disponivel: "disponível", arquivada: "arquivada",
+  rascunho: "rascunho", confirmada: "aguardando compra",
+  parcialmente_comprada: "comprado parcial", comprada: "aguardando entrega",
+  entregue_parcial: "entrega parcial", disponivel: "disponível", arquivada: "arquivada",
 };
 
 export default function OrdensCompra({ token, usuario, novaOC, onNovaOCProcessada }) {
@@ -195,6 +198,7 @@ function OCCard({ oc, onClick }) {
   const venda = oc.valor_venda ?? oc.total_venda ?? 0;
   const custo = oc.valor_custo ?? oc.total_custo ?? 0;
   const margem = venda > 0 ? ((venda - custo) / venda) * 100 : 0;
+  const lucro = venda - custo;
   const tint = laneDe(oc.status).tint;
   return (
     <div role="button" tabIndex={0} draggable
@@ -210,9 +214,16 @@ function OCCard({ oc, onClick }) {
       <div className="mt-3 flex items-end justify-between">
         <div>
           <div className="font-mono text-[14px] font-semibold text-ink">R$ {brl(venda)}</div>
-          <div className="mt-0.5 text-[11px] text-faint">{STATUS_LABEL[oc.status] || oc.status} · venda</div>
+          {custo > 0 ? (
+            <div className="mt-0.5 text-[11px]">
+              <span className="text-faint">venda · lucro bruto </span>
+              <span className={`font-mono font-medium ${lucro >= 0 ? "text-signal" : "text-rose"}`}>R$ {brl(lucro)}</span>
+            </div>
+          ) : (
+            <div className="mt-0.5 text-[11px] text-faint">{STATUS_LABEL[oc.status] || oc.status} · custo pendente</div>
+          )}
         </div>
-        {venda > 0 && (
+        {custo > 0 && (
           <div className="rounded-md px-1.5 py-0.5 text-[11px] font-semibold" style={{ background: `${tint}14`, color: tint }}>
             {margem.toFixed(0)}% margem
           </div>
@@ -289,7 +300,154 @@ function Consolidados({ token }) {
   );
 }
 
-/* ── Painel lateral ────────────────────────────────────────────────────────── */
+/* ── Formas de pagamento + cálculo de vencimentos por dia do mês ───────────── */
+const FORMAS = [
+  ["cartao", "Cartão"], ["boleto", "Boleto"], ["pix", "Pix"], ["ted", "TED"],
+];
+const FORMA_LABEL = { cartao: "Cartão", boleto: "Boleto", pix: "Pix", ted: "TED" };
+
+function diasNoMes(ano, mes) { return new Date(ano, mes + 1, 0).getDate(); } // mes 0-11
+// Datas das parcelas no cartão: 1ª no próximo dia do mês que ainda não passou, demais mês a mês.
+function vencimentosCartao(dia, parcelas, hoje = new Date()) {
+  if (!dia) return [];
+  const n = Math.max(1, parseInt(parcelas) || 1);
+  const base = new Date(hoje.getFullYear(), hoje.getMonth(), 1);
+  // se o dia deste mês já passou, começa no mês seguinte
+  let inicio = (hoje.getDate() <= dia) ? 0 : 1;
+  const datas = [];
+  for (let i = 0; i < n; i++) {
+    const ano = base.getFullYear();
+    const mes = base.getMonth() + inicio + i;
+    const d = new Date(ano, mes, 1);
+    const diaClamp = Math.min(dia, diasNoMes(d.getFullYear(), d.getMonth()));
+    datas.push(new Date(d.getFullYear(), d.getMonth(), diaClamp));
+  }
+  return datas;
+}
+const fmtData = (d) => d ? `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}` : "";
+
+/* Forma de pagamento por item — opcional, campos condicionais, resumo compacto.
+   Cartão: aprende o final → dia de vencimento; vencimentos calculados pelo dia. */
+function PagamentoItem({ it, cartoes, onSalvar, onAprenderCartao }) {
+  const [editing, setEditing] = useState(false);
+  const [forma, setForma] = useState(it.forma_pagamento || "");
+  const [parcelas, setParcelas] = useState(it.numero_parcelas || 1);
+  const [final, setFinal] = useState(it.final_cartao || "");
+  const [venc, setVenc] = useState(it.data_vencimento ? String(it.data_vencimento).slice(0, 10) : "");
+  const [diaTmp, setDiaTmp] = useState("");
+
+  const final4 = String(final).slice(-4);
+  const cartaoDia = cartoes[final4];
+  const dia = (parseInt(diaTmp) || cartaoDia) || null;
+  const diaShown = diaTmp !== "" ? diaTmp : (cartaoDia != null ? String(cartaoDia) : "");
+  const datas = forma === "cartao" && dia ? vencimentosCartao(dia, parcelas) : [];
+
+  function salvarCartao() {
+    onSalvar({ forma_pagamento: "cartao", numero_parcelas: Number(parcelas) || 1, final_cartao: final4 || null });
+  }
+  function gravarDia() {
+    const d = Math.max(1, Math.min(31, parseInt(diaTmp) || 0));
+    if (d && final4.length === 4) onAprenderCartao(final4, d);
+  }
+
+  // ── resumo (fechado) ──
+  if (!editing) {
+    if (!forma) {
+      return <button onClick={() => setEditing(true)} className="mt-2 text-[11px] font-medium text-kist hover:text-kist600">+ forma de pagamento</button>;
+    }
+    let resumo = FORMA_LABEL[forma] || forma;
+    if (forma === "cartao") resumo = `Cartão ${parcelas}x` + (final4 ? ` · final ${final4}` : "") + (dia ? ` · 1ª ${fmtData(datas[0])}` : "");
+    else if (forma === "boleto") resumo = `Boleto ${parcelas}x` + (venc ? ` · vence ${venc.split("-").reverse().join("/")}` : "");
+    return (
+      <div className="mt-2 flex items-center justify-between rounded-lg border border-line bg-paper px-2.5 py-1.5">
+        <span className="text-[11px] text-sub">{resumo}</span>
+        <button onClick={() => setEditing(true)} className="text-[11px] font-medium text-faint hover:text-kist">editar</button>
+      </div>
+    );
+  }
+
+  // ── editor (aberto) ──
+  return (
+    <div className="mt-2 rounded-lg border border-line bg-paper p-2.5">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="eyebrow text-[9px] font-bold uppercase text-faint">Forma de pagamento</span>
+        <button onClick={() => setEditing(false)} className="text-[11px] font-medium text-kist hover:text-kist600">concluir</button>
+      </div>
+      <div className="flex flex-wrap gap-1">
+        {FORMAS.map(([v, l]) => (
+          <button key={v} onClick={() => { setForma(v); onSalvar({ forma_pagamento: v }); }}
+            className={`rounded-md px-2.5 py-1 text-[11px] font-medium transition-colors ${forma === v ? "bg-ink text-white" : "border border-line2 bg-surface text-sub hover:text-ink"}`}>{l}</button>
+        ))}
+      </div>
+
+      {forma === "cartao" && (
+        <div className="mt-2 space-y-2">
+          <div className="flex gap-2">
+            <label className="block w-20">
+              <div className="text-[10.5px] text-faint">Parcelas</div>
+              <input type="number" min="1" value={parcelas}
+                onChange={(e) => setParcelas(e.target.value)} onBlur={salvarCartao}
+                className="w-full rounded bg-surface px-1.5 py-1 font-mono text-[12px] text-ink outline-none focus:ring-1 focus:ring-kist" />
+            </label>
+            <label className="block w-28">
+              <div className="text-[10.5px] text-faint">Final do cartão</div>
+              <input inputMode="numeric" maxLength={4} value={final} placeholder="0000"
+                onChange={(e) => { setFinal(e.target.value.replace(/\D/g, "").slice(0, 4)); setDiaTmp(""); }}
+                onBlur={salvarCartao}
+                className="w-full rounded bg-surface px-1.5 py-1 font-mono text-[12px] text-ink outline-none focus:ring-1 focus:ring-kist" />
+            </label>
+            {final4.length === 4 && (
+              <label className="block w-24">
+                <div className="text-[10.5px] text-faint">Vence dia</div>
+                <input type="number" min="1" max="31" value={diaShown} placeholder="10"
+                  onChange={(e) => setDiaTmp(e.target.value)} onBlur={gravarDia}
+                  className="w-full rounded bg-surface px-1.5 py-1 font-mono text-[12px] text-ink outline-none focus:ring-1 focus:ring-kist" />
+              </label>
+            )}
+          </div>
+          {final4.length === 4 && cartaoDia == null && diaTmp === "" && (
+            <div className="text-[10.5px] text-amber">Cartão novo — informe o dia de vencimento da fatura (fica salvo pros próximos).</div>
+          )}
+          {dia != null && datas.length > 0 && (
+            <div className="rounded-md bg-surface px-2 py-1.5">
+              <div className="text-[10px] uppercase eyebrow text-faint">Projeção das parcelas</div>
+              <div className="mt-1 flex flex-wrap gap-1">
+                {datas.map((d, i) => (
+                  <span key={i} className="rounded bg-paper px-1.5 py-0.5 font-mono text-[10.5px] text-sub">{i + 1}ª {fmtData(d)}</span>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {forma === "boleto" && (
+        <div className="mt-2 flex gap-2">
+          <label className="block w-20">
+            <div className="text-[10.5px] text-faint">Parcelas</div>
+            <input type="number" min="1" value={parcelas}
+              onChange={(e) => setParcelas(e.target.value)}
+              onBlur={() => onSalvar({ forma_pagamento: "boleto", numero_parcelas: Number(parcelas) || 1 })}
+              className="w-full rounded bg-surface px-1.5 py-1 font-mono text-[12px] text-ink outline-none focus:ring-1 focus:ring-kist" />
+          </label>
+          <label className="block flex-1">
+            <div className="text-[10.5px] text-faint">1º vencimento</div>
+            <input type="date" value={venc}
+              onChange={(e) => setVenc(e.target.value)}
+              onBlur={() => onSalvar({ forma_pagamento: "boleto", numero_parcelas: Number(parcelas) || 1, data_vencimento: venc || null })}
+              className="w-full rounded bg-surface px-1.5 py-1 text-[12px] text-ink outline-none focus:ring-1 focus:ring-kist" />
+          </label>
+        </div>
+      )}
+
+      {(forma === "pix" || forma === "ted") && (
+        <div className="mt-2 text-[11px] text-faint">Sem campos adicionais para {FORMA_LABEL[forma]}.</div>
+      )}
+    </div>
+  );
+}
+
+
 function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
   const jsonHeaders = () => ({ "Content-Type": "application/json", Authorization: `Bearer ${token}` });
   const ocId = oc.id ?? oc.numero_oc;
@@ -301,6 +459,7 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
   const [status, setStatus] = useState(oc.status || "rascunho");
   const [frete, setFrete] = useState(oc.frete_real ?? oc.frete_estimado ?? 0);
   const [confirmDel, setConfirmDel] = useState(false);
+  const [cartoes, setCartoes] = useState({});   // { "1234": diaVencimento }
 
   useEffect(() => {
     setLoading(true);
@@ -311,8 +470,31 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
       .finally(() => setLoading(false));
   }, [ocId, token]);
 
+  // Cadastro de cartões (aprende sozinho conforme as compras)
+  useEffect(() => {
+    fetch(`${API}/cartoes`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => r.json())
+      .then((d) => {
+        const map = {};
+        (Array.isArray(d) ? d : []).forEach((c) => { if (c.final_cartao != null) map[String(c.final_cartao)] = c.dia_vencimento; });
+        setCartoes(map);
+      })
+      .catch(() => {});
+  }, [token]);
+
+  // Ensina/atualiza um cartão (final → dia). Atualiza todas as compras desse final.
+  async function aprenderCartao(final, dia) {
+    const f = String(final || "").trim().slice(-4);
+    if (!f || !dia) return;
+    setCartoes((prev) => ({ ...prev, [f]: dia }));
+    try {
+      await fetch(`${API}/cartoes`, { method: "POST", headers: jsonHeaders(), body: JSON.stringify({ final_cartao: f, dia_vencimento: dia }) });
+    } catch (e) {}
+  }
+
   const totVenda = itens.reduce((s, i) => s + (i.preco_venda || 0) * (i.quantidade_comprar ?? i.quantidade_proposta ?? 0), 0);
   const totCusto = itens.reduce((s, i) => s + (i.preco_custo || 0) * (i.quantidade_comprar ?? i.quantidade_proposta ?? 0), 0);
+  const totLucro = totVenda - totCusto;
   const margem = totVenda > 0 ? ((totVenda - totCusto) / totVenda) * 100 : 0;
 
   async function salvarOC(campos) {
@@ -376,16 +558,23 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
           )}
         </div>
 
-        {/* Totais */}
+        {/* Totais — venda, custo, lucro bruto (R$) e margem */}
         <div className="grid grid-cols-3 gap-px border-b border-line bg-line">
-          {[["Venda", totVenda, "text-ink"], ["Custo", totCusto, "text-sub"], ["Margem", null, "text-signal"]].map(([l, v, cls], i) => (
-            <div key={i} className="bg-surface px-4 py-3">
-              <div className="text-[10.5px] uppercase eyebrow text-faint">{l}</div>
-              <div className={`mt-0.5 font-mono text-[14px] font-semibold ${cls}`}>
-                {v === null ? `${margem.toFixed(0)}%` : `R$ ${brl(v)}`}
-              </div>
+          <div className="bg-surface px-4 py-3">
+            <div className="text-[10.5px] uppercase eyebrow text-faint">Venda</div>
+            <div className="mt-0.5 font-mono text-[14px] font-semibold text-ink">R$ {brl(totVenda)}</div>
+          </div>
+          <div className="bg-surface px-4 py-3">
+            <div className="text-[10.5px] uppercase eyebrow text-faint">Custo</div>
+            <div className="mt-0.5 font-mono text-[14px] font-semibold text-sub">R$ {brl(totCusto)}</div>
+          </div>
+          <div className="bg-surface px-4 py-3">
+            <div className="text-[10.5px] uppercase eyebrow text-faint">Lucro bruto</div>
+            <div className={`mt-0.5 font-mono text-[14px] font-semibold ${totLucro >= 0 ? "text-signal" : "text-rose"}`}>
+              R$ {brl(totLucro)}
             </div>
-          ))}
+            <div className="mt-0.5 font-mono text-[10.5px] text-faint">{totCusto > 0 ? `${margem.toFixed(0)}% margem` : "custo pendente"}</div>
+          </div>
         </div>
 
         {/* Itens */}
@@ -444,6 +633,20 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
                       </div>
                     </div>
 
+                    {/* Lucro bruto do item — unitário e total (venda − custo) */}
+                    {(() => {
+                      const qd = it.quantidade_comprar ?? it.quantidade_proposta ?? 0;
+                      const lucroUn = (it.preco_venda || 0) - (it.preco_custo || 0);
+                      const lucroItem = lucroUn * qd;
+                      const cor = lucroUn >= 0 ? "text-signal" : "text-rose";
+                      return (
+                        <div className="mt-2 flex items-center justify-between rounded-lg bg-paper px-2.5 py-1.5 text-[11px]">
+                          <span className="text-faint">Lucro bruto un. <span className={`font-mono font-medium ${cor}`}>R$ {brl(lucroUn)}</span></span>
+                          <span className="text-faint">Lucro bruto item <span className={`font-mono font-semibold ${cor}`}>R$ {brl(lucroItem)}</span></span>
+                        </div>
+                      );
+                    })()}
+
                     {/* Origem do preço — herdada da proposta */}
                     <div className="mt-2 border-t border-line/70 pt-2">
                       <div className="flex items-center gap-1.5">
@@ -464,6 +667,44 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
                         )}
                       </div>
                     </div>
+
+                    {/* Compra & entrega — preenchidos quando o item é comprado */}
+                    <div className="mt-2 grid grid-cols-2 gap-x-2 gap-y-1.5 border-t border-line/70 pt-2 text-[11px]">
+                      <label className="block">
+                        <div className="text-faint">Pedido forn.</div>
+                        <input defaultValue={it.numero_pedido_fornecedor || ""}
+                          onBlur={(e) => salvarItem(it.id, { numero_pedido_fornecedor: e.target.value })}
+                          placeholder="nº do pedido"
+                          className="w-full rounded bg-paper px-1.5 py-1 font-mono text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
+                      </label>
+                      <label className="block">
+                        <div className="text-faint">Prazo entrega</div>
+                        <input defaultValue={it.prazo_entrega || ""}
+                          onBlur={(e) => salvarItem(it.id, { prazo_entrega: e.target.value })}
+                          placeholder="ex: 15 dias"
+                          className="w-full rounded bg-paper px-1.5 py-1 text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
+                      </label>
+                      <label className="col-span-2 block">
+                        <div className="text-faint">Rastreio</div>
+                        <div className="flex items-center gap-1.5">
+                          <input defaultValue={it.rastreio || ""}
+                            onBlur={(e) => salvarItem(it.id, { rastreio: e.target.value })}
+                            placeholder="código de rastreio da transportadora"
+                            className="min-w-0 flex-1 rounded bg-paper px-1.5 py-1 font-mono text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
+                          {it.rastreio && (
+                            <button onClick={() => { try { navigator.clipboard?.writeText(it.rastreio); } catch (e) {} }}
+                              className="flex-shrink-0 rounded px-1.5 py-1 text-faint hover:text-kist" title="copiar rastreio">
+                              <IconCopy size={13} />
+                            </button>
+                          )}
+                        </div>
+                      </label>
+                    </div>
+
+                    {/* Forma de pagamento (opcional) — alimenta o contas a pagar */}
+                    <PagamentoItem it={it} cartoes={cartoes}
+                      onSalvar={(campos) => salvarItem(it.id, campos)}
+                      onAprenderCartao={aprenderCartao} />
                   </div>
                 );
               })}

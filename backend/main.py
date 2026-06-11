@@ -756,6 +756,7 @@ async def listar_ocs(
             t["valor_custo"] += float(r.get("preco_custo") or 0) * float(qd or 0)
         for o in ocs:
             o.update(tot.get(o["id"], {"valor_venda": 0.0, "valor_custo": 0.0}))
+            o["valor_lucro"] = o["valor_venda"] - o["valor_custo"]   # lucro bruto (R$)
     return ocs
 
 
@@ -800,12 +801,43 @@ async def atualizar_item_oc(
     campos = {}
     for f in ["quantidade_comprar","preco_custo","nome_fornecedor","link_fornecedor",
               "sku_fornecedor","forma_pagamento","numero_parcelas","data_vencimento",
-              "status_pagamento","status_item","numero_pedido_fornecedor",
+              "final_cartao","status_pagamento","status_item","numero_pedido_fornecedor",
               "prazo_entrega","rastreio","obs"]:
         if f in payload:
             campos[f] = payload[f]
     sb.table("oc_itens").update(campos).eq("id", item_id).execute()
     return {"ok": True}
+
+
+@app.get("/cartoes")
+async def listar_cartoes(usuario: str = Depends(verificar_token)):
+    """Cadastro leve de cartões. Preenche-se sozinho conforme as compras."""
+    sb = get_supabase()
+    res = sb.table("cartoes").select("*").order("final_cartao").execute()
+    return res.data or []
+
+
+@app.post("/cartoes")
+async def upsert_cartao(payload: dict, usuario: str = Depends(verificar_token)):
+    """Aprende/atualiza um cartão pelo final (4 díg.) + dia de vencimento (1-31).
+    Editar o dia atualiza todas as compras daquele cartão, pois o vencimento
+    é derivado daqui (não congelado no item)."""
+    sb = get_supabase()
+    final = (str(payload.get("final_cartao") or "")).strip()[-4:]
+    if not final:
+        raise HTTPException(status_code=400, detail="final_cartao obrigatório")
+    registro = {"final_cartao": final}
+    if payload.get("dia_vencimento") is not None:
+        try:
+            dia = int(payload["dia_vencimento"])
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="dia_vencimento inválido")
+        registro["dia_vencimento"] = max(1, min(31, dia))
+    if payload.get("apelido") is not None:
+        registro["apelido"] = payload["apelido"]
+    # upsert pelo final (final_cartao é único)
+    sb.table("cartoes").upsert(registro, on_conflict="final_cartao").execute()
+    return {"ok": True, **registro}
 
 
 @app.delete("/oc-itens/{item_id}")
