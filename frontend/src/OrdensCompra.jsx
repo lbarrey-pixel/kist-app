@@ -39,17 +39,18 @@ export default function OrdensCompra({ token, usuario, novaOC, onNovaOCProcessad
   const [q, setQ] = useState("");
   const [sel, setSel] = useState(null);
   const [criando, setCriando] = useState(false);
+  const [equipeToda, setEquipeToda] = useState(false);
 
   const carregar = useCallback(() => {
     setLoading(true);
-    fetch(`${API}/ordens-compra`, { headers: authHeaders() })
+    fetch(`${API}/ordens-compra?todos=${equipeToda}`, { headers: authHeaders() })
       .then((r) => r.json())
       .then((d) => setOcs(Array.isArray(d) ? d : d.ordens || []))
       .catch(() => setErro("Não foi possível carregar as ordens de compra."))
       .finally(() => setLoading(false));
-  }, [token]);
+  }, [token, equipeToda]);
 
-  useEffect(() => { carregar(); /* eslint-disable-next-line */ }, []);
+  useEffect(() => { carregar(); /* eslint-disable-next-line */ }, [equipeToda]);
 
   // Criação de OC a partir de uma proposta aprovada (carrega a origem junto)
   useEffect(() => {
@@ -119,6 +120,10 @@ export default function OrdensCompra({ token, usuario, novaOC, onNovaOCProcessad
                 className="w-44 bg-transparent text-ink outline-none placeholder:text-faint"
                 placeholder="PO, OC, cliente…" />
             </div>
+            <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-line2 bg-surface px-3 py-2 text-[12.5px] text-sub">
+              <input type="checkbox" checked={equipeToda} onChange={(e) => setEquipeToda(e.target.checked)} className="accent-kist" />
+              Ver equipe toda
+            </label>
             <button onClick={arquivarAntigas} className={btnGhost}>Arquivar antigas</button>
           </>
         } />
@@ -142,7 +147,7 @@ export default function OrdensCompra({ token, usuario, novaOC, onNovaOCProcessad
       ) : vista === "lista" ? (
         <Lista ocs={filtrados} onSelect={setSel} />
       ) : (
-        <Consolidados token={token} />
+        <Consolidados token={token} todos={equipeToda} />
       )}
 
       {sel && (
@@ -152,6 +157,17 @@ export default function OrdensCompra({ token, usuario, novaOC, onNovaOCProcessad
           onDeleted={aposExcluir} />
       )}
     </div>
+  );
+}
+
+/* TAG do operador — círculo com a inicial, nome completo no hover */
+function OperadorTag({ nome }) {
+  const ini = (nome || "?").trim().charAt(0).toUpperCase();
+  return (
+    <span title={nome || "—"}
+      className="inline-flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-paper text-[10px] font-semibold text-sub ring-1 ring-line2">
+      {ini}
+    </span>
   );
 }
 
@@ -208,7 +224,10 @@ function OCCard({ oc, onClick }) {
       className="w-full cursor-grab select-none rounded-xl border border-line bg-surface p-3.5 text-left transition-all hover:border-line2 hover:shadow-[0_1px_3px_rgba(11,31,58,0.06)] active:cursor-grabbing">
       <div className="flex items-center justify-between gap-2">
         <PoChip po={oc.numero_po} />
-        <span className="flex-shrink-0 font-mono text-[11px] text-faint">{oc.id}</span>
+        <div className="flex flex-shrink-0 items-center gap-1.5">
+          <OperadorTag nome={oc.usuario_nome} />
+          <span className="font-mono text-[11px] text-faint">{oc.id}</span>
+        </div>
       </div>
       <div className="mt-2 text-[13px] font-medium leading-snug text-ink">{oc.titulo}</div>
       <div className="mt-3 flex items-end justify-between">
@@ -240,8 +259,8 @@ function Lista({ ocs, onSelect }) {
       <table className="w-full">
         <thead>
           <tr className="border-b border-line bg-paper/70">
-            {["PO", "OC", "Título", "Status", "Venda", ""].map((h, i) => (
-              <th key={i} className={`px-4 py-2.5 text-[10.5px] font-semibold uppercase eyebrow text-faint ${i === 4 ? "text-right" : "text-left"}`}>{h}</th>
+            {["PO", "OC", "Título", "Status", "Resp.", "Venda", ""].map((h, i) => (
+              <th key={i} className={`px-4 py-2.5 text-[10.5px] font-semibold uppercase eyebrow text-faint ${i === 5 ? "text-right" : "text-left"}`}>{h}</th>
             ))}
           </tr>
         </thead>
@@ -252,11 +271,12 @@ function Lista({ ocs, onSelect }) {
               <td className="px-4 py-3 font-mono text-[12px] text-sub">{oc.id}</td>
               <td className="px-4 py-3 text-[13px] font-medium text-ink">{oc.titulo}</td>
               <td className="px-4 py-3 text-[12px] text-sub">{STATUS_LABEL[oc.status] || oc.status}</td>
+              <td className="px-4 py-3"><OperadorTag nome={oc.usuario_nome} /></td>
               <td className="px-4 py-3 text-right font-mono text-[13px] font-medium text-ink">R$ {brl(oc.valor_venda ?? oc.total_venda ?? 0)}</td>
               <td className="px-4 py-3 text-right text-[12px] text-faint">abrir</td>
             </tr>
           ))}
-          {ocs.length === 0 && <tr><td colSpan={6} className="px-4 py-10 text-center text-[13px] text-faint">Nenhuma OC.</td></tr>}
+          {ocs.length === 0 && <tr><td colSpan={7} className="px-4 py-10 text-center text-[13px] text-faint">Nenhuma OC.</td></tr>}
         </tbody>
       </table>
     </div>
@@ -264,36 +284,46 @@ function Lista({ ocs, onSelect }) {
 }
 
 /* ── Vista Itens consolidados ──────────────────────────────────────────────── */
-function Consolidados({ token }) {
+function Consolidados({ token, todos }) {
   const [itens, setItens] = useState([]);
   const [loading, setLoading] = useState(true);
   useEffect(() => {
-    fetch(`${API}/ordens-compra/itens-consolidados`, { headers: { Authorization: `Bearer ${token}` } })
+    setLoading(true);
+    fetch(`${API}/ordens-compra/itens-consolidados?todos=${todos}`, { headers: { Authorization: `Bearer ${token}` } })
       .then((r) => r.json())
       .then((d) => setItens(Array.isArray(d) ? d : d.itens || []))
       .catch(() => setItens([]))
       .finally(() => setLoading(false));
-  }, [token]);
+  }, [token, todos]);
   if (loading) return <div className="mt-8 text-center text-[13px] text-faint">Carregando…</div>;
   return (
     <div className="mt-6 overflow-hidden rounded-xl border border-line bg-surface">
       <table className="w-full">
         <thead>
           <tr className="border-b border-line bg-paper/70">
-            {["Produto", "Qtd total", "Em OCs"].map((h, i) => (
+            {["Produto", "Qtd total", "Em OCs", "Operadores"].map((h, i) => (
               <th key={i} className={`px-4 py-2.5 text-[10.5px] font-semibold uppercase eyebrow text-faint ${i === 1 ? "text-right" : "text-left"}`}>{h}</th>
             ))}
           </tr>
         </thead>
         <tbody>
-          {itens.map((it, i) => (
-            <tr key={i} className="border-b border-line/70 last:border-0">
-              <td className="px-4 py-3 text-[13px] text-ink">{it.descricao}</td>
-              <td className="px-4 py-3 text-right font-mono text-[13px] text-ink">{it.total_quantidade} {it.unidade}</td>
-              <td className="px-4 py-3 font-mono text-[12px] text-sub">{it.total_ocs ?? "—"}</td>
-            </tr>
-          ))}
-          {itens.length === 0 && <tr><td colSpan={3} className="px-4 py-10 text-center text-[13px] text-faint">Nada consolidado.</td></tr>}
+          {itens.map((it, i) => {
+            const ops = [...new Set((it.itens || []).map((x) => x.oc_usuario).filter(Boolean))];
+            return (
+              <tr key={i} className="border-b border-line/70 last:border-0">
+                <td className="px-4 py-3 text-[13px] text-ink">{it.descricao}</td>
+                <td className="px-4 py-3 text-right font-mono text-[13px] text-ink">{it.total_quantidade} {it.unidade}</td>
+                <td className="px-4 py-3 font-mono text-[12px] text-sub">{it.total_ocs ?? "—"}</td>
+                <td className="px-4 py-3">
+                  <div className="flex flex-wrap gap-1">
+                    {ops.map((nome, j) => <OperadorTag key={j} nome={nome} />)}
+                    {ops.length === 0 && <span className="text-[12px] text-faint">—</span>}
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+          {itens.length === 0 && <tr><td colSpan={4} className="px-4 py-10 text-center text-[13px] text-faint">Nada consolidado.</td></tr>}
         </tbody>
       </table>
     </div>
