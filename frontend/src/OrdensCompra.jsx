@@ -356,6 +356,15 @@ function vencimentosCartao(dia, parcelas, hoje = new Date()) {
 }
 const fmtData = (d) => d ? `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}` : "";
 
+/* Boleto: conversão dias ↔ data, contando a partir de hoje (dia da compra). */
+const _addDiasHoje = (n) => { const d = new Date(); d.setDate(d.getDate() + (parseInt(n) || 0)); return d.toISOString().slice(0, 10); };
+const _diasDeHoje = (iso) => {
+  if (!iso) return "";
+  const b = new Date(); b.setHours(0, 0, 0, 0);
+  const a = new Date(iso + "T00:00:00");
+  return Math.max(0, Math.round((a - b) / 86400000));
+};
+
 /* Forma de pagamento por item — opcional, campos condicionais, resumo compacto.
    Cartão: aprende o final → dia de vencimento; vencimentos calculados pelo dia. */
 function PagamentoItem({ it, cartoes, onSalvar, onAprenderCartao }) {
@@ -365,12 +374,14 @@ function PagamentoItem({ it, cartoes, onSalvar, onAprenderCartao }) {
   const [final, setFinal] = useState(it.final_cartao || "");
   const [venc, setVenc] = useState(it.data_vencimento ? String(it.data_vencimento).slice(0, 10) : "");
   const [diaTmp, setDiaTmp] = useState("");
+  const [diasBoleto, setDiasBoleto] = useState("");
 
   const final4 = String(final).slice(-4);
   const cartaoDia = cartoes[final4];
   const dia = (parseInt(diaTmp) || cartaoDia) || null;
   const diaShown = diaTmp !== "" ? diaTmp : (cartaoDia != null ? String(cartaoDia) : "");
   const datas = forma === "cartao" && dia ? vencimentosCartao(dia, parcelas) : [];
+  const diasBoletoShown = diasBoleto !== "" ? diasBoleto : (venc ? String(_diasDeHoje(venc)) : "");
 
   function salvarCartao() {
     onSalvar({ forma_pagamento: "cartao", numero_parcelas: Number(parcelas) || 1, final_cartao: final4 || null });
@@ -452,21 +463,35 @@ function PagamentoItem({ it, cartoes, onSalvar, onAprenderCartao }) {
       )}
 
       {forma === "boleto" && (
-        <div className="mt-2 flex gap-2">
-          <label className="block w-20">
-            <div className="text-[10.5px] text-faint">Parcelas</div>
-            <input type="number" min="1" value={parcelas}
-              onChange={(e) => setParcelas(e.target.value)}
-              onBlur={() => onSalvar({ forma_pagamento: "boleto", numero_parcelas: Number(parcelas) || 1 })}
-              className="w-full rounded bg-surface px-1.5 py-1 font-mono text-[12px] text-ink outline-none focus:ring-1 focus:ring-kist" />
-          </label>
-          <label className="block flex-1">
-            <div className="text-[10.5px] text-faint">1º vencimento</div>
-            <input type="date" value={venc}
-              onChange={(e) => setVenc(e.target.value)}
-              onBlur={() => onSalvar({ forma_pagamento: "boleto", numero_parcelas: Number(parcelas) || 1, data_vencimento: venc || null })}
-              className="w-full rounded bg-surface px-1.5 py-1 text-[12px] text-ink outline-none focus:ring-1 focus:ring-kist" />
-          </label>
+        <div className="mt-2 space-y-1.5">
+          <div className="flex gap-2">
+            <label className="block w-16">
+              <div className="text-[10.5px] text-faint">Parcelas</div>
+              <input type="number" min="1" value={parcelas}
+                onChange={(e) => setParcelas(e.target.value)}
+                onBlur={() => onSalvar({ forma_pagamento: "boleto", numero_parcelas: Number(parcelas) || 1 })}
+                className="w-full rounded bg-surface px-1.5 py-1 font-mono text-[12px] text-ink outline-none focus:ring-1 focus:ring-kist" />
+            </label>
+            <label className="block w-24">
+              <div className="text-[10.5px] text-faint">Vencimento (dias)</div>
+              <input inputMode="numeric" placeholder="ex: 28" value={diasBoletoShown}
+                onChange={(e) => {
+                  const v = e.target.value.replace(/\D/g, "");
+                  setDiasBoleto(v);
+                  setVenc(v ? _addDiasHoje(v) : "");
+                }}
+                onBlur={() => onSalvar({ forma_pagamento: "boleto", numero_parcelas: Number(parcelas) || 1, data_vencimento: venc || null })}
+                className="w-full rounded bg-surface px-1.5 py-1 font-mono text-[12px] text-ink outline-none focus:ring-1 focus:ring-kist" />
+            </label>
+            <label className="block flex-1">
+              <div className="text-[10.5px] text-faint">Data de vencimento</div>
+              <input type="date" value={venc}
+                onChange={(e) => { setVenc(e.target.value); setDiasBoleto(e.target.value ? String(_diasDeHoje(e.target.value)) : ""); }}
+                onBlur={() => onSalvar({ forma_pagamento: "boleto", numero_parcelas: Number(parcelas) || 1, data_vencimento: venc || null })}
+                className="w-full rounded bg-surface px-1.5 py-1 text-[12px] text-ink outline-none focus:ring-1 focus:ring-kist" />
+            </label>
+          </div>
+          <div className="text-[10px] text-faint">Conta a partir de hoje — informe os dias (ex: 28D) ou a data; um atualiza o outro.</div>
         </div>
       )}
 
@@ -551,6 +576,82 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
       await fetch(`${API}/ordens-compra/${ocId}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } });
       onDeleted && onDeleted(ocId);
     } catch (e) {}
+  }
+
+  function imprimirOC() {
+    const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    const statusLabel = STATUS_LABEL[oc.status] || oc.status || "—";
+    const cnpj = oc.cnpj || oc.cnpj_cliente || "—";
+    const entrega = oc.endereco_entrega || oc.endereco || "—";
+    const linhas = itens.map((it, i) => {
+      const qd = it.quantidade_comprar ?? it.quantidade_proposta ?? 0;
+      const venda = it.preco_venda || 0;
+      const st = (it.status_item || "—").replace(/_/g, " ");
+      return `<tr>
+        <td>${i + 1}</td>
+        <td><strong>${esc(it.descricao)}</strong>${it.nome_fornecedor ? "" : ""}</td>
+        <td class="c">${esc(qd)} ${esc(it.unidade || "")}</td>
+        <td>${esc(it.nome_fornecedor || "—")}</td>
+        <td class="c">${esc(st)}</td>
+        <td class="r">R$ ${brl(venda)}</td>
+        <td class="r">R$ ${brl(venda * qd)}</td>
+      </tr>`;
+    }).join("");
+    const html = `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
+<title>OC ${esc(oc.id)} — ${esc(oc.titulo)}</title>
+<style>
+  @page { size: A4; margin: 15mm; }
+  * { box-sizing: border-box; }
+  body { font-family: Arial, Helvetica, sans-serif; color: #0B1F3A; margin: 0; font-size: 12px; }
+  .top { display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 2px solid #0B1F3A; padding-bottom: 10px; }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .mark { width: 34px; height: 34px; border-radius: 8px; background: #1F6FEB; color: #fff; font-weight: bold; font-size: 18px; display:flex; align-items:center; justify-content:center; }
+  .brand small { color: #5B6577; font-size: 10px; letter-spacing: .12em; text-transform: uppercase; }
+  h1 { font-size: 17px; margin: 0; }
+  .meta { text-align: right; font-size: 12px; }
+  .meta .po { font-size: 16px; font-weight: bold; }
+  .status { display:inline-block; margin-top:4px; background:#E8F0FE; color:#175FD3; padding:2px 8px; border-radius:6px; font-size:11px; font-weight:bold; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 24px; margin: 14px 0 6px; }
+  .grid div { font-size: 12px; }
+  .lbl { color: #97A0AF; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  th { text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: #5B6577; border-bottom: 1.5px solid #0B1F3A; padding: 6px 6px; }
+  td { border-bottom: 1px solid #E7EAF1; padding: 6px 6px; vertical-align: top; }
+  .c { text-align: center; } .r { text-align: right; white-space: nowrap; }
+  tfoot td { border-top: 2px solid #0B1F3A; border-bottom: none; font-weight: bold; font-size: 13px; padding-top: 8px; }
+  .foot { margin-top: 22px; font-size: 10px; color: #97A0AF; text-align: center; border-top: 1px solid #E7EAF1; padding-top: 8px; }
+  h1, h2 { margin: 0; }
+</style></head><body>
+  <div class="top">
+    <div class="brand"><div class="mark">K</div><div><h1>Ordem de Compra</h1><small>Kist · Cabine de Compras</small></div></div>
+    <div class="meta">
+      <div class="lbl">PO do cliente</div>
+      <div class="po">${esc(oc.numero_po || "—")}</div>
+      <div class="status">${esc(statusLabel)}</div>
+    </div>
+  </div>
+  <div class="grid">
+    <div><div class="lbl">Título</div>${esc(oc.titulo || "—")}</div>
+    <div><div class="lbl">OC interna</div>${esc(oc.id)}</div>
+    <div><div class="lbl">Cliente</div>${esc(oc.cliente || "—")}</div>
+    <div><div class="lbl">CNPJ</div>${esc(cnpj)}</div>
+    <div style="grid-column:1/3"><div class="lbl">Endereço de entrega</div>${esc(entrega)}</div>
+  </div>
+  <table>
+    <thead><tr>
+      <th>#</th><th>Descrição</th><th class="c">Qtd</th><th>Fornecedor</th><th class="c">Status</th><th class="r">Venda un.</th><th class="r">Total</th>
+    </tr></thead>
+    <tbody>${linhas}</tbody>
+    <tfoot><tr><td colspan="6" class="r">Total de venda</td><td class="r">R$ ${brl(totVenda)}</td></tr></tfoot>
+  </table>
+  <div class="foot">Emitido em ${new Date().toLocaleDateString("pt-BR")} · Documento interno Kist Soluções</div>
+</body></html>`;
+    const win = window.open("", "_blank");
+    if (!win) { alert("Permita pop-ups para gerar o relatório em PDF."); return; }
+    win.document.write(html);
+    win.document.close();
+    win.focus();
+    setTimeout(() => win.print(), 350);
   }
 
   return createPortal(
@@ -762,7 +863,7 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
               className="inline-flex items-center justify-center rounded-lg border border-line2 px-2.5 py-2 text-faint transition-colors hover:border-rose/40 hover:bg-rosebg hover:text-rose">
               <IconTrash size={15} />
             </button>
-            <button onClick={() => window.print()} className={`${btnGhost} flex-1 justify-center`}><IconDownload size={14} /> Exportar / PDF</button>
+            <button onClick={imprimirOC} className={`${btnGhost} flex-1 justify-center`}><IconDownload size={14} /> Exportar / PDF</button>
             <button onClick={() => mudarStatus("confirmada")} className={`${btnPrimary} flex-1 justify-center`}>
               <IconCheck size={14} /> Confirmar OC
             </button>
