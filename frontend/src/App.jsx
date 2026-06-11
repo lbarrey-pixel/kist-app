@@ -2,28 +2,24 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import Docs from "./Docs.jsx";
 import Propostas from "./Propostas.jsx";
 import OrdensCompra from "./OrdensCompra.jsx";
+import {
+  CONF, brl, btnPrimary, btnGhost, Eyebrow, StateLabel, PageHeader,
+  CertaintyStrip, Sidebar,
+  IconUpload, IconBolt, IconArrow, IconDownload, IconCheck, IconLink, IconX,
+} from "./kist-ui.jsx";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 
-const CONFIANCA_STYLE = {
-  alta:   "bg-emerald-100 text-emerald-700",
-  media:  "bg-blue-100 text-blue-700",
-  baixa:  "bg-amber-100 text-amber-700",
-  nenhuma:"bg-red-50 text-red-500",
-};
-const CONFIANCA_LABEL = { alta: "✓ exato", media: "~ similar", baixa: "⚠ incerto", nenhuma: "sem match" };
+const isLink = (s) => typeof s === "string" && /^https?:\/\//i.test(s.trim());
 
-function Badge({ count, tipo }) {
-  const cores = { total:"bg-slate-100 text-slate-700", preco:"bg-emerald-100 text-emerald-700", sem:"bg-amber-100 text-amber-700" };
-  return <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold ${cores[tipo]}`}>{count}</span>;
-}
-
+// ── Linha de item da revisão ───────────────────────────────────────────────
 function ItemRow({ item, index, onChange, token, apiUrl }) {
   const [loadingPn, setLoadingPn] = useState(false);
   const [sugestoes, setSugestoes] = useState(null);
   const [mostrarSugestoes, setMostrarSugestoes] = useState(false);
   const [mostrarSpecs, setMostrarSpecs] = useState(false);
+  const [mostrarOrigem, setMostrarOrigem] = useState(false);
 
   async function buscarSugestoes() {
     setLoadingPn(true); setSugestoes(null); setMostrarSugestoes(true);
@@ -46,92 +42,160 @@ function ItemRow({ item, index, onChange, token, apiUrl }) {
   }
 
   const confianca = item.confianca_match || "nenhuma";
+  const c = CONF[confianca];
+  const semPreco = !(item.preco_un > 0);
+  const temOrigem = !!(item.link_fornecedor || item.fornecedor || item.sku_fornecedor);
 
   return (
     <>
-      <tr className={index % 2 === 0 ? "bg-white" : "bg-slate-50"}>
-        <td className="px-3 py-2 text-xs text-slate-400 w-8">{index + 1}</td>
-        <td className="px-3 py-2">
-          <input className="w-full text-sm border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5"
-            value={item.descricao_final} onChange={e => onChange(index, "descricao_final", e.target.value)} />
-          {confianca === "baixa" && item.banco_candidato && (
-            <div className="mt-1 text-xs text-amber-600">
-              ⚠ match incerto — ref. banco: <span className="text-slate-600">{item.banco_candidato}</span>
-            </div>
-          )}
-          <div className="flex items-center gap-2 mt-0.5">
-            <span className={`text-xs px-1.5 py-0.5 rounded ${CONFIANCA_STYLE[confianca]}`}>
-              {CONFIANCA_LABEL[confianca]}
-            </span>
+      <tr className="group border-b border-line/70 last:border-0">
+        <td className="relative w-1 p-0">
+          <span className="absolute inset-y-1 left-0 w-[3px] rounded-full" style={{ background: c.rail }} />
+        </td>
+        <td className="py-2.5 pl-4 pr-2 text-center font-mono text-[11px] text-faint">
+          {String(index + 1).padStart(2, "0")}
+        </td>
+        <td className="py-2 pr-3">
+          <input
+            className="w-full rounded-md bg-transparent px-1.5 py-1 text-[13px] text-ink cell-input"
+            value={item.descricao_final}
+            onChange={(e) => onChange(index, "descricao_final", e.target.value)}
+          />
+          <div className="mt-0.5 flex flex-wrap items-center gap-2 pl-1.5">
+            <StateLabel conf={confianca} />
+            {confianca === "baixa" && item.banco_candidato && (
+              <span className="text-[11px] text-sub">
+                ref. banco: <span className="text-faint">{item.banco_candidato}</span>
+              </span>
+            )}
             {item.sugerir_pn && (
               <button onClick={buscarSugestoes} disabled={loadingPn}
-                className="text-xs text-blue-500 hover:text-blue-700 disabled:opacity-50">
-                {loadingPn ? "⟳ buscando..." : "✦ Sugerir PN"}
+                className="inline-flex items-center gap-1 text-[11px] font-medium text-kist hover:text-kist600 disabled:opacity-50">
+                <IconBolt size={11} /> {loadingPn ? "buscando…" : "Sugerir PN"}
               </button>
             )}
             {item.specs_complementares && (
-              <button onClick={() => setMostrarSpecs(v => !v)} className="text-xs text-slate-400 hover:text-slate-600">
-                {mostrarSpecs ? "▲ ocultar specs" : "▼ specs originais"}
+              <button onClick={() => setMostrarSpecs((v) => !v)} className="text-[11px] text-faint hover:text-sub">
+                {mostrarSpecs ? "− specs originais" : "+ specs originais"}
               </button>
             )}
+            <button onClick={() => setMostrarOrigem((v) => !v)}
+              className={`text-[11px] hover:text-sub ${temOrigem ? "text-kist" : "text-faint"}`}>
+              {mostrarOrigem ? "− origem do preço" : temOrigem ? "✓ origem do preço" : "+ origem do preço"}
+            </button>
           </div>
           {mostrarSpecs && item.specs_complementares && (
-            <div className="mt-1 text-xs text-slate-500 bg-slate-50 rounded p-2 font-mono whitespace-pre-wrap border border-slate-200">
+            <div className="mt-1.5 whitespace-pre-wrap rounded-md border border-line bg-paper p-2 font-mono text-[11px] text-sub">
               {item.specs_complementares}
             </div>
           )}
         </td>
-        <td className="px-3 py-2 w-16">
-          <input type="number" className="w-full text-xs text-center border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5"
-            value={item.quantidade} onChange={e => onChange(index, "quantidade", parseFloat(e.target.value))} />
+        <td className="py-2 pr-3">
+          <input type="number"
+            className="w-14 rounded-md bg-transparent px-1.5 py-1 text-right font-mono text-[12.5px] text-ink cell-input"
+            value={item.quantidade}
+            onChange={(e) => onChange(index, "quantidade", parseFloat(e.target.value))}
+          />
         </td>
-        <td className="px-3 py-2 w-14">
-          <input className="w-full text-xs text-center border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5"
-            value={item.unidade} onChange={e => onChange(index, "unidade", e.target.value)} />
+        <td className="py-2 pr-3">
+          <input
+            className="w-12 rounded-md bg-transparent px-1.5 py-1 font-mono text-[12px] text-faint cell-input"
+            value={item.unidade}
+            onChange={(e) => onChange(index, "unidade", e.target.value)}
+          />
         </td>
-        <td className="px-3 py-2 w-28">
-          <div className="flex items-center gap-1">
-            <span className="text-xs text-slate-400">R$</span>
-            <input type="number" step="0.001"
-              className={`w-full text-xs text-right border-0 bg-transparent focus:ring-1 focus:ring-blue-400 rounded px-1 py-0.5 ${item.preco_un > 0 ? "text-slate-800" : "text-amber-600 font-medium"}`}
-              value={item.preco_un} onChange={e => onChange(index, "preco_un", parseFloat(e.target.value) || 0)} />
+        <td className="py-2 pr-4">
+          <div className="flex items-center justify-end gap-1">
+            <span className={`text-[11px] ${semPreco ? "text-amber" : "text-faint"}`}>R$</span>
+            <input type="number" step="0.001" placeholder="—"
+              className={`w-20 rounded-md bg-transparent px-1 py-1 text-right font-mono text-[12.5px] cell-input
+                ${semPreco ? "text-amber placeholder:text-amber/70" : "text-ink"}`}
+              value={item.preco_un}
+              onChange={(e) => onChange(index, "preco_un", parseFloat(e.target.value) || 0)}
+            />
           </div>
         </td>
       </tr>
+
+      {/* Origem do preço — link OU texto livre · viaja junto pra OC */}
+      {mostrarOrigem && (
+        <tr className="border-b border-line/70 bg-paper/60">
+          <td /><td />
+          <td colSpan={4} className="px-3 py-2.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="flex min-w-[280px] flex-1 items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2.5 py-1.5">
+                {isLink(item.link_fornecedor)
+                  ? <IconLink size={13} className="flex-shrink-0 text-kist" />
+                  : <span className="eyebrow flex-shrink-0 text-[9px] font-bold uppercase text-faint">Origem</span>}
+                <input
+                  className="w-full bg-transparent text-[12px] text-ink outline-none"
+                  placeholder="link do fornecedor ou texto livre (ex: cotação WhatsApp 06/06)"
+                  value={item.link_fornecedor || ""}
+                  onChange={(e) => onChange(index, "link_fornecedor", e.target.value)}
+                />
+              </div>
+              <div className="flex items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2.5 py-1.5">
+                <span className="text-[11px] text-faint">Fornecedor</span>
+                <input
+                  className="w-36 bg-transparent text-[12px] text-ink outline-none"
+                  placeholder="nome"
+                  value={item.fornecedor || ""}
+                  onChange={(e) => onChange(index, "fornecedor", e.target.value)}
+                />
+              </div>
+              <div className="flex items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2.5 py-1.5">
+                <span className="text-[11px] text-faint">SKU forn.</span>
+                <input
+                  className="w-28 bg-transparent font-mono text-[12px] text-ink outline-none"
+                  placeholder="—"
+                  value={item.sku_fornecedor || ""}
+                  onChange={(e) => onChange(index, "sku_fornecedor", e.target.value)}
+                />
+              </div>
+            </div>
+            <p className="mt-1.5 pl-1 text-[11px] text-faint">
+              Essa referência acompanha o item quando a proposta virar ordem de compra.
+            </p>
+          </td>
+        </tr>
+      )}
+
+      {/* Sugestões de PN */}
       {mostrarSugestoes && (
-        <tr className={index % 2 === 0 ? "bg-white" : "bg-slate-50"}>
-          <td></td>
-          <td colSpan={4} className="px-3 pb-3">
-            <div className="border border-blue-200 rounded-lg bg-blue-50 p-3">
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-xs font-medium text-blue-700">Sugestões de PN / modelo</span>
-                <button onClick={() => setMostrarSugestoes(false)} className="text-xs text-slate-400 hover:text-red-400">✕</button>
+        <tr className="border-b border-line/70 bg-paper/60">
+          <td /><td />
+          <td colSpan={4} className="px-3 pb-3 pt-1">
+            <div className="rounded-xl border border-kist/20 bg-kist/[0.04] p-3">
+              <div className="mb-2 flex items-center justify-between">
+                <Eyebrow>Sugestões de PN / modelo</Eyebrow>
+                <button onClick={() => setMostrarSugestoes(false)} className="text-faint hover:text-rose"><IconX size={14} /></button>
               </div>
               {loadingPn ? (
-                <div className="text-xs text-slate-500 py-2">Consultando...</div>
+                <div className="py-2 text-[12px] text-sub">Consultando…</div>
               ) : sugestoes && sugestoes.length > 0 ? (
                 <div className="space-y-2">
                   {sugestoes.map((s, i) => (
-                    <div key={i} className="bg-white rounded-lg border border-blue-100 p-2.5 flex items-start justify-between gap-3">
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 mb-0.5">
-                          <span className="text-xs font-semibold text-slate-800">{s.fabricante} {s.modelo}</span>
-                          {s.atende_fabricante && <span className="text-xs bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded-full">✓ fabricante ok</span>}
+                    <div key={i} className="flex items-start justify-between gap-3 rounded-lg border border-line bg-surface p-2.5">
+                      <div className="min-w-0 flex-1">
+                        <div className="mb-0.5 flex items-center gap-2">
+                          <span className="text-[12.5px] font-semibold text-ink">{s.fabricante} {s.modelo}</span>
+                          {s.atende_fabricante && (
+                            <span className="rounded-full bg-signalbg px-1.5 py-0.5 text-[10px] font-medium text-signal">fabricante ok</span>
+                          )}
                         </div>
-                        <div className="text-xs text-slate-500 mb-1">{s.specs}</div>
+                        <div className="mb-1 text-[12px] text-sub">{s.specs}</div>
                         {s.preco_estimado > 0 && (
-                          <div className="text-xs text-slate-600">Estimado: <span className="font-medium">R$ {s.preco_estimado.toLocaleString("pt-BR", {minimumFractionDigits:2})}</span></div>
+                          <div className="text-[12px] text-sub">
+                            Estimado: <span className="font-mono font-medium text-ink">R$ {brl(s.preco_estimado)}</span>
+                          </div>
                         )}
                       </div>
-                      <button onClick={() => aplicarSugestao(s)}
-                        className="text-xs bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-lg flex-shrink-0">
-                        Usar
-                      </button>
+                      <button onClick={() => aplicarSugestao(s)} className={btnPrimary}>Usar</button>
                     </div>
                   ))}
                 </div>
               ) : (
-                <div className="text-xs text-slate-500 py-2">Nenhuma sugestão encontrada.</div>
+                <div className="py-2 text-[12px] text-sub">Nenhuma sugestão encontrada.</div>
               )}
             </div>
           </td>
@@ -144,7 +208,7 @@ function ItemRow({ item, index, onChange, token, apiUrl }) {
 export default function App() {
   const [usuario, setUsuario] = useState(null);
   const [showDocs, setShowDocs] = useState(false);
-  const [pagina, setPagina] = useState("propostas"); // propostas | ordens | nova
+  const [pagina, setPagina] = useState("nova"); // nova | propostas | ordens
   const [novaOCPayload, setNovaOCPayload] = useState(null);
   const [token, setToken] = useState(null);
   const [step, setStep] = useState("input");
@@ -174,10 +238,9 @@ export default function App() {
   useEffect(() => {
     if (!token) return;
     fetch(`${API}/banco/stats`, { headers: { Authorization: `Bearer ${token}` } })
-      .then(r => r.json()).then(setStats).catch(() => {});
+      .then((r) => r.json()).then(setStats).catch(() => {});
     fetch(`${API}/proxima-proposta`)
-      .then(r => r.json()).then(d => { if (d.proximo) setNumeroProposta(d.proximo); }).catch(() => {});
-    // Keep-alive a cada 9 min
+      .then((r) => r.json()).then((d) => { if (d.proximo) setNumeroProposta(d.proximo); }).catch(() => {});
     const ka = setInterval(() => fetch(`${API}/ping`).catch(() => {}), 9 * 60 * 1000);
     return () => clearInterval(ka);
   }, [token]);
@@ -195,7 +258,7 @@ export default function App() {
         }
       }
       if (imgs.length > 0) {
-        setImagens(prev => [...prev, ...imgs].slice(0, 6));
+        setImagens((prev) => [...prev, ...imgs].slice(0, 6));
         setArquivo(null);
       }
     }
@@ -205,10 +268,9 @@ export default function App() {
 
   function handleGoogleResponse(response) {
     const credential = response.credential;
-    const payload = JSON.parse(atob(credential.split('.')[1]));
+    const payload = JSON.parse(atob(credential.split(".")[1]));
     setToken(credential);
     setUsuario({ nome: payload.name, email: payload.email, foto: payload.picture });
-    // Renovar token 5 min antes de expirar
     const renovarEm = payload.exp * 1000 - Date.now() - 5 * 60 * 1000;
     if (renovarEm > 0) {
       setTimeout(() => {
@@ -229,7 +291,7 @@ export default function App() {
   function logout() {
     setUsuario(null); setToken(null); setStep("input"); setResultado(null);
     setTexto(""); setArquivo(null); setImagens([]); setNumeroProposta(""); setErro("");
-    setPagina("nova"); setNovaOCPayload(null);
+    setPagina("nova"); setNovaOCPayload(null); setShowDocs(false);
   }
 
   const authHeaders = () => ({ Authorization: `Bearer ${token}` });
@@ -240,9 +302,9 @@ export default function App() {
     e.preventDefault(); setIsDragging(false);
     const files = Array.from(e.dataTransfer.files || []);
     if (files.length > 0) {
-      const imgs = files.filter(f => f.type.startsWith("image/"));
-      const msgs = files.filter(f => f.name.toLowerCase().endsWith(".msg") || f.name.toLowerCase().endsWith(".eml"));
-      if (imgs.length > 0) { setImagens(prev => [...prev, ...imgs].slice(0, 6)); return; }
+      const imgs = files.filter((f) => f.type.startsWith("image/"));
+      const msgs = files.filter((f) => f.name.toLowerCase().endsWith(".msg") || f.name.toLowerCase().endsWith(".eml"));
+      if (imgs.length > 0) { setImagens((prev) => [...prev, ...imgs].slice(0, 6)); return; }
       if (msgs.length > 0) { setArquivo(msgs[0]); setTexto(""); return; }
       setArquivo(files[0]); setTexto(""); return;
     }
@@ -272,7 +334,7 @@ export default function App() {
       form.append("numero_proposta", numeroProposta);
       if (arquivo) form.append("arquivo", arquivo);
       else if (texto) form.append("texto", texto);
-      imagens.forEach(img => form.append("imagens", img));
+      imagens.forEach((img) => form.append("imagens", img));
 
       const controller = new AbortController();
       const tid = setTimeout(() => controller.abort(), 90000);
@@ -297,13 +359,13 @@ export default function App() {
   }
 
   function atualizarItem(index, campo, valor) {
-    setResultado(prev => ({ ...prev, itens: prev.itens.map((item, i) => i === index ? { ...item, [campo]: valor } : item) }));
+    setResultado((prev) => ({ ...prev, itens: prev.itens.map((item, i) => (i === index ? { ...item, [campo]: valor } : item)) }));
   }
 
   async function baixarCSV() {
     setLoading(true); setSalvandoBanco(true); setBancoInfo(null);
     try {
-      const itensCom = resultado.itens.filter(i => i.preco_un > 0);
+      const itensCom = resultado.itens.filter((i) => i.preco_un > 0);
       if (itensCom.length > 0) {
         try {
           const resBanco = await fetch(`${API}/upsert-precos`, {
@@ -313,7 +375,6 @@ export default function App() {
           if (resBanco.ok) setBancoInfo(await resBanco.json());
         } catch (e) { console.warn("Aviso banco:", e); }
       }
-      // Salvar proposta no banco
       try {
         await fetch(`${API}/salvar-proposta`, {
           method: "POST",
@@ -339,23 +400,29 @@ export default function App() {
   function reiniciar() {
     setStep("input"); setResultado(null); setBancoInfo(null);
     setTexto(""); setArquivo(null); setImagens([]); setNumeroProposta(""); setErro("");
-    fetch(`${API}/proxima-proposta`).then(r => r.json())
-      .then(d => { if (d.proximo) setNumeroProposta(d.proximo); }).catch(() => {});
+    fetch(`${API}/proxima-proposta`).then((r) => r.json())
+      .then((d) => { if (d.proximo) setNumeroProposta(d.proximo); }).catch(() => {});
   }
+
+  function navegar(k) {
+    if (k === "docs") { setShowDocs(true); return; }
+    setShowDocs(false); setPagina(k);
+  }
+  const activeNav = showDocs ? "docs" : pagina;
 
   // ── TELA DE LOGIN ─────────────────────────────────────────────────────────
   if (!usuario) {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center font-sans">
-        <div className="bg-white rounded-2xl border border-slate-200 p-10 w-full max-w-sm text-center shadow-sm">
-          <div className="w-14 h-14 bg-blue-600 rounded-2xl flex items-center justify-center mx-auto mb-5">
-            <span className="text-white font-bold text-2xl">K</span>
+      <div className="flex min-h-screen items-center justify-center bg-paper font-sans">
+        <div className="w-full max-w-sm rounded-2xl border border-line bg-surface p-10 text-center">
+          <div className="mx-auto mb-5 flex h-12 w-12 items-center justify-center rounded-xl bg-kist">
+            <span className="font-mono text-xl font-semibold text-white">K</span>
           </div>
-          <h1 className="text-xl font-semibold text-slate-800 mb-1">Kist Propostas</h1>
-          <p className="text-sm text-slate-500 mb-8">Faça login com sua conta Google para acessar</p>
-          <div ref={el => { if (el) { if (window.google) renderBotaoGoogle(el); else { const t = setInterval(() => { if (window.google) { clearInterval(t); renderBotaoGoogle(el); } }, 100); setTimeout(() => clearInterval(t), 5000); } } }}
-            className="flex justify-center min-h-[44px] items-center mb-3"></div>
-          <p className="text-xs text-slate-400">Acesso restrito à equipe Kist</p>
+          <h1 className="text-[18px] font-semibold tracking-tight text-ink">Kist · Cabine</h1>
+          <p className="mb-8 mt-1 text-[13px] text-sub">Entre com sua conta Google para acessar.</p>
+          <div ref={(el) => { if (el) { if (window.google) renderBotaoGoogle(el); else { const t = setInterval(() => { if (window.google) { clearInterval(t); renderBotaoGoogle(el); } }, 100); setTimeout(() => clearInterval(t), 5000); } } }}
+            className="mb-3 flex min-h-[44px] items-center justify-center"></div>
+          <p className="text-[11.5px] text-faint">Acesso restrito à equipe Kist</p>
         </div>
       </div>
     );
@@ -363,236 +430,197 @@ export default function App() {
 
   // ── APP PRINCIPAL ──────────────────────────────────────────────────────────
   return (
-    <div className="min-h-screen bg-slate-50 font-sans">
-      <header className="bg-white border-b border-slate-200 px-6 py-3">
-        <div className="max-w-5xl mx-auto flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center">
-              <span className="text-white font-bold text-sm">K</span>
-            </div>
-            <div>
-              <div className="font-semibold text-slate-800 text-sm">Kist Soluções</div>
-              <div className="text-xs text-slate-400">Gerador de Propostas</div>
-            </div>
-          </div>
-          <div className="flex items-center gap-4">
-            {stats && (
-              <div className="hidden sm:flex items-center gap-4 text-xs text-slate-500">
-                <span>{stats.total_produtos?.toLocaleString()} produtos no banco</span>
-                {stats.desatualizados_90d > 0 && <span className="text-amber-500">⚠ {stats.desatualizados_90d} desatualizados</span>}
-              </div>
-            )}
-            <div className="flex items-center gap-2">
-              {usuario.foto && <img src={usuario.foto} alt="" className="w-7 h-7 rounded-full" />}
-              <span className="text-xs text-slate-600 hidden sm:block">{usuario.nome}</span>
-              <div className="flex items-center gap-1">
-                {[["nova","Nova proposta"],["propostas","Propostas"],["ordens","Ordens de compra"]].map(([p,l]) => (
-                  <button key={p} onClick={() => { setShowDocs(false); setPagina(p); }}
-                    className={`text-xs px-2 py-1 rounded transition-colors ${pagina===p && !showDocs ? "bg-blue-100 text-blue-600 font-medium" : "text-slate-400 hover:text-slate-600"}`}>
-                    {l}
+    <div className="flex h-screen bg-paper font-sans text-ink antialiased">
+      <Sidebar active={activeNav} onNavigate={navegar} usuario={usuario} stats={stats} onLogout={logout} />
+
+      <main className="flex-1 overflow-auto">
+        {showDocs ? (
+          <div className="mx-auto max-w-5xl px-8 py-9"><Docs /></div>
+        ) : pagina === "propostas" ? (
+          <Propostas token={token} usuario={usuario}
+            onCriarOC={(proposta, itens, po) => { setNovaOCPayload({ proposta, itens, po }); setPagina("ordens"); }} />
+        ) : pagina === "ordens" ? (
+          <OrdensCompra token={token} usuario={usuario}
+            novaOC={novaOCPayload}
+            onNovaOCProcessada={() => setNovaOCPayload(null)} />
+        ) : (
+          <div className="mx-auto max-w-5xl px-8 py-9">
+
+            {/* INPUT */}
+            {step === "input" && (
+              <div className="mx-auto max-w-2xl rise">
+                <PageHeader eyebrow="Etapa 1 de 3 · Entrada" title="Nova proposta"
+                  sub="Arraste o .msg do Outlook, cole prints com Ctrl+V ou cole o texto do e-mail." />
+
+                <div className="mt-7 space-y-5 rounded-2xl border border-line bg-surface p-6">
+                  <div>
+                    <label className="mb-1.5 block text-[12.5px] font-medium text-ink">
+                      Número da proposta <span className="text-rose">*</span>
+                    </label>
+                    <input
+                      className="w-full rounded-lg border border-line2 bg-paper px-3 py-2.5 font-mono text-[13.5px] text-ink cell-input"
+                      placeholder="ex: 1050370" value={numeroProposta}
+                      onChange={(e) => setNumeroProposta(e.target.value)}
+                    />
+                  </div>
+
+                  <div>
+                    <label className="mb-1.5 block text-[12.5px] font-medium text-ink">E-mail ou prints da cotação</label>
+                    <div onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}
+                      onClick={() => !arquivo && !texto && imagens.length === 0 && fileRef.current.click()}
+                      className={`cursor-pointer rounded-xl border-2 border-dashed transition-all
+                        ${isDragging ? "border-kist bg-kist/[0.04]"
+                          : imagens.length > 0 ? "border-kist/40 bg-kist/[0.03]"
+                          : arquivo ? "border-kist/40 bg-kist/[0.03]"
+                          : "border-line2 bg-paper hover:border-faint"}`}>
+                      {imagens.length > 0 ? (
+                        <div className="p-4">
+                          <div className="mb-2 flex items-center justify-between">
+                            <span className="text-[12px] font-medium text-kist">{imagens.length} print(s) — cole mais com Ctrl+V</span>
+                            <button onClick={(e) => { e.stopPropagation(); setImagens([]); }} className="text-[11px] text-faint hover:text-rose">limpar tudo</button>
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            {imagens.map((img, i) => (
+                              <div key={i} className="group/img relative">
+                                <img src={URL.createObjectURL(img)} alt="" className="h-16 w-16 rounded-lg border border-line object-cover" />
+                                <button onClick={(e) => { e.stopPropagation(); setImagens((prev) => prev.filter((_, j) => j !== i)); }}
+                                  className="absolute -right-1 -top-1 hidden h-4 w-4 items-center justify-center rounded-full bg-rose text-[10px] text-white group-hover/img:flex">✕</button>
+                              </div>
+                            ))}
+                            {imagens.length < 6 && (
+                              <div className="flex h-16 w-16 items-center justify-center rounded-lg border-2 border-dashed border-line2 text-center text-[10px] text-faint">+Ctrl+V</div>
+                            )}
+                          </div>
+                        </div>
+                      ) : arquivo ? (
+                        <div className="flex items-center justify-between p-4">
+                          <div className="flex items-center gap-3">
+                            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-kist/10 text-kist"><IconUpload size={18} /></div>
+                            <div>
+                              <div className="text-[13px] font-medium text-ink">{arquivo.name}</div>
+                              <div className="font-mono text-[11px] text-faint">{(arquivo.size / 1024).toFixed(0)} KB</div>
+                            </div>
+                          </div>
+                          <button onClick={(e) => { e.stopPropagation(); setArquivo(null); }} className="px-2 text-faint hover:text-rose"><IconX size={16} /></button>
+                        </div>
+                      ) : texto ? (
+                        <div className="p-4">
+                          <div className="mb-2 flex items-center justify-between">
+                            <span className="text-[12px] font-medium text-sub">Texto colado</span>
+                            <button onClick={() => setTexto("")} className="text-[11px] text-faint hover:text-rose">limpar</button>
+                          </div>
+                          <p className="line-clamp-3 font-mono text-[11.5px] text-sub">{texto.slice(0, 200)}…</p>
+                        </div>
+                      ) : (
+                        <div className="px-6 py-10 text-center">
+                          <div className="mx-auto mb-3 flex h-11 w-11 items-center justify-center rounded-xl bg-kist/10 text-kist"><IconUpload size={20} /></div>
+                          <div className="text-[13.5px] font-medium text-ink">{isDragging ? "Solte aqui" : "Arraste o e-mail ou prints"}</div>
+                          <div className="mt-1 text-[12px] text-sub">
+                            Cole prints com <kbd className="rounded border border-line2 bg-surface px-1.5 py-0.5 font-mono text-[10.5px]">Ctrl</kbd>{" "}
+                            <kbd className="rounded border border-line2 bg-surface px-1.5 py-0.5 font-mono text-[10.5px]">V</kbd>
+                          </div>
+                          <div className="mt-1 text-[11.5px] text-faint">Aceita .msg · PNG/JPG (até 6) · PDF · Excel</div>
+                          <button onClick={(e) => { e.stopPropagation(); fileRef.current.click(); }} className={`${btnGhost} mt-3`}>Procurar arquivo</button>
+                        </div>
+                      )}
+                    </div>
+                    <input ref={fileRef} type="file" accept=".msg,.eml" className="hidden" onChange={handleArquivo} />
+                  </div>
+
+                  <div className="relative py-1 text-center">
+                    <div className="absolute inset-x-0 top-1/2 h-px bg-line" />
+                    <span className="relative bg-surface px-3 text-[11px] eyebrow uppercase text-faint">ou cole o texto</span>
+                  </div>
+
+                  <textarea rows={5}
+                    className="w-full resize-none rounded-lg border border-line2 bg-paper px-3 py-2.5 font-mono text-[12.5px] text-ink cell-input"
+                    placeholder="Cole aqui o conteúdo do e-mail de cotação…" value={texto}
+                    onChange={(e) => { setTexto(e.target.value); setArquivo(null); }} />
+
+                  {erro && <div className="rounded-lg border border-rose/30 bg-rosebg px-4 py-3 text-[13px] text-rose">{erro}</div>}
+
+                  <button onClick={processar} disabled={loading} className={`${btnPrimary} w-full justify-center py-2.5`}>
+                    {loading
+                      ? <><span className="inline-block animate-spin"><IconBolt size={15} /></span> Extraindo e cruzando com o banco…</>
+                      : <>Processar e-mail <IconArrow size={15} /></>}
                   </button>
-                ))}
-                <button onClick={() => { setShowDocs(v => !v); }}
-                  className={`text-xs px-2 py-1 rounded transition-colors ${showDocs ? "bg-blue-100 text-blue-600" : "text-slate-400 hover:text-slate-600"}`}>Docs</button>
-              </div>
-              <button onClick={logout} className="text-xs text-slate-400 hover:text-red-400 ml-1">Sair</button>
-            </div>
-          </div>
-        </div>
-      </header>
-
-      {showDocs && (
-        <div className="border-b border-slate-200 bg-white">
-          <Docs />
-        </div>
-      )}
-      {!showDocs && pagina === "propostas" && (
-        <Propostas token={token} usuario={usuario}
-          onCriarOC={(proposta, itens) => { setNovaOCPayload({proposta, itens}); setPagina("ordens"); }} />
-      )}
-      {!showDocs && pagina === "ordens" && (
-        <OrdensCompra token={token} usuario={usuario}
-          novaOC={novaOCPayload}
-          onNovaOCProcessada={() => setNovaOCPayload(null)} />
-      )}
-      {!showDocs && pagina === "nova" && <main className="max-w-5xl mx-auto px-6 py-8">
-
-        {/* INPUT */}
-        {step === "input" && (
-          <div className="max-w-2xl mx-auto">
-            <div className="mb-8">
-              <h1 className="text-2xl font-bold text-slate-800 mb-1">Nova proposta</h1>
-              <p className="text-slate-500 text-sm">Arraste o e-mail, cole prints (Ctrl+V) ou envie arquivo .msg</p>
-            </div>
-            <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-5">
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1.5">Número da proposta <span className="text-red-400">*</span></label>
-                <input className="w-full border border-slate-300 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  placeholder="ex: 1050370" value={numeroProposta} onChange={e => setNumeroProposta(e.target.value)} />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1.5">E-mail ou prints de cotação</label>
-                <div onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}
-                  onClick={() => !arquivo && !texto && imagens.length === 0 && fileRef.current.click()}
-                  className={`border-2 border-dashed rounded-xl transition-all cursor-pointer ${isDragging ? "border-blue-400 bg-blue-50 scale-[1.01]" : imagens.length > 0 ? "border-violet-300 bg-violet-50" : arquivo ? "border-blue-300 bg-blue-50" : "border-slate-200 hover:border-slate-300 hover:bg-slate-50"}`}>
-                  {imagens.length > 0 ? (
-                    <div className="p-4">
-                      <div className="flex items-center justify-between mb-2">
-                        <span className="text-xs font-medium text-violet-700">{imagens.length} print(s) — cole mais com Ctrl+V</span>
-                        <button onClick={e => { e.stopPropagation(); setImagens([]); }} className="text-xs text-slate-400 hover:text-red-400">limpar tudo</button>
-                      </div>
-                      <div className="flex gap-2 flex-wrap">
-                        {imagens.map((img, i) => (
-                          <div key={i} className="relative group">
-                            <img src={URL.createObjectURL(img)} alt="" className="w-16 h-16 object-cover rounded-lg border border-slate-200" />
-                            <button onClick={e => { e.stopPropagation(); setImagens(prev => prev.filter((_, j) => j !== i)); }}
-                              className="absolute -top-1 -right-1 w-4 h-4 bg-red-500 text-white rounded-full text-xs hidden group-hover:flex items-center justify-center">✕</button>
-                          </div>
-                        ))}
-                        {imagens.length < 6 && (
-                          <div className="w-16 h-16 border-2 border-dashed border-slate-200 rounded-lg flex items-center justify-center text-slate-400 text-xs text-center">
-                            +Ctrl+V
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  ) : arquivo ? (
-                    <div className="p-4 flex items-center justify-between">
-                      <div className="flex items-center gap-3">
-                        <div className="w-10 h-10 bg-blue-100 rounded-lg flex items-center justify-center text-blue-600 text-lg">📧</div>
-                        <div><div className="text-sm font-medium text-slate-700">{arquivo.name}</div><div className="text-xs text-slate-400">{(arquivo.size/1024).toFixed(0)} KB</div></div>
-                      </div>
-                      <button onClick={e => { e.stopPropagation(); setArquivo(null); }} className="text-slate-400 hover:text-red-400 text-lg px-2">✕</button>
-                    </div>
-                  ) : texto ? (
-                    <div className="p-4">
-                      <div className="flex items-center justify-between mb-2">
-                        <span className="text-xs font-medium text-slate-500">Texto colado</span>
-                        <button onClick={() => setTexto("")} className="text-slate-400 hover:text-red-400 text-xs">limpar</button>
-                      </div>
-                      <p className="text-xs text-slate-600 line-clamp-3 font-mono">{texto.slice(0,200)}...</p>
-                    </div>
-                  ) : (
-                    <div className="p-8 text-center">
-                      <div className="text-4xl mb-3">📨</div>
-                      <p className="text-sm font-medium text-slate-600 mb-1">{isDragging ? "Solte aqui!" : "Arraste o e-mail ou prints"}</p>
-                      <p className="text-xs text-slate-400 mb-1">Cole prints com <kbd className="bg-slate-100 px-1 rounded">Ctrl+V</kbd></p>
-                      <p className="text-xs text-slate-400 mb-3">Aceita .msg, imagens PNG/JPG (até 6)</p>
-                      <button onClick={e => { e.stopPropagation(); fileRef.current.click(); }}
-                        className="text-xs bg-slate-100 hover:bg-slate-200 text-slate-600 px-3 py-1.5 rounded-lg">Procurar arquivo</button>
-                    </div>
-                  )}
                 </div>
-                <input ref={fileRef} type="file" accept=".msg,.eml" className="hidden" onChange={handleArquivo} />
-              </div>
-              <div className="relative">
-                <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-slate-200" /></div>
-                <div className="relative flex justify-center"><span className="bg-white px-3 text-xs text-slate-400">ou cole o texto do e-mail</span></div>
-              </div>
-              <textarea rows={6}
-                className="w-full border border-slate-300 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none font-mono"
-                placeholder="Cole aqui o conteúdo do e-mail..." value={texto}
-                onChange={e => { setTexto(e.target.value); setArquivo(null); }} />
-              {erro && <div className="bg-red-50 border border-red-200 rounded-lg px-4 py-3 text-sm text-red-600">{erro}</div>}
-              <button onClick={processar} disabled={loading}
-                className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white font-medium py-2.5 rounded-lg text-sm transition-colors flex items-center justify-center gap-2">
-                {loading ? <><span className="animate-spin inline-block">⟳</span> Processando (matching IA)...</> : "Processar e-mail"}
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* RESULTADO */}
-        {step === "resultado" && resultado && (
-          <div>
-            <div className="flex items-start justify-between mb-4">
-              <div>
-                <div className="flex items-center gap-2 mb-1">
-                  <h1 className="text-xl font-bold text-slate-800">Proposta {resultado.proposta}</h1>
-                  <Badge count={resultado.total_itens} tipo="total" />
-                  <Badge count={resultado.com_preco} tipo="preco" />
-                  {resultado.sem_preco > 0 && <Badge count={resultado.sem_preco} tipo="sem" />}
-                </div>
-                <div className="text-sm text-slate-500">
-                  <span className="font-medium text-slate-700">{resultado.cliente}</span>
-                  {resultado.cnpj && <span className="ml-2 text-slate-400">{resultado.cnpj}</span>}
-                  {resultado.rc_neg && <span className="ml-2 bg-slate-100 text-slate-600 px-2 py-0.5 rounded text-xs">{resultado.rc_neg}</span>}
-                </div>
-              </div>
-              <div className="flex gap-2">
-                <button onClick={reiniciar} className="px-4 py-2 text-sm border border-slate-300 rounded-lg hover:bg-slate-50 text-slate-600">Nova proposta</button>
-                <button onClick={baixarCSV} disabled={loading || salvandoBanco}
-                  className="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white rounded-lg font-medium flex items-center gap-1.5">
-                  {salvandoBanco ? <><span className="animate-spin inline-block">⟳</span> Salvando...</> : loading ? "Gerando..." : "⬇ Confirmar e baixar CSV"}
-                </button>
-              </div>
-            </div>
-
-            {(() => {
-              const semPreco = resultado.itens.filter(i => !i.tem_preco).length;
-              const incertos = resultado.itens.filter(i => i.confianca_match === "baixa").length;
-              if (semPreco === 0 && incertos === 0) return null;
-              return (
-                <div className="bg-amber-50 border border-amber-200 rounded-lg px-4 py-3 mb-3 text-sm text-amber-700">
-                  <div className="font-medium mb-1">⚠ Atenção — revisão necessária antes de baixar:</div>
-                  <ul className="list-disc list-inside space-y-0.5 text-amber-600">
-                    {semPreco > 0 && <li><strong>{semPreco} {semPreco === 1 ? "item" : "itens"} sem preço</strong> — não encontrado no banco, cotar manualmente</li>}
-                    {incertos > 0 && <li><strong>{incertos} {incertos === 1 ? "item com match incerto" : "itens com match incerto"}</strong> — confirme se o candidato sugerido é realmente o mesmo produto</li>}
-                  </ul>
-                </div>
-              );
-            })()}
-            <div className="bg-blue-50 border border-blue-200 rounded-lg px-4 py-3 mb-3 text-sm text-blue-700">
-              💾 Ao confirmar, os preços serão salvos automaticamente no banco.
-            </div>
-            {erro && <div className="bg-red-50 border border-red-200 rounded-lg px-4 py-3 mb-3 text-sm text-red-600">{erro}</div>}
-
-            <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="bg-slate-50 border-b border-slate-200">
-                    <th className="px-3 py-3 text-left text-xs font-medium text-slate-400 w-8">#</th>
-                    <th className="px-3 py-3 text-left text-xs font-medium text-slate-500">Descrição</th>
-                    <th className="px-3 py-3 text-center text-xs font-medium text-slate-500 w-16">Qtd</th>
-                    <th className="px-3 py-3 text-center text-xs font-medium text-slate-500 w-14">Un</th>
-                    <th className="px-3 py-3 text-right text-xs font-medium text-slate-500 w-28">Preço unit.</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {resultado.itens.map((item, i) => (
-                    <ItemRow key={i} item={item} index={i} onChange={atualizarItem} token={token} apiUrl={API} />
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <div className="flex items-center gap-4 mt-3 text-xs text-slate-400">
-              <span><span className={`inline-block w-2 h-2 rounded-full bg-emerald-400 mr-1`}></span>✓ exato</span>
-              <span><span className={`inline-block w-2 h-2 rounded-full bg-blue-400 mr-1`}></span>~ similar</span>
-              <span><span className={`inline-block w-2 h-2 rounded-full bg-amber-400 mr-1`}></span>⚠ incerto</span>
-              <span><span className={`inline-block w-2 h-2 rounded-full bg-red-300 mr-1`}></span>sem match</span>
-              <span className="ml-auto">Clique em qualquer campo para editar</span>
-            </div>
-          </div>
-        )}
-
-        {/* DOWNLOAD */}
-        {step === "download" && (
-          <div className="max-w-md mx-auto text-center py-16">
-            <div className="w-16 h-16 bg-emerald-100 rounded-full flex items-center justify-center mx-auto mb-4"><span className="text-3xl">✓</span></div>
-            <h2 className="text-xl font-bold text-slate-800 mb-2">CSV baixado!</h2>
-            <p className="text-slate-500 text-sm mb-4">Arquivo <code className="bg-slate-100 px-1.5 py-0.5 rounded text-xs">proposta_{resultado?.proposta}.csv</code> pronto para importar no Tiny.</p>
-            {bancoInfo && (
-              <div className="bg-emerald-50 border border-emerald-200 rounded-lg px-4 py-3 mb-6 text-sm text-emerald-700">
-                💾 Banco atualizado — <strong>{bancoInfo.atualizados}</strong> preços atualizados, <strong>{bancoInfo.inseridos}</strong> novos inseridos
               </div>
             )}
-            <button onClick={reiniciar} className="bg-blue-600 hover:bg-blue-700 text-white font-medium py-2.5 px-6 rounded-lg text-sm">
-              Processar outra proposta
-            </button>
+
+            {/* RESULTADO */}
+            {step === "resultado" && resultado && (
+              <div className="rise">
+                <PageHeader eyebrow="Etapa 2 de 3 · Revisão"
+                  title={`Proposta ${resultado.proposta}`}
+                  sub={<span className="flex flex-wrap items-center gap-2">
+                    <span className="font-medium text-ink">{resultado.cliente}</span>
+                    {resultado.cnpj && <span className="font-mono text-[12px] text-faint">{resultado.cnpj}</span>}
+                    {resultado.rc_neg && <span className="rounded-md bg-paper px-2 py-0.5 font-mono text-[11px] text-sub">{resultado.rc_neg}</span>}
+                  </span>}
+                  actions={<>
+                    <button onClick={reiniciar} className={btnGhost}>Recomeçar</button>
+                    <button onClick={baixarCSV} disabled={loading || salvandoBanco} className={btnPrimary}>
+                      {salvandoBanco
+                        ? <><span className="inline-block animate-spin"><IconBolt size={15} /></span> Salvando…</>
+                        : loading ? "Gerando…" : <><IconDownload size={15} /> Confirmar e baixar CSV</>}
+                    </button>
+                  </>} />
+
+                <div className="mt-6"><CertaintyStrip itens={resultado.itens} /></div>
+
+                {erro && <div className="mt-3 rounded-lg border border-rose/30 bg-rosebg px-4 py-3 text-[13px] text-rose">{erro}</div>}
+
+                <div className="mt-4 overflow-hidden rounded-xl border border-line bg-surface">
+                  <table className="w-full">
+                    <thead>
+                      <tr className="border-b border-line bg-paper/70">
+                        <th className="w-1 p-0" />
+                        <th className="py-2.5 pl-4 pr-2 text-center text-[10.5px] font-semibold uppercase eyebrow text-faint">#</th>
+                        <th className="py-2.5 pr-3 text-left text-[10.5px] font-semibold uppercase eyebrow text-faint">Descrição</th>
+                        <th className="py-2.5 pr-3 text-right text-[10.5px] font-semibold uppercase eyebrow text-faint">Qtd</th>
+                        <th className="py-2.5 pr-3 text-left text-[10.5px] font-semibold uppercase eyebrow text-faint">Un</th>
+                        <th className="py-2.5 pr-4 text-right text-[10.5px] font-semibold uppercase eyebrow text-faint">Preço un.</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {resultado.itens.map((item, i) => (
+                        <ItemRow key={i} item={item} index={i} onChange={atualizarItem} token={token} apiUrl={API} />
+                      ))}
+                    </tbody>
+                  </table>
+                  <div className="flex items-center justify-between border-t border-line bg-paper/50 px-4 py-3">
+                    <span className="text-[12px] text-faint">Clique em qualquer campo para editar · preços salvos no banco ao confirmar</span>
+                    <div className="flex items-baseline gap-2">
+                      <span className="text-[11px] uppercase eyebrow text-faint">Total estimado</span>
+                      <span className="font-mono text-[16px] font-semibold text-ink">
+                        R$ {brl(resultado.itens.reduce((s, i) => s + (i.preco_un || 0) * (parseFloat(i.quantidade) || 0), 0))}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* DOWNLOAD */}
+            {step === "download" && (
+              <div className="mx-auto max-w-md py-16 text-center rise">
+                <div className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-2xl bg-signalbg text-signal"><IconCheck size={26} /></div>
+                <h2 className="text-[22px] font-semibold tracking-tight text-ink">CSV pronto</h2>
+                <p className="mx-auto mt-2 max-w-xs text-[13.5px] text-sub">
+                  O arquivo <code className="rounded bg-paper px-1.5 py-0.5 font-mono text-[12px] text-ink">proposta_{resultado?.proposta}.csv</code> foi baixado e está pronto para importar no Tiny.
+                </p>
+                {bancoInfo && (
+                  <div className="mx-auto mt-5 max-w-xs rounded-lg border border-signal/30 bg-signalbg px-4 py-3 text-left text-[12.5px] text-signal">
+                    Banco atualizado — <strong>{bancoInfo.atualizados}</strong> preços atualizados, <strong>{bancoInfo.inseridos}</strong> novos inseridos.
+                  </div>
+                )}
+                <button onClick={reiniciar} className={`${btnPrimary} mt-6`}>Processar outra proposta</button>
+              </div>
+            )}
           </div>
         )}
-      </main>}
+      </main>
     </div>
   );
 }
-

@@ -1,7 +1,43 @@
+@import url('https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
+:root { color-scheme: light; }
+html, body, #root { height: 100%; }
 body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  margin: 0;
+  background: #F6F7F9;
+  font-family: 'Geist', ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Scrollbar discreta */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: #D5DAE4; border-radius: 999px;
+  border: 3px solid transparent; background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background: #C2C9D6; background-clip: content-box; }
+
+/* Utilitários do sistema */
+.eyebrow { letter-spacing: 0.12em; }
+
+.cell-input { transition: background .12s, box-shadow .12s; }
+.cell-input:focus { background: #fff; box-shadow: inset 0 0 0 1.5px #1F6FEB; outline: none; }
+
+.rise { animation: rise .45s cubic-bezier(.2,.7,.2,1) both; }
+@keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+.slide-in { animation: slidein .22s cubic-bezier(.2,.7,.2,1) both; }
+@keyframes slidein { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+button:focus-visible, a:focus-visible, input:focus-visible, [tabindex]:focus-visible {
+  outline: 2px solid #1F6FEB; outline-offset: 2px; border-radius: 8px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rise, .slide-in { animation: none !important; }
+  * { transition: none !important; }
 }

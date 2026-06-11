@@ -690,6 +690,7 @@ async def criar_oc(payload: dict, usuario: str = Depends(verificar_token)):
     sb = get_supabase()
     res = sb.table("ordens_compra").insert({
         "titulo":        payload.get("titulo", ""),
+        "numero_po":     (payload.get("numero_po") or None),   # PO do cliente (pode ser nula/pendente)
         "usuario_email": usuario,
         "usuario_nome":  payload.get("usuario_nome", ""),
         "status":        "rascunho",
@@ -710,7 +711,8 @@ async def criar_oc(payload: dict, usuario: str = Depends(verificar_token)):
                 "quantidade_comprar":  float(i.get("quantidade_comprar") or i.get("quantidade_proposta") or 1),
                 "unidade":             i.get("unidade", "UN"),
                 "preco_venda":         float(i.get("preco_venda") or 0),
-                "nome_fornecedor":     i.get("fornecedor", ""),
+                # origem do preço herdada da proposta (aceita as duas nomenclaturas):
+                "nome_fornecedor":     i.get("nome_fornecedor") or i.get("fornecedor", ""),
                 "link_fornecedor":     i.get("link_fornecedor", ""),
                 "sku_fornecedor":      i.get("sku_fornecedor", ""),
             })
@@ -736,7 +738,25 @@ async def listar_ocs(
     # Excluir arquivadas por padrão
     q = q.neq("status", "arquivada")
     res = q.execute()
-    return res.data
+    ocs = res.data or []
+
+    # Totais por OC (venda e custo) para os cards do quadro
+    if ocs:
+        ids = [o["id"] for o in ocs]
+        itens = sb.table("oc_itens").select(
+            "oc_id,preco_venda,preco_custo,quantidade_comprar,quantidade_proposta"
+        ).in_("oc_id", ids).execute().data or []
+        tot = {}
+        for r in itens:
+            qd = r.get("quantidade_comprar")
+            if qd is None:
+                qd = r.get("quantidade_proposta") or 0
+            t = tot.setdefault(r["oc_id"], {"valor_venda": 0.0, "valor_custo": 0.0})
+            t["valor_venda"] += float(r.get("preco_venda") or 0) * float(qd or 0)
+            t["valor_custo"] += float(r.get("preco_custo") or 0) * float(qd or 0)
+        for o in ocs:
+            o.update(tot.get(o["id"], {"valor_venda": 0.0, "valor_custo": 0.0}))
+    return ocs
 
 
 @app.get("/ordens-compra/{oc_id}/itens")
@@ -754,11 +774,21 @@ async def atualizar_oc(
     """Atualiza status e campos de uma OC"""
     sb = get_supabase()
     campos = {}
-    for f in ["titulo","status","frete_estimado","frete_real","obs"]:
+    for f in ["titulo","numero_po","status","frete_estimado","frete_real","obs"]:
         if f in payload:
             campos[f] = payload[f]
     sb.table("ordens_compra").update(campos).eq("id", oc_id).execute()
     return {"ok": True}
+
+
+@app.delete("/ordens-compra/{oc_id}")
+async def excluir_oc(oc_id: int, usuario: str = Depends(verificar_token)):
+    """Exclui uma OC e todos os seus itens (limpeza de testes / OC errada).
+    Apaga os oc_itens primeiro caso a FK não seja ON DELETE CASCADE."""
+    sb = get_supabase()
+    sb.table("oc_itens").delete().eq("oc_id", oc_id).execute()
+    sb.table("ordens_compra").delete().eq("id", oc_id).execute()
+    return {"ok": True, "excluida": oc_id}
 
 
 @app.put("/oc-itens/{item_id}")
