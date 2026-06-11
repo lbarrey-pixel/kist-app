@@ -41,6 +41,7 @@ export const IconX        = (p) => <Ic {...p} d={<path d="M6 6l12 12M18 6 6 18" 
 export const IconDownload = (p) => <Ic {...p} d={<><path d="M12 4v11" /><path d="m7 11 5 5 5-5" /><path d="M5 20h14" /></>} />;
 export const IconLink     = (p) => <Ic {...p} d={<><path d="M9 15 15 9" /><path d="M10.5 6.5 13 4a4 4 0 0 1 6 6l-2.5 2.5" /><path d="M13.5 17.5 11 20a4 4 0 0 1-6-6l2.5-2.5" /></>} />;
 export const IconCopy     = (p) => <Ic {...p} d={<><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15V5a2 2 0 0 1 2-2h10" /></>} />;
+export const IconTrash    = (p) => <Ic {...p} d={<><path d="M4 7h16" /><path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" /><path d="M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13" /><path d="M10 11v6M14 11v6" /></>} />;
 export const IconLogout   = (p) => <Ic {...p} d={<><path d="M14 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2v-2" /><path d="M9 12h11" /><path d="m17 8 4 4-4 4" /></>} />;
 
 // ── Texto/labels ──────────────────────────────────────────────────────────
