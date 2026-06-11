@@ -571,3 +571,283 @@ Sugira 3 opções de PN/modelos específicos. JSON puro sem markdown:
         return json.loads(raw)
     except Exception as e:
         raise HTTPException(500, f"Erro ao parsear sugestões: {str(e)} | {raw[:200]}")
+
+
+# ── PROPOSTAS ─────────────────────────────────────────────────────────────────
+
+@app.post("/salvar-proposta")
+async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)):
+    """Salva proposta e itens no banco após confirmação"""
+    sb = get_supabase()
+
+    # Calcular valor total estimado
+    itens = payload.get("itens", [])
+    valor_total = sum(
+        float(i.get("preco_un") or 0) * float(i.get("quantidade") or 1)
+        for i in itens
+    )
+
+    # Inserir proposta
+    res = sb.table("propostas").insert({
+        "numero_proposta": payload.get("proposta"),
+        "cliente":         payload.get("cliente"),
+        "cnpj":            payload.get("cnpj"),
+        "rc_neg":          payload.get("rc_neg"),
+        "usuario_email":   usuario,
+        "usuario_nome":    payload.get("usuario_nome", ""),
+        "total_itens":     len(itens),
+        "com_preco":       payload.get("com_preco", 0),
+        "sem_preco":       payload.get("sem_preco", 0),
+        "valor_total_estimado": valor_total,
+    }).execute()
+
+    proposta_id = res.data[0]["id"]
+
+    # Inserir itens
+    if itens:
+        rows = []
+        for i in itens:
+            rows.append({
+                "proposta_id":       proposta_id,
+                "descricao_original": i.get("descricao_original", ""),
+                "descricao_final":   i.get("descricao_final", ""),
+                "quantidade":        float(i.get("quantidade") or 1),
+                "unidade":           i.get("unidade", "UN"),
+                "preco_venda":       float(i.get("preco_un") or 0),
+                "confianca_match":   i.get("confianca_match", ""),
+                "specs_complementares": i.get("specs_complementares", ""),
+                "fornecedor":        i.get("fornecedor", ""),
+                "link_fornecedor":   i.get("link_fornecedor", ""),
+                "sku_fornecedor":    i.get("sku_fornecedor", ""),
+                "obs_interna":       i.get("obs_interna", ""),
+            })
+        sb.table("itens_proposta").insert(rows).execute()
+
+    return {"proposta_id": proposta_id, "total_itens": len(itens)}
+
+
+@app.get("/propostas")
+async def listar_propostas(
+    numero: str = None,
+    cnpj: str = None,
+    usuario_email: str = None,
+    data_inicio: str = None,
+    data_fim: str = None,
+    todos: bool = False,
+    limit: int = 50,
+    usuario: str = Depends(verificar_token)
+):
+    """Lista propostas com filtros"""
+    sb = get_supabase()
+    q = sb.table("propostas").select("*").order("data_geracao", desc=True).limit(limit)
+
+    # Por padrão mostra só do usuário autenticado, salvo se todos=True
+    if not todos:
+        q = q.eq("usuario_email", usuario)
+    if numero:
+        q = q.ilike("numero_proposta", f"%{numero}%")
+    if cnpj:
+        q = q.ilike("cnpj", f"%{cnpj}%")
+    if usuario_email:
+        q = q.ilike("usuario_email", f"%{usuario_email}%")
+    if data_inicio:
+        q = q.gte("data_geracao", data_inicio)
+    if data_fim:
+        q = q.lte("data_geracao", data_fim + "T23:59:59")
+
+    res = q.execute()
+    return res.data
+
+
+@app.get("/propostas/{proposta_id}/itens")
+async def itens_proposta(proposta_id: int, usuario: str = Depends(verificar_token)):
+    """Retorna itens de uma proposta"""
+    sb = get_supabase()
+    res = sb.table("itens_proposta").select("*").eq("proposta_id", proposta_id).execute()
+    return res.data
+
+
+@app.put("/itens-proposta/{item_id}/origem")
+async def atualizar_origem_item(
+    item_id: int, payload: dict, usuario: str = Depends(verificar_token)
+):
+    """Atualiza campos internos de origem de um item"""
+    sb = get_supabase()
+    sb.table("itens_proposta").update({
+        "fornecedor":      payload.get("fornecedor", ""),
+        "link_fornecedor": payload.get("link_fornecedor", ""),
+        "sku_fornecedor":  payload.get("sku_fornecedor", ""),
+        "obs_interna":     payload.get("obs_interna", ""),
+    }).eq("id", item_id).execute()
+    return {"ok": True}
+
+
+# ── ORDENS DE COMPRA ──────────────────────────────────────────────────────────
+
+@app.post("/ordens-compra")
+async def criar_oc(payload: dict, usuario: str = Depends(verificar_token)):
+    """Cria uma nova ordem de compra"""
+    sb = get_supabase()
+    res = sb.table("ordens_compra").insert({
+        "titulo":        payload.get("titulo", ""),
+        "usuario_email": usuario,
+        "usuario_nome":  payload.get("usuario_nome", ""),
+        "status":        "rascunho",
+        "obs":           payload.get("obs", ""),
+    }).execute()
+    oc_id = res.data[0]["id"]
+
+    # Adicionar itens se fornecidos
+    itens = payload.get("itens", [])
+    if itens:
+        rows = []
+        for i in itens:
+            rows.append({
+                "oc_id":               oc_id,
+                "item_proposta_id":    i.get("item_proposta_id"),
+                "descricao":           i.get("descricao", ""),
+                "quantidade_proposta": float(i.get("quantidade_proposta") or 1),
+                "quantidade_comprar":  float(i.get("quantidade_comprar") or i.get("quantidade_proposta") or 1),
+                "unidade":             i.get("unidade", "UN"),
+                "preco_venda":         float(i.get("preco_venda") or 0),
+                "nome_fornecedor":     i.get("fornecedor", ""),
+                "link_fornecedor":     i.get("link_fornecedor", ""),
+                "sku_fornecedor":      i.get("sku_fornecedor", ""),
+            })
+        sb.table("oc_itens").insert(rows).execute()
+
+    return {"oc_id": oc_id}
+
+
+@app.get("/ordens-compra")
+async def listar_ocs(
+    status: str = None,
+    todos: bool = False,
+    limit: int = 100,
+    usuario: str = Depends(verificar_token)
+):
+    """Lista ordens de compra"""
+    sb = get_supabase()
+    q = sb.table("ordens_compra").select("*").order("criado_em", desc=True).limit(limit)
+    if not todos:
+        q = q.eq("usuario_email", usuario)
+    if status:
+        q = q.eq("status", status)
+    # Excluir arquivadas por padrão
+    q = q.neq("status", "arquivada")
+    res = q.execute()
+    return res.data
+
+
+@app.get("/ordens-compra/{oc_id}/itens")
+async def itens_oc(oc_id: int, usuario: str = Depends(verificar_token)):
+    """Retorna itens de uma OC"""
+    sb = get_supabase()
+    res = sb.table("oc_itens").select("*").eq("oc_id", oc_id).execute()
+    return res.data
+
+
+@app.put("/ordens-compra/{oc_id}")
+async def atualizar_oc(
+    oc_id: int, payload: dict, usuario: str = Depends(verificar_token)
+):
+    """Atualiza status e campos de uma OC"""
+    sb = get_supabase()
+    campos = {}
+    for f in ["titulo","status","frete_estimado","frete_real","obs"]:
+        if f in payload:
+            campos[f] = payload[f]
+    sb.table("ordens_compra").update(campos).eq("id", oc_id).execute()
+    return {"ok": True}
+
+
+@app.put("/oc-itens/{item_id}")
+async def atualizar_item_oc(
+    item_id: int, payload: dict, usuario: str = Depends(verificar_token)
+):
+    """Atualiza campos de um item de OC (preço custo, pagamento, rastreio etc)"""
+    sb = get_supabase()
+    campos = {}
+    for f in ["quantidade_comprar","preco_custo","nome_fornecedor","link_fornecedor",
+              "sku_fornecedor","forma_pagamento","numero_parcelas","data_vencimento",
+              "status_pagamento","status_item","numero_pedido_fornecedor",
+              "prazo_entrega","rastreio","obs"]:
+        if f in payload:
+            campos[f] = payload[f]
+    sb.table("oc_itens").update(campos).eq("id", item_id).execute()
+    return {"ok": True}
+
+
+@app.delete("/oc-itens/{item_id}")
+async def remover_item_oc(item_id: int, usuario: str = Depends(verificar_token)):
+    """Remove item de uma OC"""
+    sb = get_supabase()
+    sb.table("oc_itens").delete().eq("id", item_id).execute()
+    return {"ok": True}
+
+
+@app.get("/ordens-compra/itens-consolidados")
+async def itens_consolidados(
+    todos: bool = False,
+    usuario: str = Depends(verificar_token)
+):
+    """Visão consolidada de itens a comprar agrupados por descrição"""
+    sb = get_supabase()
+
+    # Buscar OCs ativas (não arquivadas, não disponíveis)
+    q = sb.table("ordens_compra").select("id,titulo,usuario_email,usuario_nome")
+    if not todos:
+        q = q.eq("usuario_email", usuario)
+    ocs_ativas = q.in_("status", ["rascunho","confirmada","parcialmente_comprada","comprada"]).execute()
+
+    if not ocs_ativas.data:
+        return []
+
+    oc_ids = [oc["id"] for oc in ocs_ativas.data]
+    oc_map = {oc["id"]: oc for oc in ocs_ativas.data}
+
+    # Buscar itens pendentes dessas OCs
+    itens_res = sb.table("oc_itens").select("*")\
+        .in_("oc_id", oc_ids)\
+        .in_("status_item", ["pendente","comprado"])\
+        .execute()
+
+    # Agrupar por descrição
+    from collections import defaultdict
+    grupos = defaultdict(list)
+    for item in (itens_res.data or []):
+        key = item["descricao"].strip().upper()
+        grupos[key].append({
+            **item,
+            "oc_titulo": oc_map.get(item["oc_id"], {}).get("titulo", ""),
+            "oc_usuario": oc_map.get(item["oc_id"], {}).get("usuario_nome", ""),
+        })
+
+    resultado = []
+    for desc, itens in grupos.items():
+        total_qty = sum(float(i.get("quantidade_comprar") or 0) for i in itens)
+        unidade = itens[0].get("unidade", "UN")
+        resultado.append({
+            "descricao": desc,
+            "unidade": unidade,
+            "total_quantidade": total_qty,
+            "total_ocs": len(itens),
+            "itens": itens,
+        })
+
+    resultado.sort(key=lambda x: x["descricao"])
+    return resultado
+
+
+@app.post("/ordens-compra/arquivar-antigas")
+async def arquivar_antigas(usuario: str = Depends(verificar_token)):
+    """Arquiva OCs com status 'disponivel' há mais de 30 dias"""
+    sb = get_supabase()
+    from datetime import datetime, timedelta
+    limite = (datetime.now() - timedelta(days=30)).isoformat()
+    res = sb.table("ordens_compra")\
+        .update({"status": "arquivada"})\
+        .eq("status", "disponivel")\
+        .lt("atualizado_em", limite)\
+        .execute()
+    return {"arquivadas": len(res.data) if res.data else 0}
