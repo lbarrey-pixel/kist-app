@@ -85,10 +85,15 @@ export default function OrdensCompra({ token, usuario, novaOC, onNovaOCProcessad
   }, [novaOC]);
 
   const norm = (s) => (s || "").toString().toLowerCase();
-  const filtrados = ocs.filter((o) =>
-    !q.trim() ||
-    norm(o.numero_po).includes(norm(q)) || norm(o.id).includes(norm(q)) ||
-    norm(o.titulo).includes(norm(q)) || norm(o.cliente).includes(norm(q)));
+  // busca de PO por proximidade: maiúsculo, O→0, ignora espaços/traços/pontos
+  const normPO = (s) => (s || "").toString().toUpperCase().replace(/O/g, "0").replace(/[^A-Z0-9]/g, "");
+  const filtrados = ocs.filter((o) => {
+    if (!q.trim()) return true;
+    const nq = normPO(q);
+    return (nq && normPO(o.numero_po).includes(nq)) ||
+      norm(o.id).includes(norm(q)) ||
+      norm(o.titulo).includes(norm(q)) || norm(o.cliente).includes(norm(q));
+  });
 
   async function arquivarAntigas() {
     try {

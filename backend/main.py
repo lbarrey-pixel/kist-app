@@ -800,6 +800,141 @@ async def atualizar_origem_item(
 
 # ── ORDENS DE COMPRA ──────────────────────────────────────────────────────────
 
+# ============================================================================
+# Casar PO do cliente com proposta salva (matcher) — reusa leitura .msg/PDF + Claude
+# ============================================================================
+SYSTEM_PO = """Você recebe o texto de uma ORDEM DE COMPRA (PO) enviada por um cliente.
+Extraia em JSON PURO (sem markdown, sem ``` ): 
+{"itens":[{"descricao":"...","quantidade":0,"preco_unitario":0}],"destino":"endereço/cidade-UF de entrega ou ''"}
+quantidade e preco_unitario são números (ponto decimal). Sem preço -> 0. Não invente itens. Só o JSON."""
+
+def _pdf_po_texto(data):
+    try:
+        import pdfplumber, io as _io
+        with pdfplumber.open(_io.BytesIO(data)) as pdf:
+            return "".join((p.extract_text() or "") + "\n" for p in pdf.pages)
+    except Exception:
+        return ""
+
+async def _ler_po(arquivo):
+    nome = (arquivo.filename or "").lower()
+    dados = await arquivo.read()
+    if nome.endswith(".msg"):
+        with open("/tmp/po_upload.msg", "wb") as f:
+            f.write(dados)
+        msg = extract_msg.openMsg("/tmp/po_upload.msg")
+        texto = f"Assunto: {msg.subject}\n\n{(msg.body or '').strip()}"
+        for att in msg.attachments:
+            fn = (att.longFilename or att.shortFilename or "").lower()
+            if att.data and fn.endswith(".pdf"):
+                texto += "\n\n[ANEXO PDF]\n" + _pdf_po_texto(att.data)
+        return texto
+    if nome.endswith(".pdf"):
+        return _pdf_po_texto(dados)
+    try:
+        return dados.decode("utf-8", "ignore")
+    except Exception:
+        return ""
+
+def _digitos(s):
+    return re.sub(r"\D", "", s or "")
+
+def _toks(s):
+    return set(re.findall(r"[a-z0-9]+", (s or "").lower()))
+
+def _casar_propostas(cnpjs_dig, itens_po):
+    """Acha propostas pelo CNPJ do cliente e ranqueia por casamento de itens/preço."""
+    sb = get_supabase()
+    alvo = {c for c in cnpjs_dig if len(c) == 14}
+    if not alvo:
+        return []
+    try:
+        props = (sb.table("propostas")
+                   .select("id,numero_proposta,cliente,cnpj,data_geracao")
+                   .order("data_geracao", desc=True).limit(2000).execute().data) or []
+    except Exception:
+        props = []
+    casadas = [p for p in props if _digitos(p.get("cnpj")) in alvo]
+    if not casadas:
+        return []
+    ids = [p["id"] for p in casadas]
+    try:
+        itens = (sb.table("itens_proposta").select("*")
+                   .in_("proposta_id", ids).limit(3000).execute().data) or []
+    except Exception:
+        itens = []
+    por_prop = {}
+    for it in itens:
+        por_prop.setdefault(it["proposta_id"], []).append(it)
+    po_toks = [(_toks(i.get("descricao")), float(i.get("preco_unitario") or 0)) for i in (itens_po or [])]
+    cands = []
+    for p in casadas:
+        lista = por_prop.get(p["id"], [])
+        score = 0.0
+        for pt, ppreco in po_toks:
+            melhor = 0.0
+            for it in lista:
+                itoks = _toks(it.get("descricao_final") or it.get("descricao_original"))
+                if not pt or not itoks:
+                    continue
+                inter = len(pt & itoks); uni = len(pt | itoks)
+                sim = (inter / uni) if uni else 0.0
+                pv = float(it.get("preco_venda") or 0)
+                if ppreco and pv and abs(pv - ppreco) < 0.01:
+                    sim += 0.5
+                melhor = max(melhor, sim)
+            score += melhor
+        cands.append({"proposta": p, "score": round(score, 2), "itens": lista})
+    cands.sort(key=lambda c: c["score"], reverse=True)
+    return cands[:5]
+
+@app.post("/casar-po")
+async def casar_po(
+    arquivo: UploadFile = File(None),
+    texto: str = Form(None),
+    usuario: str = Depends(verificar_token)
+):
+    """Recebe a PO do cliente (.msg/.pdf/texto), extrai e casa com propostas salvas."""
+    conteudo = ""
+    if arquivo and arquivo.filename:
+        conteudo = await _ler_po(arquivo)
+    elif texto:
+        conteudo = texto
+    if not (conteudo or "").strip():
+        return {"erro": "Não consegui ler o conteúdo. Tente o PDF da PO ou cole o texto."}
+
+    cnpjs = re.findall(r"\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}", conteudo)
+    cnpjs_dig = [_digitos(c) for c in cnpjs if len(_digitos(c)) == 14]
+    pos = re.findall(r"PO[-\s]?\d{5,}", conteudo, re.I)
+    po_num = pos[0].strip() if pos else ""
+
+    itens_po, destino = [], ""
+    try:
+        import json
+        claude = get_claude()
+        r = claude.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=2000,
+            system=SYSTEM_PO,
+            messages=[{"role": "user", "content": conteudo[:8000]}],
+        )
+        t = "".join(b.text for b in r.content if getattr(b, "type", "") == "text").strip()
+        t = t.strip("`")
+        if t.lower().startswith("json"):
+            t = t[4:]
+        data = json.loads(t)
+        itens_po = data.get("itens", []) or []
+        destino = data.get("destino", "") or ""
+    except Exception:
+        pass
+
+    return {
+        "po_numero": po_num,
+        "cnpjs": cnpjs,
+        "destino": destino,
+        "itens_po": itens_po,
+        "candidatas": _casar_propostas(cnpjs_dig, itens_po),
+    }
+
 @app.post("/ordens-compra")
 async def criar_oc(payload: dict, usuario: str = Depends(verificar_token)):
     """Cria uma nova ordem de compra"""

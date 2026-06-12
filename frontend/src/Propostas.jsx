@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, Fragment } from "react";
+import ReceberPO from "./ReceberPO.jsx";
 import {
   brl, btnPrimary, btnGhost, Eyebrow, PageHeader, StateLabel,
   IconSearch, IconArrow, IconCheck, IconX, IconBolt,
@@ -51,6 +52,7 @@ function ApprovalModal({ proposta, itens, onClose, onConfirm }) {
 
 export default function Propostas({ token, usuario, onCriarOC }) {
   const authHeaders = () => ({ Authorization: `Bearer ${token}` });
+  const [mostrarPO, setMostrarPO] = useState(false);
 
   const [lista, setLista] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -113,11 +115,20 @@ export default function Propostas({ token, usuario, onCriarOC }) {
       <PageHeader eyebrow="Histórico" title="Propostas"
         sub="Tudo que sua equipe gerou. Abra uma proposta, selecione itens e aprove para virar OC."
         actions={
-          <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-line2 bg-surface px-3 py-2 text-[12.5px] text-sub">
-            <input type="checkbox" checked={equipeToda} onChange={(e) => setEquipeToda(e.target.checked)} className="accent-kist" />
-            Ver equipe toda
-          </label>
+          <div className="flex items-center gap-2">
+            <button onClick={() => setMostrarPO(true)} className={btnPrimary}>
+              <IconBolt size={15} /> Receber PO
+            </button>
+            <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-line2 bg-surface px-3 py-2 text-[12.5px] text-sub">
+              <input type="checkbox" checked={equipeToda} onChange={(e) => setEquipeToda(e.target.checked)} className="accent-kist" />
+              Ver equipe toda
+            </label>
+          </div>
         } />
+
+      {mostrarPO && (
+        <ReceberPO token={token} usuario={usuario} onCriarOC={onCriarOC} onClose={() => setMostrarPO(false)} />
+      )}
 
       {/* Filtros */}
       <div className="mt-6 flex flex-wrap items-center gap-2">
