@@ -684,6 +684,7 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
         "com_preco":       payload.get("com_preco", 0),
         "sem_preco":       payload.get("sem_preco", 0),
         "valor_total_estimado": valor_total,
+        "frete_recebimento": float(payload.get("frete_recebimento") or 0),
     }).execute()
 
     proposta_id = res.data[0]["id"]
@@ -699,6 +700,8 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
                 "quantidade":        float(i.get("quantidade") or 1),
                 "unidade":           i.get("unidade", "UN"),
                 "preco_venda":       float(i.get("preco_un") or 0),
+                "preco_custo":       float(i.get("preco_custo") or 0),
+                "frete_vinda":       float(i.get("frete_vinda") or 0),
                 "confianca_match":   i.get("confianca_match", ""),
                 "specs_complementares": i.get("specs_complementares", ""),
                 "fornecedor":        i.get("fornecedor", ""),
@@ -801,6 +804,14 @@ async def atualizar_origem_item(
 async def criar_oc(payload: dict, usuario: str = Depends(verificar_token)):
     """Cria uma nova ordem de compra"""
     sb = get_supabase()
+    # imposto padrão (config que o operador pode sobrescrever depois)
+    imposto_def = 12.0
+    try:
+        c = sb.table("config_kist").select("valor").eq("chave", "imposto_percent_default").limit(1).execute()
+        if c.data:
+            imposto_def = float(c.data[0]["valor"])
+    except Exception:
+        pass
     res = sb.table("ordens_compra").insert({
         "titulo":        payload.get("titulo", ""),
         "numero_po":     (payload.get("numero_po") or None),   # PO do cliente (pode ser nula/pendente)
@@ -808,6 +819,7 @@ async def criar_oc(payload: dict, usuario: str = Depends(verificar_token)):
         "usuario_nome":  payload.get("usuario_nome", ""),
         "status":        "rascunho",
         "obs":           payload.get("obs", ""),
+        "imposto_percent": imposto_def,
     }).execute()
     oc_id = res.data[0]["id"]
 
@@ -824,6 +836,8 @@ async def criar_oc(payload: dict, usuario: str = Depends(verificar_token)):
                 "quantidade_comprar":  float(i.get("quantidade_comprar") or i.get("quantidade_proposta") or 1),
                 "unidade":             i.get("unidade", "UN"),
                 "preco_venda":         float(i.get("preco_venda") or 0),
+                "preco_custo":         float(i.get("preco_custo") or 0),
+                "frete_vinda":         float(i.get("frete_vinda") or 0),
                 # origem do preço herdada da proposta (aceita as duas nomenclaturas):
                 "nome_fornecedor":     i.get("nome_fornecedor") or i.get("fornecedor", ""),
                 "link_fornecedor":     i.get("link_fornecedor", ""),
@@ -853,23 +867,42 @@ async def listar_ocs(
     res = q.execute()
     ocs = res.data or []
 
-    # Totais por OC (venda e custo) para os cards do quadro
+    # Totais por OC (venda, custo, fretes, imposto, lucros) para os cards e dashboard
     if ocs:
         ids = [o["id"] for o in ocs]
         itens = sb.table("oc_itens").select(
-            "oc_id,preco_venda,preco_custo,quantidade_comprar,quantidade_proposta"
+            "oc_id,preco_venda,preco_custo,frete_vinda,quantidade_comprar,quantidade_proposta"
         ).in_("oc_id", ids).execute().data or []
         tot = {}
         for r in itens:
             qd = r.get("quantidade_comprar")
             if qd is None:
                 qd = r.get("quantidade_proposta") or 0
-            t = tot.setdefault(r["oc_id"], {"valor_venda": 0.0, "valor_custo": 0.0})
+            t = tot.setdefault(r["oc_id"], {"valor_venda": 0.0, "valor_custo": 0.0, "soma_frete_vinda_itens": 0.0})
             t["valor_venda"] += float(r.get("preco_venda") or 0) * float(qd or 0)
             t["valor_custo"] += float(r.get("preco_custo") or 0) * float(qd or 0)
+            t["soma_frete_vinda_itens"] += float(r.get("frete_vinda") or 0)
         for o in ocs:
-            o.update(tot.get(o["id"], {"valor_venda": 0.0, "valor_custo": 0.0}))
-            o["valor_lucro"] = o["valor_venda"] - o["valor_custo"]   # lucro bruto (R$)
+            base = tot.get(o["id"], {"valor_venda": 0.0, "valor_custo": 0.0, "soma_frete_vinda_itens": 0.0})
+            o.update({"valor_venda": base["valor_venda"], "valor_custo": base["valor_custo"]})
+            # frete de vinda efetivo: soma dos itens se houver, senão o global
+            soma_itens = base["soma_frete_vinda_itens"]
+            frete_vinda = soma_itens if soma_itens > 0 else float(o.get("frete_vinda_global") or 0)
+            frete_ida = float(o.get("frete_ida") or 0)
+            cobrado = bool(o.get("frete_ida_cobrado"))
+            imposto_pct = float(o.get("imposto_percent") if o.get("imposto_percent") is not None else 12)
+            custo_total = base["valor_custo"] + frete_vinda + frete_ida
+            nota = base["valor_venda"] + (frete_ida if cobrado else 0.0)
+            lucro_bruto = nota - custo_total
+            imposto = nota * imposto_pct / 100.0
+            lucro_liquido = lucro_bruto - imposto
+            o["frete_vinda_efetivo"] = frete_vinda
+            o["custo_total"] = custo_total
+            o["nota"] = nota
+            o["imposto_valor"] = imposto
+            o["valor_lucro"] = lucro_bruto          # lucro bruto (R$) — compat
+            o["lucro_bruto"] = lucro_bruto
+            o["lucro_liquido"] = lucro_liquido
     return ocs
 
 
@@ -888,10 +921,20 @@ async def atualizar_oc(
     """Atualiza status e campos de uma OC"""
     sb = get_supabase()
     campos = {}
-    for f in ["titulo","numero_po","status","frete_estimado","frete_real","obs"]:
+    for f in ["titulo","numero_po","status","frete_estimado","frete_real","obs",
+              "frete_vinda_global","frete_ida","frete_ida_cobrado","imposto_percent"]:
         if f in payload:
             campos[f] = payload[f]
     sb.table("ordens_compra").update(campos).eq("id", oc_id).execute()
+    # o imposto que o operador definir vira o novo padrão (sobrescreve)
+    if "imposto_percent" in payload and payload["imposto_percent"] is not None:
+        try:
+            sb.table("config_kist").upsert(
+                {"chave": "imposto_percent_default", "valor": str(float(payload["imposto_percent"]))},
+                on_conflict="chave"
+            ).execute()
+        except Exception:
+            pass
     return {"ok": True}
 
 
@@ -912,7 +955,7 @@ async def atualizar_item_oc(
     """Atualiza campos de um item de OC (preço custo, pagamento, rastreio etc)"""
     sb = get_supabase()
     campos = {}
-    for f in ["quantidade_comprar","preco_custo","nome_fornecedor","link_fornecedor",
+    for f in ["quantidade_comprar","preco_custo","frete_vinda","nome_fornecedor","link_fornecedor",
               "sku_fornecedor","forma_pagamento","numero_parcelas","data_vencimento",
               "final_cartao","status_pagamento","status_item","numero_pedido_fornecedor",
               "prazo_entrega","rastreio","obs"]:
