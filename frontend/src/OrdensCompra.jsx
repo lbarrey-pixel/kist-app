@@ -62,6 +62,9 @@ export default function OrdensCompra({ token, usuario, novaOC, onNovaOCProcessad
       numero_po: po,
       usuario_nome: usuario?.nome,
       status: "rascunho",
+      cnpj: proposta.cnpj || null,
+      cliente: proposta.cliente || null,
+      uf: proposta.uf || null,
       itens: (itens || []).map((i) => ({
         item_proposta_id: i.id,
         descricao: i.descricao_final || i.descricao_original,
@@ -238,7 +241,12 @@ function OCCard({ oc, onClick }) {
           <span className="font-mono text-[11px] text-faint">{oc.id}</span>
         </div>
       </div>
-      <div className="mt-2 text-[13px] font-medium leading-snug text-ink">{oc.titulo}</div>
+      <div className="mt-2 leading-snug">
+        <div className="text-[13px] font-medium text-ink">{oc.cliente || oc.titulo}</div>
+        {(oc.uf || oc.cnpj) && (
+          <div className="mt-0.5 font-mono text-[10.5px] text-faint">{oc.uf ? `${oc.uf} · ` : ""}{oc.cnpj || ""}</div>
+        )}
+      </div>
       <div className="mt-3 flex items-end justify-between">
         <div>
           <div className="font-mono text-[14px] font-semibold text-ink">R$ {brl(venda)}</div>
@@ -520,7 +528,10 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
   const [itens, setItens] = useState([]);
   const [loading, setLoading] = useState(true);
   const [po, setPo] = useState(oc.numero_po || null);
-  const [poInput, setPoInput] = useState("");
+  const [poInput, setPoInput] = useState(oc.numero_po || "");
+  const [cliente, setCliente] = useState(oc.cliente || "");
+  const [uf, setUf] = useState(oc.uf || "");
+  const [cnpj, setCnpj] = useState(oc.cnpj || "");
   const [status, setStatus] = useState(oc.status || "rascunho");
   const [freteVindaGlobal, setFreteVindaGlobal] = useState(oc.frete_vinda_global ?? 0);
   const [freteIda, setFreteIda] = useState(oc.frete_ida ?? 0);
@@ -581,9 +592,9 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
       onChanged && onChanged();
     } catch (e) {}
   }
-  function vincularPO() {
-    const v = poInput.trim(); if (!v) return;
-    setPo(v); salvarOC({ numero_po: v });
+  function salvarPO() {
+    const v = poInput.trim();
+    setPo(v || null); salvarOC({ numero_po: v || null });
   }
   function mudarStatus(novo) {
     setStatus(novo); salvarOC({ status: novo });
@@ -692,32 +703,47 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
         {/* Cabeçalho — PO em destaque */}
         <div className="border-b border-line px-5 py-4">
           <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0">
+            <div className="min-w-0 flex-1">
               <div className="flex items-center gap-1.5">
                 <PoChip po={po} size="lg" />
                 {po && <CopyPo po={po} />}
               </div>
-              <h3 className="mt-2 text-[16px] font-semibold tracking-tight text-ink">{oc.titulo}</h3>
+              {/* Razão social / cliente — editável */}
+              <input value={cliente} onChange={(e) => setCliente(e.target.value)}
+                onBlur={() => cliente !== (oc.cliente || "") && salvarOC({ cliente: cliente.trim() || null })}
+                placeholder="Razão social / cliente"
+                className="mt-2 w-full rounded px-0.5 bg-transparent text-[16px] font-semibold tracking-tight text-ink outline-none placeholder:font-normal placeholder:text-faint/60 focus:bg-paper" />
+              {/* UF + CNPJ — editáveis */}
+              <div className="mt-1.5 flex items-center gap-2">
+                <input value={uf} onChange={(e) => setUf(e.target.value.toUpperCase().replace(/[^A-Z]/g, "").slice(0, 2))}
+                  onBlur={() => uf !== (oc.uf || "") && salvarOC({ uf: uf.trim().toUpperCase() || null })}
+                  placeholder="UF" maxLength={2}
+                  className="w-11 rounded-md border border-line2 bg-paper px-1.5 py-0.5 text-center font-mono text-[11px] text-ink outline-none focus:ring-1 focus:ring-kist placeholder:text-faint/60" />
+                <input value={cnpj} onChange={(e) => setCnpj(e.target.value)}
+                  onBlur={() => cnpj !== (oc.cnpj || "") && salvarOC({ cnpj: cnpj.trim() || null })}
+                  placeholder="CNPJ"
+                  className="flex-1 rounded-md border border-line2 bg-paper px-2 py-0.5 font-mono text-[11px] text-ink outline-none focus:ring-1 focus:ring-kist placeholder:text-faint/60" />
+              </div>
               <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11.5px] text-faint">
                 <span className="font-mono text-sub">{oc.id}</span>
-                {oc.cliente && <><span>·</span><span>{oc.cliente}</span></>}
                 <span>·</span>
                 <select value={status} onChange={(e) => mudarStatus(e.target.value)}
                   className="rounded-md border border-line2 bg-paper px-1.5 py-0.5 text-[11px] font-medium text-ink outline-none focus:ring-1 focus:ring-kist">
                   {STATUS_OPCOES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
                 </select>
+                {oc.titulo && <span className="truncate text-faint/70" title={oc.titulo}>· {oc.titulo.replace(/^null\s*—\s*/, "")}</span>}
               </div>
             </div>
             <button onClick={onClose} className="flex-shrink-0 rounded-md p-1 text-faint hover:bg-paper hover:text-ink"><IconX size={18} /></button>
           </div>
-          {!po && (
-            <div className="mt-3 flex items-center gap-2 rounded-lg border border-amber/30 bg-amberbg px-2.5 py-2">
-              <input value={poInput} onChange={(e) => setPoInput(e.target.value)}
-                placeholder="Informar nº da PO do cliente"
-                className="flex-1 bg-transparent font-mono text-[12.5px] text-ink outline-none placeholder:text-amber/70" />
-              <button onClick={vincularPO} className="flex-shrink-0 rounded-md bg-amber px-2.5 py-1 text-[11.5px] font-medium text-white">Vincular PO</button>
-            </div>
-          )}
+          {/* Nº da PO do cliente — sempre editável (auto na criação, ajustável na mão) */}
+          <div className="mt-3 flex items-center gap-2 rounded-lg border border-line2 bg-paper px-2.5 py-2">
+            <span className="text-[10px] font-semibold uppercase eyebrow text-faint">PO</span>
+            <input value={poInput} onChange={(e) => setPoInput(e.target.value)} onBlur={salvarPO}
+              placeholder="nº da PO do cliente"
+              className="flex-1 bg-transparent font-mono text-[12.5px] text-ink outline-none placeholder:text-faint/60" />
+            <button onClick={salvarPO} className="flex-shrink-0 rounded-md bg-kist px-2.5 py-1 text-[11.5px] font-medium text-white">Salvar</button>
+          </div>
         </div>
 
         {/* Totais — venda, custo total, lucro bruto */}

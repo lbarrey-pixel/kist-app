@@ -45,14 +45,23 @@ export default function ReceberPO({ token, usuario, onCriarOC, onClose }) {
     sku_fornecedor: i.sku_fornecedor || null,
   }));
 
+  // UF de destino = última sigla de estado que aparecer no texto do destino
+  function ufFromDestino(d) {
+    const m = (d || "").toUpperCase().match(/\b(AC|AL|AP|AM|BA|CE|DF|ES|GO|MA|MT|MS|MG|PA|PB|PR|PE|PI|RJ|RN|RS|RO|RR|SC|SP|SE|TO)\b/g);
+    return m ? m[m.length - 1] : "";
+  }
+
   function gerarDaProposta(c) {
     // OC = itens da PO + dados de compra emprestados desta proposta
-    onCriarOC(c.proposta, ocItensDe(c.itens_oc), res.po_numero || "");
+    const prop = { ...c.proposta, cnpj: c.proposta?.cnpj || res.cnpj_cliente || "", uf: ufFromDestino(res.destino) };
+    onCriarOC(prop, ocItensDe(c.itens_oc), res.po_numero || "");
     onClose();
   }
 
   function gerarDaPO() {
-    const proposta = { cliente: (res.cnpjs && res.cnpjs[0]) ? `Cliente ${res.cnpjs[0]}` : "Cliente (PO)", numero_proposta: "" };
+    const cnpjCli = res.cnpj_cliente || "";
+    const proposta = { cliente: cnpjCli ? `Cliente ${cnpjCli}` : "Cliente (PO)", numero_proposta: "",
+                       cnpj: cnpjCli, uf: ufFromDestino(res.destino) };
     onCriarOC(proposta, ocItensDe(res.itens_po), res.po_numero || "");
     onClose();
   }

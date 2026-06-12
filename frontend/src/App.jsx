@@ -656,9 +656,8 @@ export default function App() {
                   const prodCusto = resultado.itens.reduce((s, i) => s + (i.preco_custo || 0) * (parseFloat(i.quantidade) || 0), 0);
                   const custoFreteItens = resultado.itens.reduce((s, i) => s + num(i.frete_vinda), 0); // frete único por item, SEM ×qtd
                   const freteCobr = num(resultado.frete);
-                  const freteReceb = num(resultado.frete_recebimento);
                   const base = prodVenda + freteCobr;
-                  const lucro = base - prodCusto - freteReceb - custoFreteItens;
+                  const lucro = base - prodCusto - custoFreteItens;
                   const margem = base > 0 ? (lucro / base) * 100 : 0;
                   const temCusto = prodCusto > 0 || custoFreteItens > 0;
                   return (
@@ -667,28 +666,18 @@ export default function App() {
                         <div className="eyebrow text-[10px] font-bold uppercase text-faint">Custo & lucro · uso interno</div>
                         <span className="rounded-md bg-paper px-2 py-0.5 text-[10px] font-medium text-faint">não exportado pro Tiny</span>
                       </div>
-                      <div className="mt-3 grid grid-cols-1 gap-4 md:grid-cols-2">
-                        <label className="block">
-                          <div className="text-[11.5px] text-sub">Frete de recebimento (R$)</div>
-                          <input inputMode="decimal" value={resultado.frete_recebimento ?? ""}
-                            onChange={(e) => setResultado((p) => ({ ...p, frete_recebimento: e.target.value }))}
-                            placeholder="0,00"
-                            className="mt-1 w-full rounded-lg border border-line2 bg-paper px-2.5 py-1.5 font-mono text-[13px] text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
-                          <div className="mt-1 text-[10.5px] text-faint">Custo do frete pra receber a mercadoria. O custo unitário de cada item fica em “origem do preço”.</div>
-                        </label>
-                        <div className="rounded-lg bg-paper p-3 text-[12px]">
-                          <div className="flex justify-between text-sub"><span>Venda (produtos)</span><span className="font-mono">R$ {brl(prodVenda)}</span></div>
-                          {freteCobr > 0 && <div className="flex justify-between text-sub"><span>+ Frete cobrado</span><span className="font-mono">R$ {brl(freteCobr)}</span></div>}
-                          <div className="flex justify-between text-sub"><span>− Custo (produtos)</span><span className="font-mono">R$ {brl(prodCusto)}</span></div>
-                          {custoFreteItens > 0 && <div className="flex justify-between text-sub"><span>− Frete itens (custo)</span><span className="font-mono">R$ {brl(custoFreteItens)}</span></div>}
-                          {freteReceb > 0 && <div className="flex justify-between text-sub"><span>− Frete recebimento</span><span className="font-mono">R$ {brl(freteReceb)}</span></div>}
-                          <div className="mt-1.5 flex items-baseline justify-between border-t border-line pt-1.5">
-                            <span className="font-medium text-ink">Previsão de lucro</span>
-                            <span className={`font-mono text-[16px] font-semibold ${lucro >= 0 ? "text-signal" : "text-rose"}`}>R$ {brl(lucro)}</span>
-                          </div>
-                          <div className="text-right text-[10.5px] text-faint">{temCusto ? `${margem.toFixed(0)}% margem` : "informe os custos dos itens"}</div>
+                      <div className="mt-3 rounded-lg bg-paper p-3 text-[12px]">
+                        <div className="flex justify-between text-sub"><span>Venda (produtos)</span><span className="font-mono">R$ {brl(prodVenda)}</span></div>
+                        {freteCobr > 0 && <div className="flex justify-between text-sub"><span>+ Frete cobrado</span><span className="font-mono">R$ {brl(freteCobr)}</span></div>}
+                        <div className="flex justify-between text-sub"><span>− Custo (produtos)</span><span className="font-mono">R$ {brl(prodCusto)}</span></div>
+                        {custoFreteItens > 0 && <div className="flex justify-between text-sub"><span>− Frete (custo)</span><span className="font-mono">R$ {brl(custoFreteItens)}</span></div>}
+                        <div className="mt-1.5 flex items-baseline justify-between border-t border-line pt-1.5">
+                          <span className="font-medium text-ink">Previsão de lucro</span>
+                          <span className={`font-mono text-[16px] font-semibold ${lucro >= 0 ? "text-signal" : "text-rose"}`}>R$ {brl(lucro)}</span>
                         </div>
+                        <div className="text-right text-[10.5px] text-faint">{temCusto ? `${margem.toFixed(0)}% margem` : "informe os custos dos itens"}</div>
                       </div>
+                      <div className="mt-2 text-[10.5px] text-faint">O frete de custo de cada item entra no campo “Frete (item)”, junto da origem do preço.</div>
                     </div>
                   );
                 })()}

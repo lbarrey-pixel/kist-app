@@ -1055,9 +1055,14 @@ async def casar_po(
     for c in candidatas:
         c["itens_oc"] = _montar_itens_oc(itens_po, c.get("itens"))
 
+    # CNPJ do CLIENTE = o que NÃO é a própria Kist (fornecedor na PO)
+    KIST_CNPJ = "10573732000396"
+    cnpj_cliente = next((c for c in cnpjs_dig if len(c) == 14 and c != KIST_CNPJ), "")
+
     return {
         "po_numero": po_num,
         "cnpjs": cnpjs,
+        "cnpj_cliente": cnpj_cliente,
         "destino": destino,
         "itens_po": _enriquecer_itens_po(itens_po),   # itens da PO já enriquecidos pelo histórico
         "candidatas": candidatas,
@@ -1075,6 +1080,21 @@ async def criar_oc(payload: dict, usuario: str = Depends(verificar_token)):
             imposto_def = float(c.data[0]["valor"])
     except Exception:
         pass
+    # identidade do cliente: CNPJ + razão social + UF (puxa da Receita se houver CNPJ)
+    cnpj_in = re.sub(r"\D", "", payload.get("cnpj") or "")
+    cnpj_oc = payload.get("cnpj") or None
+    cliente_oc = payload.get("cliente") or None
+    uf_oc = payload.get("uf") or None
+    if _cnpj_valido(cnpj_in):
+        cnpj_oc = _cnpj_formatado(cnpj_in)
+        try:
+            rec = _consulta_receita(cnpj_in)
+            if rec.get("razao_social"):
+                cliente_oc = rec["razao_social"]
+            if not uf_oc and rec.get("uf"):
+                uf_oc = rec["uf"]
+        except Exception:
+            pass
     res = sb.table("ordens_compra").insert({
         "titulo":        payload.get("titulo", ""),
         "numero_po":     (payload.get("numero_po") or None),   # PO do cliente (pode ser nula/pendente)
@@ -1083,6 +1103,9 @@ async def criar_oc(payload: dict, usuario: str = Depends(verificar_token)):
         "status":        "rascunho",
         "obs":           payload.get("obs", ""),
         "imposto_percent": imposto_def,
+        "cnpj":          cnpj_oc,
+        "cliente":       cliente_oc,
+        "uf":            uf_oc,
     }).execute()
     oc_id = res.data[0]["id"]
 
@@ -1185,9 +1208,17 @@ async def atualizar_oc(
     sb = get_supabase()
     campos = {}
     for f in ["titulo","numero_po","status","frete_estimado","frete_real","obs",
-              "frete_vinda_global","frete_ida","frete_ida_cobrado","imposto_percent"]:
+              "frete_vinda_global","frete_ida","frete_ida_cobrado","imposto_percent",
+              "cnpj","cliente","uf"]:
         if f in payload:
             campos[f] = payload[f]
+    # CNPJ editado na mão: grava formatado se for válido (senão, o que veio)
+    if "cnpj" in campos and campos["cnpj"]:
+        dig = re.sub(r"\D", "", campos["cnpj"])
+        if _cnpj_valido(dig):
+            campos["cnpj"] = _cnpj_formatado(dig)
+    if "uf" in campos and campos["uf"]:
+        campos["uf"] = str(campos["uf"]).strip().upper()[:2]
     sb.table("ordens_compra").update(campos).eq("id", oc_id).execute()
     # o imposto que o operador definir vira o novo padrão (sobrescreve)
     if "imposto_percent" in payload and payload["imposto_percent"] is not None:
