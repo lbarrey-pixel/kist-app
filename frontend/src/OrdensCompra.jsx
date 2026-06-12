@@ -213,9 +213,11 @@ function Kanban({ ocs, onSelect, onMove }) {
 
 function OCCard({ oc, onClick }) {
   const venda = oc.valor_venda ?? oc.total_venda ?? 0;
-  const custo = oc.valor_custo ?? oc.total_custo ?? 0;
-  const margem = venda > 0 ? ((venda - custo) / venda) * 100 : 0;
-  const lucro = venda - custo;
+  const custoProd = oc.valor_custo ?? oc.total_custo ?? 0;
+  const lucro = oc.lucro_bruto ?? oc.valor_lucro ?? (venda - custoProd);
+  const liquido = oc.lucro_liquido;
+  const base = oc.nota ?? venda;
+  const margem = base > 0 ? (lucro / base) * 100 : 0;
   const tint = laneDe(oc.status).tint;
   return (
     <div role="button" tabIndex={0} draggable
@@ -234,16 +236,17 @@ function OCCard({ oc, onClick }) {
       <div className="mt-3 flex items-end justify-between">
         <div>
           <div className="font-mono text-[14px] font-semibold text-ink">R$ {brl(venda)}</div>
-          {custo > 0 ? (
+          {custoProd > 0 ? (
             <div className="mt-0.5 text-[11px]">
-              <span className="text-faint">venda · lucro bruto </span>
+              <span className="text-faint">bruto </span>
               <span className={`font-mono font-medium ${lucro >= 0 ? "text-signal" : "text-rose"}`}>R$ {brl(lucro)}</span>
+              {liquido != null && <span className="text-faint"> · líq <span className={`font-mono ${liquido >= 0 ? "text-signal" : "text-rose"}`}>R$ {brl(liquido)}</span></span>}
             </div>
           ) : (
             <div className="mt-0.5 text-[11px] text-faint">{STATUS_LABEL[oc.status] || oc.status} · custo pendente</div>
           )}
         </div>
-        {custo > 0 && (
+        {custoProd > 0 && (
           <div className="rounded-md px-1.5 py-0.5 text-[11px] font-semibold" style={{ background: `${tint}14`, color: tint }}>
             {margem.toFixed(0)}% margem
           </div>
@@ -513,7 +516,10 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
   const [po, setPo] = useState(oc.numero_po || null);
   const [poInput, setPoInput] = useState("");
   const [status, setStatus] = useState(oc.status || "rascunho");
-  const [frete, setFrete] = useState(oc.frete_real ?? oc.frete_estimado ?? 0);
+  const [freteVindaGlobal, setFreteVindaGlobal] = useState(oc.frete_vinda_global ?? 0);
+  const [freteIda, setFreteIda] = useState(oc.frete_ida ?? 0);
+  const [idaCobrado, setIdaCobrado] = useState(!!oc.frete_ida_cobrado);
+  const [imposto, setImposto] = useState(oc.imposto_percent ?? 12);
   const [confirmDel, setConfirmDel] = useState(false);
   const [cartoes, setCartoes] = useState({});   // { "1234": diaVencimento }
 
@@ -550,8 +556,18 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
 
   const totVenda = itens.reduce((s, i) => s + (i.preco_venda || 0) * (i.quantidade_comprar ?? i.quantidade_proposta ?? 0), 0);
   const totCusto = itens.reduce((s, i) => s + (i.preco_custo || 0) * (i.quantidade_comprar ?? i.quantidade_proposta ?? 0), 0);
-  const totLucro = totVenda - totCusto;
-  const margem = totVenda > 0 ? ((totVenda - totCusto) / totVenda) * 100 : 0;
+
+  // Modelo de fretes + imposto (v3.8)
+  const somaVindaItens = itens.reduce((s, i) => s + (parseFloat(i.frete_vinda) || 0), 0);
+  const freteVindaEfetivo = somaVindaItens > 0 ? somaVindaItens : (parseFloat(freteVindaGlobal) || 0);
+  const freteIdaNum = parseFloat(freteIda) || 0;
+  const impostoPct = parseFloat(imposto) || 0;
+  const custoTotal = totCusto + freteVindaEfetivo + freteIdaNum;
+  const nota = totVenda + (idaCobrado ? freteIdaNum : 0);
+  const totLucro = nota - custoTotal;                 // lucro bruto
+  const impostoValor = nota * impostoPct / 100;
+  const lucroLiquido = totLucro - impostoValor;
+  const margem = nota > 0 ? (totLucro / nota) * 100 : 0;
 
   async function salvarOC(campos) {
     try {
@@ -655,6 +671,14 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
     setTimeout(() => win.print(), 350);
   }
 
+  function abrirTodosLinks() {
+    const links = [...new Set(itens.map((it) => it.link_fornecedor).filter((l) => l && /^https?:\/\//i.test(l)))];
+    if (!links.length) { alert("Nenhum link de compra (URL) cadastrado nos itens."); return; }
+    let bloqueado = false;
+    links.forEach((l) => { const w = window.open(l, "_blank", "noopener"); if (!w) bloqueado = true; });
+    if (bloqueado) alert("Seu navegador bloqueou algumas abas. Permita pop-ups deste site para abrir todos os links de uma vez.");
+  }
+
   return createPortal(
     <div className="fixed inset-0 z-50 flex justify-end">
       <div className="absolute inset-0 bg-ink/30" onClick={onClose} />
@@ -690,15 +714,16 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
           )}
         </div>
 
-        {/* Totais — venda, custo, lucro bruto (R$) e margem */}
+        {/* Totais — venda, custo total, lucro bruto */}
         <div className="grid grid-cols-3 gap-px border-b border-line bg-line">
           <div className="bg-surface px-4 py-3">
             <div className="text-[10.5px] uppercase eyebrow text-faint">Venda</div>
             <div className="mt-0.5 font-mono text-[14px] font-semibold text-ink">R$ {brl(totVenda)}</div>
           </div>
           <div className="bg-surface px-4 py-3">
-            <div className="text-[10.5px] uppercase eyebrow text-faint">Custo</div>
-            <div className="mt-0.5 font-mono text-[14px] font-semibold text-sub">R$ {brl(totCusto)}</div>
+            <div className="text-[10.5px] uppercase eyebrow text-faint">Custo total</div>
+            <div className="mt-0.5 font-mono text-[14px] font-semibold text-sub">R$ {brl(custoTotal)}</div>
+            <div className="mt-0.5 font-mono text-[10px] text-faint">+ fretes</div>
           </div>
           <div className="bg-surface px-4 py-3">
             <div className="text-[10.5px] uppercase eyebrow text-faint">Lucro bruto</div>
@@ -709,17 +734,59 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
           </div>
         </div>
 
+        {/* Fretes & imposto */}
+        <div className="border-b border-line bg-paper/50 px-4 py-3">
+          <div className="flex flex-wrap items-end gap-x-4 gap-y-2">
+            <label className="block">
+              <div className="text-[10px] uppercase eyebrow text-faint">Frete vinda (R$)</div>
+              <input type="number" step="0.01"
+                value={somaVindaItens > 0 ? somaVindaItens.toFixed(2) : freteVindaGlobal}
+                disabled={somaVindaItens > 0}
+                onChange={(e) => setFreteVindaGlobal(parseFloat(e.target.value) || 0)}
+                onBlur={() => somaVindaItens === 0 && salvarOC({ frete_vinda_global: parseFloat(freteVindaGlobal) || 0 })}
+                className={`mt-0.5 w-24 rounded border border-line2 px-1.5 py-1 text-right font-mono text-[12px] outline-none focus:ring-1 focus:ring-kist ${somaVindaItens > 0 ? "bg-line text-faint" : "bg-surface text-ink"}`} />
+            </label>
+            <label className="block">
+              <div className="text-[10px] uppercase eyebrow text-faint">Frete ida (R$)</div>
+              <input type="number" step="0.01" value={freteIda}
+                onChange={(e) => setFreteIda(e.target.value)}
+                onBlur={() => salvarOC({ frete_ida: parseFloat(freteIda) || 0 })}
+                className="mt-0.5 w-24 rounded border border-line2 bg-surface px-1.5 py-1 text-right font-mono text-[12px] text-ink outline-none focus:ring-1 focus:ring-kist" />
+            </label>
+            <label className="flex cursor-pointer items-center gap-1.5 pb-1 text-[11.5px] text-sub">
+              <input type="checkbox" checked={idaCobrado}
+                onChange={(e) => { setIdaCobrado(e.target.checked); salvarOC({ frete_ida_cobrado: e.target.checked }); }}
+                className="accent-kist" />
+              ida cobrada do cliente
+            </label>
+            <label className="block">
+              <div className="text-[10px] uppercase eyebrow text-faint">Imposto %</div>
+              <input type="number" step="0.1" value={imposto}
+                onChange={(e) => setImposto(e.target.value)}
+                onBlur={() => salvarOC({ imposto_percent: parseFloat(imposto) || 0 })}
+                className="mt-0.5 w-16 rounded border border-line2 bg-surface px-1.5 py-1 text-right font-mono text-[12px] text-ink outline-none focus:ring-1 focus:ring-kist" />
+            </label>
+          </div>
+          {somaVindaItens > 0 && (
+            <div className="mt-1.5 text-[10px] text-faint">Frete de vinda somado dos itens. Zere os itens para lançar um valor global.</div>
+          )}
+          {/* Nota · imposto · lucro líquido */}
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-surface px-3 py-2">
+            <div className="flex gap-4 text-[11.5px] text-sub">
+              <span>Nota <span className="font-mono text-ink">R$ {brl(nota)}</span></span>
+              <span>Imposto <span className="font-mono text-rose">− R$ {brl(impostoValor)}</span></span>
+            </div>
+            <div className="flex items-baseline gap-2">
+              <span className="text-[11px] uppercase eyebrow text-faint">Lucro líquido</span>
+              <span className={`font-mono text-[16px] font-semibold ${lucroLiquido >= 0 ? "text-signal" : "text-rose"}`}>R$ {brl(lucroLiquido)}</span>
+            </div>
+          </div>
+        </div>
+
         {/* Itens */}
         <div className="flex-1 overflow-auto px-5 py-4">
           <div className="mb-2 flex items-center justify-between">
             <Eyebrow>Itens · custo & origem</Eyebrow>
-            <label className="flex items-center gap-1.5 text-[11px] text-faint">
-              frete R$
-              <input type="number" value={frete}
-                onChange={(e) => setFrete(parseFloat(e.target.value) || 0)}
-                onBlur={() => salvarOC({ frete_real: frete })}
-                className="w-16 rounded border border-line2 bg-paper px-1.5 py-0.5 text-right font-mono text-[11px] text-ink outline-none" />
-            </label>
           </div>
 
           {loading ? (
@@ -763,6 +830,17 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
                         <div className="text-faint">Venda un.</div>
                         <div className="font-mono text-ink">R$ {brl(it.preco_venda)}</div>
                       </div>
+                    </div>
+
+                    {/* Frete de vinda deste item (opcional) — soma no frete da OC */}
+                    <div className="mt-2 flex items-center gap-1.5 text-[11px]">
+                      <span className="text-faint">Frete vinda (item)</span>
+                      <span className="text-faint">R$</span>
+                      <input type="number" step="0.01" defaultValue={it.frete_vinda || ""}
+                        onBlur={(e) => salvarItem(it.id, { frete_vinda: parseFloat(e.target.value) || 0 })}
+                        placeholder="—"
+                        className="w-16 rounded bg-paper px-1 py-0.5 text-right font-mono text-ink outline-none focus:bg-white focus:ring-1 focus:ring-kist" />
+                      <span className="text-faint/70">soma no frete de vinda da OC</span>
                     </div>
 
                     {/* Lucro bruto do item — unitário e total (venda − custo) */}
@@ -863,6 +941,10 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
             <button onClick={() => setConfirmDel(true)} title="Excluir OC"
               className="inline-flex items-center justify-center rounded-lg border border-line2 px-2.5 py-2 text-faint transition-colors hover:border-rose/40 hover:bg-rosebg hover:text-rose">
               <IconTrash size={15} />
+            </button>
+            <button onClick={abrirTodosLinks} title="Abrir todos os links de compra"
+              className="inline-flex items-center justify-center rounded-lg border border-line2 px-2.5 py-2 text-faint transition-colors hover:border-kist/40 hover:bg-kist/5 hover:text-kist">
+              <IconLink size={15} />
             </button>
             <button onClick={imprimirOC} className={`${btnGhost} flex-1 justify-center`}><IconDownload size={14} /> Exportar / PDF</button>
             <button onClick={() => mudarStatus("confirmada")} className={`${btnPrimary} flex-1 justify-center`}>
