@@ -808,6 +808,11 @@ Extraia em JSON PURO (sem markdown, sem ``` ):
 {"itens":[{"descricao":"...","quantidade":0,"preco_unitario":0}],"destino":"endereço/cidade-UF de entrega ou ''"}
 quantidade e preco_unitario são números (ponto decimal). Sem preço -> 0. Não invente itens. Só o JSON."""
 
+SYSTEM_PROP_TINY = """Você recebe o texto de uma PROPOSTA COMERCIAL / orçamento (sistema Tiny).
+Extraia em JSON PURO (sem markdown, sem ``` ):
+{"cliente":"...","cnpj":"...","numero_proposta":"...","itens":[{"descricao":"...","quantidade":0,"preco_venda":0}]}
+Números com ponto decimal. Sem dado -> "" ou 0. Não invente itens. Só o JSON."""
+
 def _pdf_po_texto(data):
     try:
         import pdfplumber, io as _io
@@ -842,31 +847,32 @@ def _digitos(s):
 def _toks(s):
     return set(re.findall(r"[a-z0-9]+", (s or "").lower()))
 
-def _casar_propostas(cnpjs_dig, itens_po):
-    """Acha propostas pelo CNPJ do cliente e ranqueia por casamento de itens/preço."""
+def _casar_propostas(cnpjs_dig, itens_match):
+    """Casa propostas: CNPJ COMPLETO é o principal; a RAIZ (8 díg.) é filtro extra de confiança."""
     sb = get_supabase()
-    alvo = {c for c in cnpjs_dig if len(c) == 14}
-    if not alvo:
+    full = {c for c in cnpjs_dig if len(c) == 14}
+    roots = {c[:8] for c in full}
+    if not roots:
         return []
     try:
         props = (sb.table("propostas")
                    .select("id,numero_proposta,cliente,cnpj,data_geracao")
-                   .order("data_geracao", desc=True).limit(2000).execute().data) or []
+                   .order("data_geracao", desc=True).limit(3000).execute().data) or []
     except Exception:
         props = []
-    casadas = [p for p in props if _digitos(p.get("cnpj")) in alvo]
+    casadas = [p for p in props if _digitos(p.get("cnpj"))[:8] in roots]
     if not casadas:
         return []
     ids = [p["id"] for p in casadas]
     try:
         itens = (sb.table("itens_proposta").select("*")
-                   .in_("proposta_id", ids).limit(3000).execute().data) or []
+                   .in_("proposta_id", ids).limit(4000).execute().data) or []
     except Exception:
         itens = []
     por_prop = {}
     for it in itens:
         por_prop.setdefault(it["proposta_id"], []).append(it)
-    po_toks = [(_toks(i.get("descricao")), float(i.get("preco_unitario") or 0)) for i in (itens_po or [])]
+    po_toks = [(_toks(i.get("descricao")), float(i.get("preco_unitario") or 0)) for i in (itens_match or [])]
     cands = []
     for p in casadas:
         lista = por_prop.get(p["id"], [])
@@ -884,13 +890,60 @@ def _casar_propostas(cnpjs_dig, itens_po):
                     sim += 0.5
                 melhor = max(melhor, sim)
             score += melhor
-        cands.append({"proposta": p, "score": round(score, 2), "itens": lista})
-    cands.sort(key=lambda c: c["score"], reverse=True)
-    return cands[:5]
+        # CNPJ COMPLETO igual = principal (sobe muito); raiz só (filial difer.) fica abaixo
+        cnpj_exato = _digitos(p.get("cnpj")) in full
+        if cnpj_exato:
+            score += 5.0
+        cands.append({"proposta": p, "score": round(score, 2), "cnpj_exato": cnpj_exato, "itens": lista})
+    cands.sort(key=lambda c: (c["score"], c["proposta"].get("data_geracao") or ""), reverse=True)
+    return cands[:8]
+
+def _enriquecer_itens_po(itens_po):
+    """Pra cada item da PO, busca no histórico (itens_proposta) e puxa custo/link/fornecedor/frete/PN."""
+    sb = get_supabase()
+    out = []
+    for i in (itens_po or []):
+        desc = i.get("descricao") or ""
+        preco_po = float(i.get("preco_unitario") or 0)
+        enr = {"descricao": desc, "quantidade": i.get("quantidade") or 1, "preco_unitario": preco_po,
+               "preco_venda": preco_po, "preco_custo": 0.0, "frete_vinda": 0.0,
+               "fornecedor": "", "link_fornecedor": "", "sku_fornecedor": "", "match_banco": False}
+        dtok = _toks(desc)
+        chave = max(dtok, key=len, default="")
+        chave = re.sub(r"[,()*]", "", chave)
+        if len(chave) >= 3:
+            try:
+                r = (sb.table("itens_proposta")
+                       .select("descricao_final,descricao_original,preco_venda,preco_custo,frete_vinda,fornecedor,link_fornecedor,sku_fornecedor")
+                       .or_(f"descricao_final.ilike.*{chave}*,descricao_original.ilike.*{chave}*")
+                       .limit(25).execute().data) or []
+            except Exception:
+                r = []
+            best, bsim = None, 0.0
+            for it in r:
+                itoks = _toks(it.get("descricao_final") or it.get("descricao_original"))
+                uni = len(dtok | itoks); inter = len(dtok & itoks)
+                sim = (inter / uni) if uni else 0.0
+                if sim > bsim:
+                    bsim, best = sim, it
+            if best and bsim >= 0.5:
+                pv = float(best.get("preco_venda") or 0)
+                enr.update({
+                    "preco_venda": pv or preco_po,
+                    "preco_custo": float(best.get("preco_custo") or 0),
+                    "frete_vinda": float(best.get("frete_vinda") or 0),
+                    "fornecedor": best.get("fornecedor") or "",
+                    "link_fornecedor": best.get("link_fornecedor") or "",
+                    "sku_fornecedor": best.get("sku_fornecedor") or "",
+                    "match_banco": True,
+                })
+        out.append(enr)
+    return out
 
 @app.post("/casar-po")
 async def casar_po(
     arquivo: UploadFile = File(None),
+    proposta_tiny: UploadFile = File(None),
     texto: str = Form(None),
     usuario: str = Depends(verificar_token)
 ):
@@ -927,12 +980,38 @@ async def casar_po(
     except Exception:
         pass
 
+    # Proposta do Tiny (opcional) — pra povoar a base quando a proposta não existe
+    prop_tiny = None
+    if proposta_tiny and proposta_tiny.filename:
+        try:
+            import json
+            ptxt = await _ler_po(proposta_tiny)
+            if ptxt.strip():
+                claude = get_claude()
+                rp = claude.messages.create(
+                    model="claude-haiku-4-5-20251001", max_tokens=2500,
+                    system=SYSTEM_PROP_TINY,
+                    messages=[{"role": "user", "content": ptxt[:8000]}],
+                )
+                tp = "".join(b.text for b in rp.content if getattr(b, "type", "") == "text").strip().strip("`")
+                if tp.lower().startswith("json"):
+                    tp = tp[4:]
+                prop_tiny = json.loads(tp)
+        except Exception:
+            prop_tiny = None
+
+    # a proposta do Tiny (se anexada) entra só como REFORÇO da busca, não cria nada
+    itens_match = list(itens_po)
+    if prop_tiny and prop_tiny.get("itens"):
+        for it in prop_tiny["itens"]:
+            itens_match.append({"descricao": it.get("descricao"), "preco_unitario": it.get("preco_venda") or 0})
+
     return {
         "po_numero": po_num,
         "cnpjs": cnpjs,
         "destino": destino,
-        "itens_po": itens_po,
-        "candidatas": _casar_propostas(cnpjs_dig, itens_po),
+        "itens_po": _enriquecer_itens_po(itens_po),   # já enriquecidos pelo histórico
+        "candidatas": _casar_propostas(cnpjs_dig, itens_match),
     }
 
 @app.post("/ordens-compra")
