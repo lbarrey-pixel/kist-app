@@ -847,6 +847,18 @@ def _digitos(s):
 def _toks(s):
     return set(re.findall(r"[a-z0-9]+", (s or "").lower()))
 
+def _item_certo(dtok, preco_po, prop_item):
+    """Só consideramos 'mesmo item' (e emprestamos dado de compra) com ALTA certeza:
+    descrição idêntica, OU preço exato + descrição bem parecida. Senão, NÃO carrega."""
+    itoks = _toks(prop_item.get("descricao_final") or prop_item.get("descricao_original"))
+    if not dtok or not itoks:
+        return False
+    inter = len(dtok & itoks); uni = len(dtok | itoks)
+    sim = (inter / uni) if uni else 0.0
+    pv = float(prop_item.get("preco_venda") or 0)
+    preco_bate = preco_po > 0 and pv > 0 and abs(pv - preco_po) < 0.01
+    return (dtok == itoks) or (preco_bate and sim >= 0.6)
+
 def _casar_propostas(cnpjs_dig, itens_match):
     """Casa propostas: CNPJ COMPLETO é o principal; a RAIZ (8 díg.) é filtro extra de confiança."""
     sb = get_supabase()
@@ -919,25 +931,57 @@ def _enriquecer_itens_po(itens_po):
                        .limit(25).execute().data) or []
             except Exception:
                 r = []
-            best, bsim = None, 0.0
+            best, bsim = None, -1.0
             for it in r:
-                itoks = _toks(it.get("descricao_final") or it.get("descricao_original"))
-                uni = len(dtok | itoks); inter = len(dtok & itoks)
-                sim = (inter / uni) if uni else 0.0
-                if sim > bsim:
-                    bsim, best = sim, it
-            if best and bsim >= 0.5:
-                pv = float(best.get("preco_venda") or 0)
+                if _item_certo(dtok, preco_po, it):
+                    itoks = _toks(it.get("descricao_final") or it.get("descricao_original"))
+                    uni = len(dtok | itoks); inter = len(dtok & itoks)
+                    sim = (inter / uni) if uni else 0.0
+                    if sim > bsim:
+                        bsim, best = sim, it
+            if best:
                 enr.update({
-                    "preco_venda": pv or preco_po,
                     "preco_custo": float(best.get("preco_custo") or 0),
                     "frete_vinda": float(best.get("frete_vinda") or 0),
                     "fornecedor": best.get("fornecedor") or "",
                     "link_fornecedor": best.get("link_fornecedor") or "",
                     "sku_fornecedor": best.get("sku_fornecedor") or "",
                     "match_banco": True,
-                })
+                })  # preco_venda fica o da PO (preservado)
         out.append(enr)
+    return out
+
+def _montar_itens_oc(itens_po, prop_itens):
+    """OC = itens da PO (descrição/qtd/preço PRESERVADOS). A proposta só empresta o dado de compra."""
+    out = []
+    for i in (itens_po or []):
+        desc = i.get("descricao") or ""
+        dtok = _toks(desc)
+        preco_po = float(i.get("preco_unitario") or 0)
+        oc = {"descricao": desc, "quantidade": i.get("quantidade") or 1,
+              "preco_venda": preco_po,   # PREÇO DA PO
+              "preco_custo": 0.0, "frete_vinda": 0.0,
+              "fornecedor": "", "link_fornecedor": "", "sku_fornecedor": "",
+              "item_proposta_id": None, "match_proposta": False}
+        best, bsim = None, -1.0
+        for it in (prop_itens or []):
+            if _item_certo(dtok, preco_po, it):
+                itoks = _toks(it.get("descricao_final") or it.get("descricao_original"))
+                uni = len(dtok | itoks); inter = len(dtok & itoks)
+                sim = (inter / uni) if uni else 0.0
+                if sim > bsim:
+                    bsim, best = sim, it
+        if best:
+            oc.update({
+                "preco_custo": float(best.get("preco_custo") or 0),
+                "frete_vinda": float(best.get("frete_vinda") or 0),
+                "fornecedor": best.get("fornecedor") or "",
+                "link_fornecedor": best.get("link_fornecedor") or "",
+                "sku_fornecedor": best.get("sku_fornecedor") or "",
+                "item_proposta_id": best.get("id"),
+                "match_proposta": True,
+            })
+        out.append(oc)
     return out
 
 @app.post("/casar-po")
@@ -1006,12 +1050,17 @@ async def casar_po(
         for it in prop_tiny["itens"]:
             itens_match.append({"descricao": it.get("descricao"), "preco_unitario": it.get("preco_venda") or 0})
 
+    candidatas = _casar_propostas(cnpjs_dig, itens_match)
+    # OC de cada candidata = itens da PO + dados de compra casados linha-a-linha
+    for c in candidatas:
+        c["itens_oc"] = _montar_itens_oc(itens_po, c.get("itens"))
+
     return {
         "po_numero": po_num,
         "cnpjs": cnpjs,
         "destino": destino,
-        "itens_po": _enriquecer_itens_po(itens_po),   # já enriquecidos pelo histórico
-        "candidatas": _casar_propostas(cnpjs_dig, itens_match),
+        "itens_po": _enriquecer_itens_po(itens_po),   # itens da PO já enriquecidos pelo histórico
+        "candidatas": candidatas,
     }
 
 @app.post("/ordens-compra")

@@ -1,6 +1,6 @@
 import { useState, useRef } from "react";
 import { createPortal } from "react-dom";
-import { btnPrimary, btnGhost, Eyebrow, IconX, IconCheck, IconSearch } from "./kist-ui.jsx";
+import { brl, btnPrimary, btnGhost, Eyebrow, IconX, IconCheck, IconSearch } from "./kist-ui.jsx";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
@@ -32,20 +32,28 @@ export default function ReceberPO({ token, usuario, onCriarOC, onClose }) {
     } finally { setLoading(false); }
   }
 
+  const ocItensDe = (lista) => (lista || []).map((i) => ({
+    id: i.item_proposta_id ?? null,
+    descricao_final: i.descricao,
+    quantidade: Number(i.quantidade) || 1,
+    unidade: i.unidade || "UN",
+    preco_venda: Number(i.preco_venda) || 0,   // preço da PO, preservado
+    preco_custo: Number(i.preco_custo) || 0,
+    frete_vinda: Number(i.frete_vinda) || 0,
+    fornecedor: i.fornecedor || null,
+    link_fornecedor: i.link_fornecedor || null,
+    sku_fornecedor: i.sku_fornecedor || null,
+  }));
+
   function gerarDaProposta(c) {
-    onCriarOC(c.proposta, c.itens, res.po_numero || "");
+    // OC = itens da PO + dados de compra emprestados desta proposta
+    onCriarOC(c.proposta, ocItensDe(c.itens_oc), res.po_numero || "");
     onClose();
   }
 
-  // último recurso: OC com os dados da PO, já enriquecida pelo histórico
   function gerarDaPO() {
     const proposta = { cliente: (res.cnpjs && res.cnpjs[0]) ? `Cliente ${res.cnpjs[0]}` : "Cliente (PO)", numero_proposta: "" };
-    const itens = (res.itens_po || []).map((i) => ({
-      id: null, descricao_final: i.descricao, quantidade: Number(i.quantidade) || 1, unidade: "UN",
-      preco_venda: Number(i.preco_venda) || 0, preco_custo: Number(i.preco_custo) || 0, frete_vinda: Number(i.frete_vinda) || 0,
-      fornecedor: i.fornecedor || null, link_fornecedor: i.link_fornecedor || null, sku_fornecedor: i.sku_fornecedor || null,
-    }));
-    onCriarOC(proposta, itens, res.po_numero || "");
+    onCriarOC(proposta, ocItensDe(res.itens_po), res.po_numero || "");
     onClose();
   }
 
@@ -99,8 +107,21 @@ export default function ReceberPO({ token, usuario, onCriarOC, onClose }) {
                   <span className="text-faint">PO <span className="font-mono text-ink">{res.po_numero || "—"}</span></span>
                   <span className="text-faint">CNPJ <span className="font-mono text-ink">{(res.cnpjs && res.cnpjs.join(", ")) || "—"}</span></span>
                   {res.destino && <span className="text-faint">Destino <span className="text-ink">{res.destino}</span></span>}
-                  <span className="text-faint">{(res.itens_po || []).length} itens lidos</span>
+                  <span className="text-faint">{(res.itens_po || []).length} itens na PO</span>
                 </div>
+                {(res.itens_po || []).length > 0 && (
+                  <div className="mt-3 space-y-1 border-t border-line pt-2">
+                    <div className="mb-1 text-[10px] uppercase eyebrow text-faint">Itens da PO (vão pra OC exatamente assim)</div>
+                    {res.itens_po.map((it, k) => (
+                      <div key={k} className="flex items-center gap-2 text-[12px]">
+                        <span className="min-w-0 flex-1 truncate text-sub">{it.descricao}</span>
+                        <span className="font-mono text-faint">{it.quantidade}x</span>
+                        <span className="font-mono text-ink">R$ {brl(it.preco_unitario)}</span>
+                        {it.match_banco && <span className="text-[10px] font-semibold text-signal" title="mesmo item confirmado (preço/descrição batem) — custo e origem preenchidos">✓ mesmo item</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
 
               {(res.candidatas || []).length > 0 ? (
@@ -113,7 +134,8 @@ export default function ReceberPO({ token, usuario, onCriarOC, onClose }) {
                           <div className="min-w-0">
                             <div className="truncate text-[13.5px] font-medium text-ink">{c.proposta.cliente}</div>
                             <div className="mt-0.5 text-[11.5px] text-faint">
-                              proposta <span className="font-mono">{c.proposta.numero_proposta || "—"}</span> · {(c.itens || []).length} itens
+                              proposta <span className="font-mono">{c.proposta.numero_proposta || "—"}</span>
+                              {" · "}{(c.itens_oc || []).filter((x) => x.match_proposta).length}/{(res.itens_po || []).length} itens com dados de compra
                               {i === 0 && c.score > 0 && <span className="ml-2 font-semibold text-signal">melhor casamento</span>}
                             </div>
                           </div>
