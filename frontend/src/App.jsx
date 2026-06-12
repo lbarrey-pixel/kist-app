@@ -152,9 +152,37 @@ function ItemRow({ item, index, onChange, token, apiUrl }) {
                   onChange={(e) => onChange(index, "sku_fornecedor", e.target.value)}
                 />
               </div>
+              <div className="flex items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2.5 py-1.5">
+                <span className="text-[11px] text-faint">Custo un.</span>
+                <span className="text-[11px] text-faint">R$</span>
+                <input type="number" step="0.01"
+                  className="w-20 bg-transparent text-right font-mono text-[12px] text-ink outline-none"
+                  placeholder="0,00"
+                  value={item.preco_custo ?? ""}
+                  onChange={(e) => onChange(index, "preco_custo", parseFloat(e.target.value) || 0)}
+                />
+              </div>
+              <div className="flex items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2.5 py-1.5">
+                <span className="text-[11px] text-faint">Frete (item)</span>
+                <span className="text-[11px] text-faint">R$</span>
+                <input type="number" step="0.01"
+                  className="w-20 bg-transparent text-right font-mono text-[12px] text-ink outline-none"
+                  placeholder="0,00"
+                  value={item.frete_vinda ?? ""}
+                  onChange={(e) => onChange(index, "frete_vinda", parseFloat(e.target.value) || 0)}
+                />
+              </div>
+              {item.preco_custo > 0 && (
+                <span className="text-[11px] text-faint">
+                  lucro un.{" "}
+                  <span className={`font-mono ${(item.preco_un - item.preco_custo) >= 0 ? "text-signal" : "text-rose"}`}>
+                    R$ {brl((item.preco_un || 0) - (item.preco_custo || 0))}
+                  </span>
+                </span>
+              )}
             </div>
             <p className="mt-1.5 pl-1 text-[11px] text-faint">
-              Essa referência acompanha o item quando a proposta virar ordem de compra.
+              Essa referência acompanha o item quando a proposta virar ordem de compra. <span className="text-faint/80">Custo é interno — não vai pro Tiny.</span>
             </p>
           </td>
         </tr>
@@ -620,10 +648,52 @@ export default function App() {
                     </div>
                   </div>
                 </div>
+
+                {/* Custo & lucro — uso INTERNO, não vai para o CSV do Tiny */}
+                {(() => {
+                  const num = (v) => { let s = String(v ?? "").trim(); if (s.includes(",")) s = s.replace(/\./g, "").replace(",", "."); return parseFloat(s) || 0; };
+                  const prodVenda = resultado.itens.reduce((s, i) => s + (i.preco_un || 0) * (parseFloat(i.quantidade) || 0), 0);
+                  const prodCusto = resultado.itens.reduce((s, i) => s + (i.preco_custo || 0) * (parseFloat(i.quantidade) || 0), 0);
+                  const custoFreteItens = resultado.itens.reduce((s, i) => s + num(i.frete_vinda), 0); // frete único por item, SEM ×qtd
+                  const freteCobr = num(resultado.frete);
+                  const freteReceb = num(resultado.frete_recebimento);
+                  const base = prodVenda + freteCobr;
+                  const lucro = base - prodCusto - freteReceb - custoFreteItens;
+                  const margem = base > 0 ? (lucro / base) * 100 : 0;
+                  const temCusto = prodCusto > 0 || custoFreteItens > 0;
+                  return (
+                    <div className="mt-4 rounded-xl border border-line bg-surface p-4">
+                      <div className="flex items-center justify-between">
+                        <div className="eyebrow text-[10px] font-bold uppercase text-faint">Custo & lucro · uso interno</div>
+                        <span className="rounded-md bg-paper px-2 py-0.5 text-[10px] font-medium text-faint">não exportado pro Tiny</span>
+                      </div>
+                      <div className="mt-3 grid grid-cols-1 gap-4 md:grid-cols-2">
+                        <label className="block">
+                          <div className="text-[11.5px] text-sub">Frete de recebimento (R$)</div>
+                          <input inputMode="decimal" value={resultado.frete_recebimento ?? ""}
+                            onChange={(e) => setResultado((p) => ({ ...p, frete_recebimento: e.target.value }))}
+                            placeholder="0,00"
+                            className="mt-1 w-full rounded-lg border border-line2 bg-paper px-2.5 py-1.5 font-mono text-[13px] text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
+                          <div className="mt-1 text-[10.5px] text-faint">Custo do frete pra receber a mercadoria. O custo unitário de cada item fica em “origem do preço”.</div>
+                        </label>
+                        <div className="rounded-lg bg-paper p-3 text-[12px]">
+                          <div className="flex justify-between text-sub"><span>Venda (produtos)</span><span className="font-mono">R$ {brl(prodVenda)}</span></div>
+                          {freteCobr > 0 && <div className="flex justify-between text-sub"><span>+ Frete cobrado</span><span className="font-mono">R$ {brl(freteCobr)}</span></div>}
+                          <div className="flex justify-between text-sub"><span>− Custo (produtos)</span><span className="font-mono">R$ {brl(prodCusto)}</span></div>
+                          {custoFreteItens > 0 && <div className="flex justify-between text-sub"><span>− Frete itens (custo)</span><span className="font-mono">R$ {brl(custoFreteItens)}</span></div>}
+                          {freteReceb > 0 && <div className="flex justify-between text-sub"><span>− Frete recebimento</span><span className="font-mono">R$ {brl(freteReceb)}</span></div>}
+                          <div className="mt-1.5 flex items-baseline justify-between border-t border-line pt-1.5">
+                            <span className="font-medium text-ink">Previsão de lucro</span>
+                            <span className={`font-mono text-[16px] font-semibold ${lucro >= 0 ? "text-signal" : "text-rose"}`}>R$ {brl(lucro)}</span>
+                          </div>
+                          <div className="text-right text-[10.5px] text-faint">{temCusto ? `${margem.toFixed(0)}% margem` : "informe os custos dos itens"}</div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })()}
               </div>
             )}
-
-            {/* DOWNLOAD */}
             {step === "download" && (
               <div className="mx-auto max-w-md py-16 text-center rise">
                 <div className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-2xl bg-signalbg text-signal"><IconCheck size={26} /></div>
