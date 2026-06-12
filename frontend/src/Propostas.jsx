@@ -181,6 +181,23 @@ export default function Propostas({ token, usuario, onCriarOC }) {
                           <div className="py-4 text-center text-[12.5px] text-faint">Carregando itens…</div>
                         ) : (
                           <div className="space-y-1">
+                            {(itensProp[id] || []).length > 0 && (() => {
+                              const lst = itensProp[id] || [];
+                              const todos = lst.every((it) => selecionados[it.id]);
+                              return (
+                                <label className="flex cursor-pointer items-center gap-3 rounded-lg border-b border-line/50 px-2 py-1.5 hover:bg-surface">
+                                  <input type="checkbox" checked={todos}
+                                    onChange={() => setSelecionados((prev) => {
+                                      const novo = { ...prev };
+                                      lst.forEach((it) => { novo[it.id] = !todos; });
+                                      return novo;
+                                    })}
+                                    className="accent-kist" />
+                                  <span className="flex-1 text-[12px] font-medium text-sub">{todos ? "Desmarcar todos" : "Selecionar todos"}</span>
+                                  <span className="text-[11px] text-faint">{lst.length} {lst.length === 1 ? "item" : "itens"}</span>
+                                </label>
+                              );
+                            })()}
                             {(itensProp[id] || []).map((it) => (
                               <label key={it.id} className="flex cursor-pointer items-center gap-3 rounded-lg px-2 py-1.5 hover:bg-surface">
                                 <input type="checkbox" checked={!!selecionados[it.id]} onChange={() => toggleItem(it.id)} className="accent-kist" />
