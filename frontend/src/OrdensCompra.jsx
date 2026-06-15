@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback } from "react";
-import { createPortal } from "react-dom";
 import {
   brl, btnPrimary, btnGhost, Eyebrow, PageHeader, PoChip, CopyPo,
   IconSearch, IconBoard, IconList, IconDownload, IconX, IconLink, IconTrash, IconCheck, IconCopy,
@@ -7,8 +6,6 @@ import {
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
-// Etapas do funil (colunas do quadro). `drop` = status aplicado ao arrastar pra cá.
-// "Aguardando compra" também acolhe OCs recém-criadas (status rascunho).
 const LANES = [
   { key: "aguardando", label: "Aguardando compra",  tint: "#1F6FEB", drop: "confirmada",            status: ["rascunho", "confirmada"] },
   { key: "parcial",    label: "Comprado parcial",   tint: "#7A5AF0", drop: "parcialmente_comprada", status: ["parcialmente_comprada"] },
@@ -35,7 +32,7 @@ export default function OrdensCompra({ token, usuario, novaOC, onNovaOCProcessad
   const [ocs, setOcs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [erro, setErro] = useState("");
-  const [vista, setVista] = useState("kanban"); // kanban | lista | consolidados
+  const [vista, setVista] = useState("kanban");
   const [q, setQ] = useState("");
   const [sel, setSel] = useState(null);
   const [criando, setCriando] = useState(false);
@@ -52,7 +49,6 @@ export default function OrdensCompra({ token, usuario, novaOC, onNovaOCProcessad
 
   useEffect(() => { carregar(); /* eslint-disable-next-line */ }, [equipeToda]);
 
-  // Criação de OC a partir de uma proposta aprovada (carrega a origem junto)
   useEffect(() => {
     if (!novaOC || criando) return;
     const { proposta, itens, po } = novaOC;
@@ -74,7 +70,6 @@ export default function OrdensCompra({ token, usuario, novaOC, onNovaOCProcessad
         preco_venda: i.preco_venda,
         preco_custo: i.preco_custo || 0,
         frete_vinda: i.frete_vinda || 0,
-        // origem do preço viaja junto pra facilitar a compra:
         nome_fornecedor: i.fornecedor || null,
         link_fornecedor: i.link_fornecedor || null,
         sku_fornecedor: i.sku_fornecedor || null,
@@ -88,7 +83,6 @@ export default function OrdensCompra({ token, usuario, novaOC, onNovaOCProcessad
   }, [novaOC]);
 
   const norm = (s) => (s || "").toString().toLowerCase();
-  // busca de PO por proximidade: maiúsculo, O→0, ignora espaços/traços/pontos
   const normPO = (s) => (s || "").toString().toUpperCase().replace(/O/g, "0").replace(/[^A-Z0-9]/g, "");
   const filtrados = ocs.filter((o) => {
     if (!q.trim()) return true;
@@ -111,13 +105,27 @@ export default function OrdensCompra({ token, usuario, novaOC, onNovaOCProcessad
   }
 
   async function moverStatus(id, status) {
-    setOcs((prev) => prev.map((o) => (o.id === id ? { ...o, status } : o)));   // otimista
+    setOcs((prev) => prev.map((o) => (o.id === id ? { ...o, status } : o)));
     setSel((s) => (s && s.id === id ? { ...s, status } : s));
     try {
       await fetch(`${API}/ordens-compra/${id}`, { method: "PUT", headers: jsonHeaders(), body: JSON.stringify({ status }) });
     } catch (e) { carregar(); }
   }
 
+  // ── Página de detalhe widescreen ─────────────────────────────────────────
+  if (sel) {
+    return (
+      <OCDetalhe
+        oc={sel}
+        token={token}
+        onClose={() => { setSel(null); carregar(); }}
+        onChanged={carregar}
+        onDeleted={aposExcluir}
+      />
+    );
+  }
+
+  // ── Lista / Kanban ────────────────────────────────────────────────────────
   return (
     <div className="mx-auto max-w-6xl px-8 py-9 rise">
       <PageHeader eyebrow="Compras" title="Ordens de compra"
@@ -138,7 +146,6 @@ export default function OrdensCompra({ token, usuario, novaOC, onNovaOCProcessad
           </>
         } />
 
-      {/* Alternador de vista */}
       <div className="mt-5 inline-flex rounded-lg border border-line2 bg-surface p-0.5">
         {[["kanban", "Kanban", IconBoard], ["lista", "Lista", IconList], ["consolidados", "Itens consolidados", IconList]].map(([k, label, Icon]) => (
           <button key={k} onClick={() => setVista(k)}
@@ -159,18 +166,11 @@ export default function OrdensCompra({ token, usuario, novaOC, onNovaOCProcessad
       ) : (
         <Consolidados token={token} todos={equipeToda} />
       )}
-
-      {sel && (
-        <SlideOver oc={sel} token={token}
-          onClose={() => setSel(null)}
-          onChanged={carregar}
-          onDeleted={aposExcluir} />
-      )}
     </div>
   );
 }
 
-/* TAG do operador — círculo com a inicial, nome completo no hover */
+/* ── Operador tag ────────────────────────────────────────────────────────── */
 function OperadorTag({ nome }) {
   const ini = (nome || "?").trim().charAt(0).toUpperCase();
   return (
@@ -181,7 +181,7 @@ function OperadorTag({ nome }) {
   );
 }
 
-/* ── Vista Kanban (com arrastar entre colunas) ─────────────────────────────── */
+/* ── Kanban ──────────────────────────────────────────────────────────────── */
 function Kanban({ ocs, onSelect, onMove }) {
   const [over, setOver] = useState(null);
   return (
@@ -270,7 +270,7 @@ function OCCard({ oc, onClick }) {
   );
 }
 
-/* ── Vista Lista ───────────────────────────────────────────────────────────── */
+/* ── Lista ───────────────────────────────────────────────────────────────── */
 function Lista({ ocs, onSelect }) {
   return (
     <div className="mt-6 overflow-hidden rounded-xl border border-line bg-surface">
@@ -301,7 +301,7 @@ function Lista({ ocs, onSelect }) {
   );
 }
 
-/* ── Vista Itens consolidados ──────────────────────────────────────────────── */
+/* ── Itens consolidados ──────────────────────────────────────────────────── */
 function Consolidados({ token, todos }) {
   const [itens, setItens] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -348,19 +348,17 @@ function Consolidados({ token, todos }) {
   );
 }
 
-/* ── Formas de pagamento + cálculo de vencimentos por dia do mês ───────────── */
+/* ── Pagamento por item ──────────────────────────────────────────────────── */
 const FORMAS = [
   ["cartao", "Cartão"], ["boleto", "Boleto"], ["pix", "Pix"], ["ted", "TED"],
 ];
 const FORMA_LABEL = { cartao: "Cartão", boleto: "Boleto", pix: "Pix", ted: "TED" };
 
-function diasNoMes(ano, mes) { return new Date(ano, mes + 1, 0).getDate(); } // mes 0-11
-// Datas das parcelas no cartão: 1ª no próximo dia do mês que ainda não passou, demais mês a mês.
+function diasNoMes(ano, mes) { return new Date(ano, mes + 1, 0).getDate(); }
 function vencimentosCartao(dia, parcelas, hoje = new Date()) {
   if (!dia) return [];
   const n = Math.max(1, parseInt(parcelas) || 1);
   const base = new Date(hoje.getFullYear(), hoje.getMonth(), 1);
-  // se o dia deste mês já passou, começa no mês seguinte
   let inicio = (hoje.getDate() <= dia) ? 0 : 1;
   const datas = [];
   for (let i = 0; i < n; i++) {
@@ -373,8 +371,6 @@ function vencimentosCartao(dia, parcelas, hoje = new Date()) {
   return datas;
 }
 const fmtData = (d) => d ? `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}` : "";
-
-/* Boleto: conversão dias ↔ data, contando a partir de hoje (dia da compra). */
 const _addDiasHoje = (n) => { const d = new Date(); d.setDate(d.getDate() + (parseInt(n) || 0)); return d.toISOString().slice(0, 10); };
 const _diasDeHoje = (iso) => {
   if (!iso) return "";
@@ -383,8 +379,6 @@ const _diasDeHoje = (iso) => {
   return Math.max(0, Math.round((a - b) / 86400000));
 };
 
-/* Forma de pagamento por item — opcional, campos condicionais, resumo compacto.
-   Cartão: aprende o final → dia de vencimento; vencimentos calculados pelo dia. */
 function PagamentoItem({ it, cartoes, onSalvar, onAprenderCartao }) {
   const [editing, setEditing] = useState(false);
   const [forma, setForma] = useState(it.forma_pagamento || "");
@@ -409,7 +403,6 @@ function PagamentoItem({ it, cartoes, onSalvar, onAprenderCartao }) {
     if (d && final4.length === 4) onAprenderCartao(final4, d);
   }
 
-  // ── resumo (fechado) ──
   if (!editing) {
     if (!forma) {
       return <button onClick={() => setEditing(true)} className="mt-2 text-[11px] font-medium text-kist hover:text-kist600">+ forma de pagamento</button>;
@@ -425,7 +418,6 @@ function PagamentoItem({ it, cartoes, onSalvar, onAprenderCartao }) {
     );
   }
 
-  // ── editor (aberto) ──
   return (
     <div className="mt-2 rounded-lg border border-line bg-paper p-2.5">
       <div className="mb-2 flex items-center justify-between">
@@ -438,7 +430,6 @@ function PagamentoItem({ it, cartoes, onSalvar, onAprenderCartao }) {
             className={`rounded-md px-2.5 py-1 text-[11px] font-medium transition-colors ${forma === v ? "bg-ink text-white" : "border border-line2 bg-surface text-sub hover:text-ink"}`}>{l}</button>
         ))}
       </div>
-
       {forma === "cartao" && (
         <div className="mt-2 space-y-2">
           <div className="flex gap-2">
@@ -479,7 +470,6 @@ function PagamentoItem({ it, cartoes, onSalvar, onAprenderCartao }) {
           )}
         </div>
       )}
-
       {forma === "boleto" && (
         <div className="mt-2 space-y-1.5">
           <div className="flex gap-2">
@@ -512,7 +502,6 @@ function PagamentoItem({ it, cartoes, onSalvar, onAprenderCartao }) {
           <div className="text-[10px] text-faint">Conta a partir de hoje — informe os dias (ex: 28D) ou a data; um atualiza o outro.</div>
         </div>
       )}
-
       {(forma === "pix" || forma === "ted") && (
         <div className="mt-2 text-[11px] text-faint">Sem campos adicionais para {FORMA_LABEL[forma]}.</div>
       )}
@@ -520,8 +509,8 @@ function PagamentoItem({ it, cartoes, onSalvar, onAprenderCartao }) {
   );
 }
 
-
-function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
+/* ── OCDetalhe — página widescreen ──────────────────────────────────────── */
+function OCDetalhe({ oc, token, onClose, onChanged, onDeleted }) {
   const jsonHeaders = () => ({ "Content-Type": "application/json", Authorization: `Bearer ${token}` });
   const ocId = oc.id ?? oc.numero_oc;
 
@@ -538,7 +527,7 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
   const [idaCobrado, setIdaCobrado] = useState(!!oc.frete_ida_cobrado);
   const [imposto, setImposto] = useState(oc.imposto_percent ?? 12);
   const [confirmDel, setConfirmDel] = useState(false);
-  const [cartoes, setCartoes] = useState({});   // { "1234": diaVencimento }
+  const [cartoes, setCartoes] = useState({});
 
   useEffect(() => {
     setLoading(true);
@@ -549,7 +538,6 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
       .finally(() => setLoading(false));
   }, [ocId, token]);
 
-  // Cadastro de cartões (aprende sozinho conforme as compras)
   useEffect(() => {
     fetch(`${API}/cartoes`, { headers: { Authorization: `Bearer ${token}` } })
       .then((r) => r.json())
@@ -561,7 +549,6 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
       .catch(() => {});
   }, [token]);
 
-  // Ensina/atualiza um cartão (final → dia). Atualiza todas as compras desse final.
   async function aprenderCartao(final, dia) {
     const f = String(final || "").trim().slice(-4);
     if (!f || !dia) return;
@@ -571,17 +558,16 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
     } catch (e) {}
   }
 
+  // Cálculos financeiros
   const totVenda = itens.reduce((s, i) => s + (i.preco_venda || 0) * (i.quantidade_comprar ?? i.quantidade_proposta ?? 0), 0);
   const totCusto = itens.reduce((s, i) => s + (i.preco_custo || 0) * (i.quantidade_comprar ?? i.quantidade_proposta ?? 0), 0);
-
-  // Modelo de fretes + imposto (v3.8)
   const somaVindaItens = itens.reduce((s, i) => s + (parseFloat(i.frete_vinda) || 0), 0);
   const freteVindaEfetivo = somaVindaItens > 0 ? somaVindaItens : (parseFloat(freteVindaGlobal) || 0);
   const freteIdaNum = parseFloat(freteIda) || 0;
   const impostoPct = parseFloat(imposto) || 0;
   const custoTotal = totCusto + freteVindaEfetivo + freteIdaNum;
   const nota = totVenda + (idaCobrado ? freteIdaNum : 0);
-  const totLucro = nota - custoTotal;                 // lucro bruto
+  const totLucro = nota - custoTotal;
   const impostoValor = nota * impostoPct / 100;
   const lucroLiquido = totLucro - impostoValor;
   const margem = nota > 0 ? (totLucro / nota) * 100 : 0;
@@ -615,7 +601,7 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
   function imprimirOC() {
     const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
     const statusLabel = STATUS_LABEL[oc.status] || oc.status || "—";
-    const cnpj = oc.cnpj || oc.cnpj_cliente || "—";
+    const cnpjVal = oc.cnpj || oc.cnpj_cliente || "—";
     const entrega = oc.endereco_entrega || oc.endereco || "—";
     const linhas = itens.map((it, i) => {
       const qd = it.quantidade_comprar ?? it.quantidade_proposta ?? 0;
@@ -623,7 +609,7 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
       const st = (it.status_item || "—").replace(/_/g, " ");
       return `<tr>
         <td>${i + 1}</td>
-        <td><strong>${esc(it.descricao)}</strong>${it.nome_fornecedor ? "" : ""}</td>
+        <td><strong>${esc(it.descricao)}</strong></td>
         <td class="c">${esc(qd)} ${esc(it.unidade || "")}</td>
         <td>${esc(it.nome_fornecedor || "—")}</td>
         <td class="c">${esc(st)}</td>
@@ -668,7 +654,7 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
     <div><div class="lbl">Título</div>${esc(oc.titulo || "—")}</div>
     <div><div class="lbl">OC interna</div>${esc(oc.id)}</div>
     <div><div class="lbl">Cliente</div>${esc(oc.cliente || "—")}</div>
-    <div><div class="lbl">CNPJ</div>${esc(cnpj)}</div>
+    <div><div class="lbl">CNPJ</div>${esc(cnpjVal)}</div>
     <div style="grid-column:1/3"><div class="lbl">Endereço de entrega</div>${esc(entrega)}</div>
   </div>
   <table>
@@ -696,79 +682,264 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
     if (bloqueado) alert("Seu navegador bloqueou algumas abas. Permita pop-ups deste site para abrir todos os links de uma vez.");
   }
 
-  return createPortal(
-    <div className="fixed inset-0 z-50 flex justify-end">
-      <div className="absolute inset-0 bg-ink/30" onClick={onClose} />
-      <div className="slide-in relative flex h-screen w-[460px] flex-col bg-surface shadow-2xl">
-        {/* Cabeçalho — PO em destaque */}
-        <div className="border-b border-line px-5 py-4">
-          <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-1.5">
-                <PoChip po={po} size="lg" />
-                {po && <CopyPo po={po} />}
-              </div>
-              {/* Razão social / cliente — editável */}
-              <input value={cliente} onChange={(e) => setCliente(e.target.value)}
-                onBlur={() => cliente !== (oc.cliente || "") && salvarOC({ cliente: cliente.trim() || null })}
-                placeholder="Razão social / cliente"
-                className="mt-2 w-full rounded px-0.5 bg-transparent text-[16px] font-semibold tracking-tight text-ink outline-none placeholder:font-normal placeholder:text-faint/60 focus:bg-paper" />
-              {/* UF + CNPJ — editáveis */}
-              <div className="mt-1.5 flex items-center gap-2">
-                <input value={uf} onChange={(e) => setUf(e.target.value.toUpperCase().replace(/[^A-Z]/g, "").slice(0, 2))}
-                  onBlur={() => uf !== (oc.uf || "") && salvarOC({ uf: uf.trim().toUpperCase() || null })}
-                  placeholder="UF" maxLength={2}
-                  className="w-11 rounded-md border border-line2 bg-paper px-1.5 py-0.5 text-center font-mono text-[11px] text-ink outline-none focus:ring-1 focus:ring-kist placeholder:text-faint/60" />
-                <input value={cnpj} onChange={(e) => setCnpj(e.target.value)}
-                  onBlur={() => cnpj !== (oc.cnpj || "") && salvarOC({ cnpj: cnpj.trim() || null })}
-                  placeholder="CNPJ"
-                  className="flex-1 rounded-md border border-line2 bg-paper px-2 py-0.5 font-mono text-[11px] text-ink outline-none focus:ring-1 focus:ring-kist placeholder:text-faint/60" />
-              </div>
-              <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11.5px] text-faint">
-                <span className="font-mono text-sub">{oc.id}</span>
-                <span>·</span>
-                <select value={status} onChange={(e) => mudarStatus(e.target.value)}
-                  className="rounded-md border border-line2 bg-paper px-1.5 py-0.5 text-[11px] font-medium text-ink outline-none focus:ring-1 focus:ring-kist">
-                  {STATUS_OPCOES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
-                </select>
-                {oc.titulo && <span className="truncate text-faint/70" title={oc.titulo}>· {oc.titulo.replace(/^null\s*—\s*/, "")}</span>}
-              </div>
-            </div>
-            <button onClick={onClose} className="flex-shrink-0 rounded-md p-1 text-faint hover:bg-paper hover:text-ink"><IconX size={18} /></button>
-          </div>
-          {/* Nº da PO do cliente — sempre editável (auto na criação, ajustável na mão) */}
-          <div className="mt-3 flex items-center gap-2 rounded-lg border border-line2 bg-paper px-2.5 py-2">
-            <span className="text-[10px] font-semibold uppercase eyebrow text-faint">PO</span>
-            <input value={poInput} onChange={(e) => setPoInput(e.target.value)} onBlur={salvarPO}
-              placeholder="nº da PO do cliente"
-              className="flex-1 bg-transparent font-mono text-[12.5px] text-ink outline-none placeholder:text-faint/60" />
-            <button onClick={salvarPO} className="flex-shrink-0 rounded-md bg-kist px-2.5 py-1 text-[11.5px] font-medium text-white">Salvar</button>
-          </div>
+  return (
+    <div className="flex flex-col" style={{ minHeight: "calc(100vh - 56px)" }}>
+
+      {/* ── Barra de contexto (sticky) ─────────────────────────────────── */}
+      <div className="sticky top-0 z-20 flex shrink-0 flex-wrap items-center gap-2 border-b border-line bg-surface/95 px-6 py-2.5 backdrop-blur-sm">
+        {/* Voltar */}
+        <button onClick={onClose}
+          className="mr-1 flex items-center gap-1 rounded-md px-2 py-1 text-[12.5px] font-medium text-sub transition-colors hover:bg-paper hover:text-ink">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M9 2L4 7l5 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+          Compras
+        </button>
+        <div className="h-4 w-px bg-line2" />
+
+        {/* Cliente editável */}
+        <input value={cliente} onChange={(e) => setCliente(e.target.value)}
+          onBlur={() => cliente !== (oc.cliente || "") && salvarOC({ cliente: cliente.trim() || null })}
+          placeholder="Razão social / cliente"
+          className="rounded px-1 py-0.5 text-[13.5px] font-semibold text-ink outline-none placeholder:font-normal placeholder:text-faint/60 hover:bg-paper focus:bg-paper focus:ring-1 focus:ring-kist" />
+
+        {/* UF editável */}
+        <input value={uf} onChange={(e) => setUf(e.target.value.toUpperCase().replace(/[^A-Z]/g, "").slice(0, 2))}
+          onBlur={() => uf !== (oc.uf || "") && salvarOC({ uf: uf.trim().toUpperCase() || null })}
+          placeholder="UF" maxLength={2}
+          className="w-10 rounded border border-line2 bg-paper px-1.5 py-0.5 text-center font-mono text-[11.5px] text-ink outline-none focus:ring-1 focus:ring-kist placeholder:text-faint/60" />
+
+        {/* CNPJ editável */}
+        <input value={cnpj} onChange={(e) => setCnpj(e.target.value)}
+          onBlur={() => cnpj !== (oc.cnpj || "") && salvarOC({ cnpj: cnpj.trim() || null })}
+          placeholder="CNPJ"
+          className="w-40 rounded border border-line2 bg-paper px-2 py-0.5 font-mono text-[11.5px] text-ink outline-none focus:ring-1 focus:ring-kist placeholder:text-faint/60" />
+
+        <div className="h-4 w-px bg-line2" />
+
+        {/* PO editável */}
+        <div className="flex items-center gap-1.5 rounded-md border border-line2 bg-paper px-2 py-0.5">
+          <span className="eyebrow text-[9px] font-bold uppercase text-faint">PO</span>
+          <input value={poInput} onChange={(e) => setPoInput(e.target.value)} onBlur={salvarPO}
+            placeholder="nº da PO"
+            className="w-36 bg-transparent font-mono text-[12.5px] text-ink outline-none placeholder:text-faint/60" />
+          {po && <CopyPo po={po} />}
         </div>
 
-        {/* Totais — venda, custo total, lucro bruto */}
-        <div className="grid grid-cols-3 gap-px border-b border-line bg-line">
-          <div className="bg-surface px-4 py-3">
-            <div className="text-[10.5px] uppercase eyebrow text-faint">Venda</div>
-            <div className="mt-0.5 font-mono text-[14px] font-semibold text-ink">R$ {brl(totVenda)}</div>
+        {/* Status */}
+        <select value={status} onChange={(e) => mudarStatus(e.target.value)}
+          className="rounded-md border border-line2 bg-paper px-2 py-1 text-[11.5px] font-medium text-ink outline-none focus:ring-1 focus:ring-kist">
+          {STATUS_OPCOES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+        </select>
+
+        <span className="font-mono text-[11px] text-faint">{oc.id}</span>
+
+        {/* Ações */}
+        <div className="ml-auto flex items-center gap-2">
+          <button onClick={abrirTodosLinks} title="Abrir todos os links de compra"
+            className="inline-flex items-center justify-center rounded-lg border border-line2 px-2.5 py-1.5 text-faint transition-colors hover:border-kist/40 hover:bg-kist/5 hover:text-kist">
+            <IconLink size={15} />
+          </button>
+          <button onClick={imprimirOC} className={`${btnGhost} py-1.5`}><IconDownload size={14} /> Exportar PDF</button>
+          <button onClick={() => mudarStatus("confirmada")} className={`${btnPrimary} py-1.5`}>
+            <IconCheck size={14} /> Confirmar OC
+          </button>
+        </div>
+      </div>
+
+      {/* ── Corpo: itens (principal) + sidebar financeira ────────────────── */}
+      <div className="flex flex-1 items-start">
+
+        {/* Itens — coluna principal */}
+        <div className="min-w-0 flex-1 px-8 py-6">
+          <div className="mb-4 flex items-center justify-between">
+            <Eyebrow>Itens · {itens.length} produto{itens.length !== 1 ? "s" : ""}</Eyebrow>
           </div>
-          <div className="bg-surface px-4 py-3">
-            <div className="text-[10.5px] uppercase eyebrow text-faint">Custo total</div>
-            <div className="mt-0.5 font-mono text-[14px] font-semibold text-sub">R$ {brl(custoTotal)}</div>
-            <div className="mt-0.5 font-mono text-[10px] text-faint">+ fretes</div>
-          </div>
-          <div className="bg-surface px-4 py-3">
-            <div className="text-[10.5px] uppercase eyebrow text-faint">Lucro bruto</div>
-            <div className={`mt-0.5 font-mono text-[14px] font-semibold ${totLucro >= 0 ? "text-signal" : "text-rose"}`}>
-              R$ {brl(totLucro)}
+
+          {loading ? (
+            <div className="py-10 text-center text-[13px] text-faint">Carregando itens…</div>
+          ) : (
+            <div className="space-y-3">
+              {itens.map((it) => {
+                const link = it.link_fornecedor;
+                const isUrl = typeof link === "string" && /^https?:\/\//i.test(link);
+                const qd = it.quantidade_comprar ?? it.quantidade_proposta ?? 0;
+                const lucroUn = (it.preco_venda || 0) - (it.preco_custo || 0);
+                const lucroItem = lucroUn * qd;
+                const corLucro = lucroUn >= 0 ? "text-signal" : "text-rose";
+                return (
+                  <div key={it.id} className="rounded-xl border border-line bg-surface p-4">
+
+                    {/* Linha 1 — descrição + status */}
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="text-[13.5px] font-medium leading-snug text-ink">{it.descricao}</div>
+                      <select value={it.status_item || "pendente"}
+                        onChange={(e) => salvarItem(it.id, { status_item: e.target.value })}
+                        className={`shrink-0 rounded-md border border-line2 bg-paper px-2 py-0.5 text-[11px] font-medium outline-none focus:ring-1 focus:ring-kist
+                          ${it.status_item === "entregue" ? "text-signal" : it.status_item === "comprado" ? "text-kist" : "text-sub"}`}>
+                        <option value="pendente">pendente</option>
+                        <option value="comprado">comprado</option>
+                        <option value="entregue_parcial">entr. parcial</option>
+                        <option value="entregue">entregue</option>
+                      </select>
+                    </div>
+
+                    {/* Linha 2 — números: qtd | custo | venda | frete | lucro */}
+                    <div className="mt-3 grid grid-cols-5 gap-3 border-t border-line/60 pt-3 text-[11.5px]">
+                      {/* Qtd */}
+                      <div>
+                        <div className="text-faint">Qtd</div>
+                        <div className="mt-0.5 font-mono text-ink">{qd} <span className="text-faint">{it.unidade}</span></div>
+                      </div>
+                      {/* Custo un */}
+                      <div>
+                        <div className="text-faint">Custo un.</div>
+                        <div className="mt-0.5 flex items-center gap-0.5">
+                          <span className="text-faint">R$</span>
+                          <input type="number" step="0.001" defaultValue={it.preco_custo || ""}
+                            onBlur={(e) => salvarItem(it.id, { preco_custo: parseFloat(e.target.value) || 0 })}
+                            placeholder="—"
+                            className="w-20 rounded bg-paper px-1 py-0.5 text-right font-mono text-ink outline-none focus:bg-white focus:ring-1 focus:ring-kist" />
+                        </div>
+                      </div>
+                      {/* Venda un */}
+                      <div>
+                        <div className="text-faint">Venda un.</div>
+                        <div className="mt-0.5 font-mono text-ink">R$ {brl(it.preco_venda)}</div>
+                      </div>
+                      {/* Frete vinda */}
+                      <div>
+                        <div className="text-faint">Frete vinda</div>
+                        <div className="mt-0.5 flex items-center gap-0.5">
+                          <span className="text-faint">R$</span>
+                          <input type="number" step="0.01" defaultValue={it.frete_vinda || ""}
+                            onBlur={(e) => salvarItem(it.id, { frete_vinda: parseFloat(e.target.value) || 0 })}
+                            placeholder="—"
+                            className="w-20 rounded bg-paper px-1 py-0.5 text-right font-mono text-ink outline-none focus:bg-white focus:ring-1 focus:ring-kist" />
+                        </div>
+                      </div>
+                      {/* Lucro */}
+                      <div>
+                        <div className="text-faint">Lucro bruto</div>
+                        <div className={`mt-0.5 font-mono font-medium ${corLucro}`}>R$ {brl(lucroItem)}</div>
+                        <div className={`text-[10px] ${corLucro} opacity-70`}>un. R$ {brl(lucroUn)}</div>
+                      </div>
+                    </div>
+
+                    {/* Linha 3 — origem: fornecedor | SKU | link */}
+                    <div className="mt-3 grid grid-cols-3 gap-3 border-t border-line/60 pt-3 text-[11.5px]">
+                      <div>
+                        <div className="text-faint">Fornecedor</div>
+                        <input defaultValue={it.nome_fornecedor || ""}
+                          onBlur={(e) => salvarItem(it.id, { nome_fornecedor: e.target.value })}
+                          placeholder="—"
+                          className="mt-0.5 w-full rounded bg-paper px-1.5 py-0.5 text-ink outline-none placeholder:text-faint focus:ring-1 focus:ring-kist" />
+                      </div>
+                      <div>
+                        <div className="text-faint">SKU / referência</div>
+                        <input defaultValue={it.sku_fornecedor || ""}
+                          onBlur={(e) => salvarItem(it.id, { sku_fornecedor: e.target.value })}
+                          placeholder="—"
+                          className="mt-0.5 w-full rounded bg-paper px-1.5 py-0.5 font-mono text-ink outline-none placeholder:text-faint focus:ring-1 focus:ring-kist" />
+                      </div>
+                      <div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-faint">Link / origem</span>
+                          {isUrl && <a href={link} target="_blank" rel="noreferrer" className="text-[10.5px] font-medium text-kist hover:underline">abrir ↗</a>}
+                        </div>
+                        <div className="flex items-center gap-1">
+                          {isUrl && <IconLink size={11} className="shrink-0 text-kist" />}
+                          <input defaultValue={link || ""}
+                            onBlur={(e) => salvarItem(it.id, { link_fornecedor: e.target.value })}
+                            placeholder="URL ou texto"
+                            className="mt-0.5 min-w-0 flex-1 rounded bg-paper px-1.5 py-0.5 text-sub outline-none placeholder:text-faint focus:ring-1 focus:ring-kist" />
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Linha 4 — compra: pedido | prazo | rastreio */}
+                    <div className="mt-3 grid grid-cols-3 gap-3 border-t border-line/60 pt-3 text-[11.5px]">
+                      <div>
+                        <div className="text-faint">Pedido forn.</div>
+                        <input defaultValue={it.numero_pedido_fornecedor || ""}
+                          onBlur={(e) => salvarItem(it.id, { numero_pedido_fornecedor: e.target.value })}
+                          placeholder="nº do pedido"
+                          className="mt-0.5 w-full rounded bg-paper px-1.5 py-0.5 font-mono text-ink outline-none placeholder:text-faint focus:ring-1 focus:ring-kist" />
+                      </div>
+                      <div>
+                        <div className="text-faint">Prazo entrega</div>
+                        <input defaultValue={it.prazo_entrega || ""}
+                          onBlur={(e) => salvarItem(it.id, { prazo_entrega: e.target.value })}
+                          placeholder="ex: 15 dias"
+                          className="mt-0.5 w-full rounded bg-paper px-1.5 py-0.5 text-ink outline-none placeholder:text-faint focus:ring-1 focus:ring-kist" />
+                      </div>
+                      <div>
+                        <div className="text-faint">Rastreio</div>
+                        <div className="mt-0.5 flex items-center gap-1">
+                          <input defaultValue={it.rastreio || ""}
+                            onBlur={(e) => salvarItem(it.id, { rastreio: e.target.value })}
+                            placeholder="código de rastreio"
+                            className="min-w-0 flex-1 rounded bg-paper px-1.5 py-0.5 font-mono text-ink outline-none placeholder:text-faint focus:ring-1 focus:ring-kist" />
+                          {it.rastreio && (
+                            <button onClick={() => { try { navigator.clipboard?.writeText(it.rastreio); } catch (e) {} }}
+                              className="shrink-0 rounded px-1 py-0.5 text-faint hover:text-kist" title="copiar rastreio">
+                              <IconCopy size={13} />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Pagamento */}
+                    <PagamentoItem it={it} cartoes={cartoes}
+                      onSalvar={(campos) => salvarItem(it.id, campos)}
+                      onAprenderCartao={aprenderCartao} />
+                  </div>
+                );
+              })}
+              {itens.length === 0 && <div className="py-10 text-center text-[13px] text-faint">Sem itens.</div>}
             </div>
-            <div className="mt-0.5 font-mono text-[10.5px] text-faint">{totCusto > 0 ? `${margem.toFixed(0)}% margem` : "custo pendente"}</div>
-          </div>
+          )}
         </div>
 
-        {/* Fretes & imposto */}
-        <div className="border-b border-line bg-paper/50 px-4 py-3">
-          <div className="flex flex-wrap items-end gap-x-4 gap-y-2">
+        {/* ── Sidebar financeira (sticky) ───────────────────────────────── */}
+        <div className="w-72 shrink-0 self-start border-l border-line bg-paper/50 px-5 py-6" style={{ position: "sticky", top: "49px" }}>
+
+          {/* Resumo financeiro */}
+          <div className="space-y-2.5">
+            <div className="flex items-baseline justify-between">
+              <span className="text-[11px] text-faint">Venda</span>
+              <span className="font-mono text-[14px] font-semibold text-ink">R$ {brl(totVenda)}</span>
+            </div>
+            <div className="flex items-baseline justify-between">
+              <span className="text-[11px] text-faint">Custo produtos</span>
+              <span className="font-mono text-[13px] text-sub">R$ {brl(totCusto)}</span>
+            </div>
+            <div className="flex items-baseline justify-between">
+              <span className="text-[11px] text-faint">Frete de vinda</span>
+              <span className="font-mono text-[13px] text-sub">R$ {brl(freteVindaEfetivo)}</span>
+            </div>
+            {freteIdaNum > 0 && (
+              <div className="flex items-baseline justify-between">
+                <span className="text-[11px] text-faint">Frete de ida</span>
+                <span className="font-mono text-[13px] text-sub">R$ {brl(freteIdaNum)}</span>
+              </div>
+            )}
+            <div className="flex items-baseline justify-between border-t border-line pt-2">
+              <span className="text-[11px] font-medium text-sub">Lucro bruto</span>
+              <span className={`font-mono text-[13px] font-semibold ${totLucro >= 0 ? "text-signal" : "text-rose"}`}>
+                R$ {brl(totLucro)}
+              </span>
+            </div>
+            {totCusto > 0 && (
+              <div className="flex items-center justify-end">
+                <span className="rounded-md bg-paper px-1.5 py-0.5 text-[10.5px] font-semibold text-sub ring-1 ring-line">
+                  {margem.toFixed(0)}% margem
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* Fretes & imposto */}
+          <div className="mt-5 space-y-3 border-t border-line pt-5">
             <label className="block">
               <div className="text-[10px] uppercase eyebrow text-faint">Frete vinda (R$)</div>
               <input type="number" step="0.01"
@@ -776,16 +947,17 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
                 disabled={somaVindaItens > 0}
                 onChange={(e) => setFreteVindaGlobal(parseFloat(e.target.value) || 0)}
                 onBlur={() => somaVindaItens === 0 && salvarOC({ frete_vinda_global: parseFloat(freteVindaGlobal) || 0 })}
-                className={`mt-0.5 w-24 rounded border border-line2 px-1.5 py-1 text-right font-mono text-[12px] outline-none focus:ring-1 focus:ring-kist ${somaVindaItens > 0 ? "bg-line text-faint" : "bg-surface text-ink"}`} />
+                className={`mt-1 w-full rounded border border-line2 px-2.5 py-1.5 text-right font-mono text-[12px] outline-none focus:ring-1 focus:ring-kist ${somaVindaItens > 0 ? "bg-line text-faint" : "bg-surface text-ink"}`} />
+              {somaVindaItens > 0 && <div className="mt-1 text-[10px] text-faint">Somado dos itens. Zere os itens para lançar valor global.</div>}
             </label>
             <label className="block">
               <div className="text-[10px] uppercase eyebrow text-faint">Frete ida (R$)</div>
               <input type="number" step="0.01" value={freteIda}
                 onChange={(e) => setFreteIda(e.target.value)}
                 onBlur={() => salvarOC({ frete_ida: parseFloat(freteIda) || 0 })}
-                className="mt-0.5 w-24 rounded border border-line2 bg-surface px-1.5 py-1 text-right font-mono text-[12px] text-ink outline-none focus:ring-1 focus:ring-kist" />
+                className="mt-1 w-full rounded border border-line2 bg-surface px-2.5 py-1.5 text-right font-mono text-[12px] text-ink outline-none focus:ring-1 focus:ring-kist" />
             </label>
-            <label className="flex cursor-pointer items-center gap-1.5 pb-1 text-[11.5px] text-sub">
+            <label className="flex cursor-pointer items-center gap-2 text-[11.5px] text-sub">
               <input type="checkbox" checked={idaCobrado}
                 onChange={(e) => { setIdaCobrado(e.target.checked); salvarOC({ frete_ida_cobrado: e.target.checked }); }}
                 className="accent-kist" />
@@ -796,196 +968,51 @@ function SlideOver({ oc, token, onClose, onChanged, onDeleted }) {
               <input type="number" step="0.1" value={imposto}
                 onChange={(e) => setImposto(e.target.value)}
                 onBlur={() => salvarOC({ imposto_percent: parseFloat(imposto) || 0 })}
-                className="mt-0.5 w-16 rounded border border-line2 bg-surface px-1.5 py-1 text-right font-mono text-[12px] text-ink outline-none focus:ring-1 focus:ring-kist" />
+                className="mt-1 w-full rounded border border-line2 bg-surface px-2.5 py-1.5 text-right font-mono text-[12px] text-ink outline-none focus:ring-1 focus:ring-kist" />
             </label>
           </div>
-          {somaVindaItens > 0 && (
-            <div className="mt-1.5 text-[10px] text-faint">Frete de vinda somado dos itens. Zere os itens para lançar um valor global.</div>
-          )}
-          {/* Nota · imposto · lucro líquido */}
-          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-surface px-3 py-2">
-            <div className="flex gap-4 text-[11.5px] text-sub">
-              <span>Nota <span className="font-mono text-ink">R$ {brl(nota)}</span></span>
-              <span>Imposto <span className="font-mono text-rose">− R$ {brl(impostoValor)}</span></span>
+
+          {/* Lucro líquido */}
+          <div className="mt-5 space-y-1.5 border-t border-line pt-5">
+            <div className="flex items-baseline justify-between text-[11.5px] text-sub">
+              <span>Nota</span>
+              <span className="font-mono">R$ {brl(nota)}</span>
             </div>
-            <div className="flex items-baseline gap-2">
+            <div className="flex items-baseline justify-between text-[11.5px] text-sub">
+              <span>Imposto</span>
+              <span className="font-mono text-rose">− R$ {brl(impostoValor)}</span>
+            </div>
+            <div className="flex items-baseline justify-between pt-1">
               <span className="text-[11px] uppercase eyebrow text-faint">Lucro líquido</span>
-              <span className={`font-mono text-[16px] font-semibold ${lucroLiquido >= 0 ? "text-signal" : "text-rose"}`}>R$ {brl(lucroLiquido)}</span>
+              <span className={`font-mono text-[18px] font-semibold ${lucroLiquido >= 0 ? "text-signal" : "text-rose"}`}>
+                R$ {brl(lucroLiquido)}
+              </span>
             </div>
           </div>
-        </div>
 
-        {/* Itens */}
-        <div className="flex-1 overflow-auto px-5 py-4">
-          <div className="mb-2 flex items-center justify-between">
-            <Eyebrow>Itens · custo & origem</Eyebrow>
-          </div>
-
-          {loading ? (
-            <div className="py-6 text-center text-[12.5px] text-faint">Carregando itens…</div>
-          ) : (
-            <div className="space-y-2">
-              {itens.map((it) => {
-                const link = it.link_fornecedor;
-                const isUrl = typeof link === "string" && /^https?:\/\//i.test(link);
-                return (
-                  <div key={it.id} className="rounded-xl border border-line p-3">
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="text-[12.5px] font-medium leading-snug text-ink">{it.descricao}</div>
-                      <select value={it.status_item || "pendente"}
-                        onChange={(e) => salvarItem(it.id, { status_item: e.target.value })}
-                        className={`flex-shrink-0 rounded-md border border-line2 bg-surface px-1.5 py-0.5 text-[10.5px] font-medium outline-none
-                          ${it.status_item === "entregue" ? "text-signal" : it.status_item === "comprado" ? "text-kist" : "text-sub"}`}>
-                        <option value="pendente">pendente</option>
-                        <option value="comprado">comprado</option>
-                        <option value="entregue_parcial">entr. parcial</option>
-                        <option value="entregue">entregue</option>
-                      </select>
-                    </div>
-
-                    <div className="mt-2 grid grid-cols-3 gap-2 text-[11px]">
-                      <div>
-                        <div className="text-faint">Qtd</div>
-                        <div className="font-mono text-ink">{it.quantidade_comprar ?? it.quantidade_proposta} {it.unidade}</div>
-                      </div>
-                      <div>
-                        <div className="text-faint">Custo un.</div>
-                        <div className="flex items-center gap-0.5">
-                          <span className="text-faint">R$</span>
-                          <input type="number" step="0.001" defaultValue={it.preco_custo || ""}
-                            onBlur={(e) => salvarItem(it.id, { preco_custo: parseFloat(e.target.value) || 0 })}
-                            placeholder="—"
-                            className="w-16 rounded bg-paper px-1 py-0.5 text-right font-mono text-ink outline-none focus:bg-white focus:ring-1 focus:ring-kist" />
-                        </div>
-                      </div>
-                      <div>
-                        <div className="text-faint">Venda un.</div>
-                        <div className="font-mono text-ink">R$ {brl(it.preco_venda)}</div>
-                      </div>
-                    </div>
-
-                    {/* Frete de vinda deste item (opcional) — soma no frete da OC */}
-                    <div className="mt-2 flex items-center gap-1.5 text-[11px]">
-                      <span className="text-faint">Frete vinda (item)</span>
-                      <span className="text-faint">R$</span>
-                      <input type="number" step="0.01" defaultValue={it.frete_vinda || ""}
-                        onBlur={(e) => salvarItem(it.id, { frete_vinda: parseFloat(e.target.value) || 0 })}
-                        placeholder="—"
-                        className="w-16 rounded bg-paper px-1 py-0.5 text-right font-mono text-ink outline-none focus:bg-white focus:ring-1 focus:ring-kist" />
-                      <span className="text-faint/70">soma no frete de vinda da OC</span>
-                    </div>
-
-                    {/* Lucro bruto do item — unitário e total (venda − custo) */}
-                    {(() => {
-                      const qd = it.quantidade_comprar ?? it.quantidade_proposta ?? 0;
-                      const lucroUn = (it.preco_venda || 0) - (it.preco_custo || 0);
-                      const lucroItem = lucroUn * qd;
-                      const cor = lucroUn >= 0 ? "text-signal" : "text-rose";
-                      return (
-                        <div className="mt-2 flex items-center justify-between rounded-lg bg-paper px-2.5 py-1.5 text-[11px]">
-                          <span className="text-faint">Lucro bruto un. <span className={`font-mono font-medium ${cor}`}>R$ {brl(lucroUn)}</span></span>
-                          <span className="text-faint">Lucro bruto item <span className={`font-mono font-semibold ${cor}`}>R$ {brl(lucroItem)}</span></span>
-                        </div>
-                      );
-                    })()}
-
-                    {/* Origem do preço — herdada da proposta */}
-                    <div className="mt-2 border-t border-line/70 pt-2">
-                      <div className="flex items-center gap-1.5">
-                        {isUrl ? <IconLink size={12} className="flex-shrink-0 text-kist" />
-                               : <span className="eyebrow flex-shrink-0 text-[9px] font-bold uppercase text-faint">Origem</span>}
-                        <input defaultValue={link || ""}
-                          onBlur={(e) => salvarItem(it.id, { link_fornecedor: e.target.value })}
-                          placeholder="link ou texto da origem do preço"
-                          className="min-w-0 flex-1 bg-transparent text-[11.5px] text-sub outline-none placeholder:text-faint" />
-                      </div>
-                      <div className="mt-1 flex items-center gap-2">
-                        <input defaultValue={it.nome_fornecedor || ""}
-                          onBlur={(e) => salvarItem(it.id, { nome_fornecedor: e.target.value })}
-                          placeholder="fornecedor"
-                          className="flex-1 bg-transparent text-[11.5px] text-sub outline-none placeholder:text-faint" />
-                        {isUrl && (
-                          <a href={link} target="_blank" rel="noreferrer" className="text-[11px] font-medium text-kist hover:underline">abrir ↗</a>
-                        )}
-                      </div>
-                    </div>
-
-                    {/* Compra & entrega — preenchidos quando o item é comprado */}
-                    <div className="mt-2 grid grid-cols-2 gap-x-2 gap-y-1.5 border-t border-line/70 pt-2 text-[11px]">
-                      <label className="block">
-                        <div className="text-faint">Pedido forn.</div>
-                        <input defaultValue={it.numero_pedido_fornecedor || ""}
-                          onBlur={(e) => salvarItem(it.id, { numero_pedido_fornecedor: e.target.value })}
-                          placeholder="nº do pedido"
-                          className="w-full rounded bg-paper px-1.5 py-1 font-mono text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
-                      </label>
-                      <label className="block">
-                        <div className="text-faint">Prazo entrega</div>
-                        <input defaultValue={it.prazo_entrega || ""}
-                          onBlur={(e) => salvarItem(it.id, { prazo_entrega: e.target.value })}
-                          placeholder="ex: 15 dias"
-                          className="w-full rounded bg-paper px-1.5 py-1 text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
-                      </label>
-                      <label className="col-span-2 block">
-                        <div className="text-faint">Rastreio</div>
-                        <div className="flex items-center gap-1.5">
-                          <input defaultValue={it.rastreio || ""}
-                            onBlur={(e) => salvarItem(it.id, { rastreio: e.target.value })}
-                            placeholder="código de rastreio da transportadora"
-                            className="min-w-0 flex-1 rounded bg-paper px-1.5 py-1 font-mono text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
-                          {it.rastreio && (
-                            <button onClick={() => { try { navigator.clipboard?.writeText(it.rastreio); } catch (e) {} }}
-                              className="flex-shrink-0 rounded px-1.5 py-1 text-faint hover:text-kist" title="copiar rastreio">
-                              <IconCopy size={13} />
-                            </button>
-                          )}
-                        </div>
-                      </label>
-                    </div>
-
-                    {/* Forma de pagamento (opcional) — alimenta o contas a pagar */}
-                    <PagamentoItem it={it} cartoes={cartoes}
-                      onSalvar={(campos) => salvarItem(it.id, campos)}
-                      onAprenderCartao={aprenderCartao} />
-                  </div>
-                );
-              })}
-              {itens.length === 0 && <div className="py-6 text-center text-[12.5px] text-faint">Sem itens.</div>}
-            </div>
-          )}
-        </div>
-
-        {/* Rodapé — ações + exclusão */}
-        {confirmDel ? (
-          <div className="border-t border-rose/30 bg-rosebg px-5 py-3">
-            <div className="text-[12.5px] font-medium text-rose">Excluir {oc.id} e seus {itens.length} itens?</div>
-            <div className="mt-0.5 text-[11.5px] text-rose/80">Ação permanente. Para apenas tirar do quadro, arquive em vez de excluir.</div>
-            <div className="mt-2.5 flex items-center gap-2">
-              <button onClick={() => setConfirmDel(false)} className={`${btnGhost} flex-1 justify-center`}>Cancelar</button>
-              <button onClick={excluirOC}
-                className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-rose px-3.5 py-2 text-[13px] font-medium text-white transition-colors hover:brightness-95">
-                <IconTrash size={14} /> Excluir definitivamente
+          {/* Excluir */}
+          <div className="mt-6 border-t border-line pt-5">
+            {confirmDel ? (
+              <div>
+                <div className="text-[12px] font-medium text-rose">Excluir {oc.id} e seus {itens.length} itens?</div>
+                <div className="mt-0.5 text-[11px] text-rose/80">Ação permanente.</div>
+                <div className="mt-3 flex gap-2">
+                  <button onClick={() => setConfirmDel(false)} className={`${btnGhost} flex-1 justify-center text-[12px]`}>Cancelar</button>
+                  <button onClick={excluirOC}
+                    className="flex flex-1 items-center justify-center gap-1 rounded-lg bg-rose px-3 py-1.5 text-[12px] font-medium text-white hover:brightness-95">
+                    <IconTrash size={13} /> Excluir
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button onClick={() => setConfirmDel(true)}
+                className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-line2 px-3 py-2 text-[12px] text-faint transition-colors hover:border-rose/40 hover:bg-rosebg hover:text-rose">
+                <IconTrash size={13} /> Excluir OC
               </button>
-            </div>
+            )}
           </div>
-        ) : (
-          <div className="flex items-center gap-2 border-t border-line px-5 py-3">
-            <button onClick={() => setConfirmDel(true)} title="Excluir OC"
-              className="inline-flex items-center justify-center rounded-lg border border-line2 px-2.5 py-2 text-faint transition-colors hover:border-rose/40 hover:bg-rosebg hover:text-rose">
-              <IconTrash size={15} />
-            </button>
-            <button onClick={abrirTodosLinks} title="Abrir todos os links de compra"
-              className="inline-flex items-center justify-center rounded-lg border border-line2 px-2.5 py-2 text-faint transition-colors hover:border-kist/40 hover:bg-kist/5 hover:text-kist">
-              <IconLink size={15} />
-            </button>
-            <button onClick={imprimirOC} className={`${btnGhost} flex-1 justify-center`}><IconDownload size={14} /> Exportar / PDF</button>
-            <button onClick={() => mudarStatus("confirmada")} className={`${btnPrimary} flex-1 justify-center`}>
-              <IconCheck size={14} /> Confirmar OC
-            </button>
-          </div>
-        )}
+        </div>
       </div>
-    </div>,
-    document.body
+    </div>
   );
 }
