@@ -804,7 +804,9 @@ async def atualizar_origem_item(
 # Casar PO do cliente com proposta salva (matcher) — reusa leitura .msg/PDF + Claude
 # ============================================================================
 SYSTEM_PO = """Você recebe o texto de uma ORDEM DE COMPRA (PO) enviada por um cliente.
-Extraia em JSON PURO (sem markdown, sem ``` ): 
+O texto pode incluir tabelas no formato "Coluna1 | Coluna2 | ..." — use essas tabelas como fonte principal.
+A coluna "Qnt" ou "Quantidade" é a quantidade do item. Dimensões na descrição (ex: "430MM X 240MM X 300MM") NÃO são quantidade.
+Extraia em JSON PURO (sem markdown, sem ``` ):
 {"itens":[{"descricao":"...","quantidade":0,"preco_unitario":0}],"destino":"endereço/cidade-UF de entrega ou ''"}
 quantidade e preco_unitario são números (ponto decimal). Sem preço -> 0. Não invente itens. Só o JSON."""
 
@@ -814,10 +816,29 @@ Extraia em JSON PURO (sem markdown, sem ``` ):
 Números com ponto decimal. Sem dado -> "" ou 0. Não invente itens. Só o JSON."""
 
 def _pdf_po_texto(data):
+    """Extrai texto de PDF de PO preservando estrutura de tabelas.
+    Usa extract_tables() primeiro para manter colunas (Qnt separada da Descrição),
+    depois extract_text() para conteúdo fora de tabelas (cabeçalhos, rodapés).
+    Resolve o bug de quantidade=1 causado pelo extract_text() que misturava
+    a coluna Qnt dentro da string de descrição."""
     try:
         import pdfplumber, io as _io
+        partes = []
         with pdfplumber.open(_io.BytesIO(data)) as pdf:
-            return "".join((p.extract_text() or "") + "\n" for p in pdf.pages)
+            for page in pdf.pages:
+                # 1. Tabelas: renderiza como linhas pipe-separadas (preserva colunas)
+                for table in (page.extract_tables() or []):
+                    rows = []
+                    for row in (table or []):
+                        cells = [str(c or "").replace("\n", " ").strip() for c in row]
+                        rows.append(" | ".join(cells))
+                    if rows:
+                        partes.append("\n".join(rows))
+                # 2. Texto livre (info fora de tabelas: assunto, observações etc.)
+                txt = (page.extract_text() or "").strip()
+                if txt:
+                    partes.append(txt)
+        return "\n\n".join(partes)
     except Exception:
         return ""
 
