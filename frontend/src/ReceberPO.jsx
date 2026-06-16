@@ -11,11 +11,13 @@ export default function ReceberPO({ token, usuario, onCriarOC, onClose }) {
   const [loading, setLoading] = useState(false);
   const [erro, setErro] = useState("");
   const [res, setRes] = useState(null);
+  // Multi-proposta: Set de IDs selecionados
+  const [selecionadas, setSelecionadas] = useState(new Set());
   const poRef = useRef(null);
   const tinyRef = useRef(null);
 
   async function buscar() {
-    setErro(""); setRes(null);
+    setErro(""); setRes(null); setSelecionadas(new Set());
     if (!poFile && !texto.trim()) { setErro("Anexe a PO do cliente (obrigatória) ou cole o texto."); return; }
     setLoading(true);
     try {
@@ -37,7 +39,7 @@ export default function ReceberPO({ token, usuario, onCriarOC, onClose }) {
     descricao_final: i.descricao,
     quantidade: Number(i.quantidade) || 1,
     unidade: i.unidade || "UN",
-    preco_venda: Number(i.preco_venda) || 0,   // preço da PO, preservado
+    preco_venda: Number(i.preco_venda) || 0,
     preco_custo: Number(i.preco_custo) || 0,
     frete_vinda: Number(i.frete_vinda) || 0,
     fornecedor: i.fornecedor || null,
@@ -45,14 +47,20 @@ export default function ReceberPO({ token, usuario, onCriarOC, onClose }) {
     sku_fornecedor: i.sku_fornecedor || null,
   }));
 
-  // UF de destino = última sigla de estado que aparecer no texto do destino
   function ufFromDestino(d) {
     const m = (d || "").toUpperCase().match(/\b(AC|AL|AP|AM|BA|CE|DF|ES|GO|MA|MT|MS|MG|PA|PB|PR|PE|PI|RJ|RN|RS|RO|RR|SC|SP|SE|TO)\b/g);
     return m ? m[m.length - 1] : "";
   }
 
+  function toggleSelecionada(id) {
+    setSelecionadas(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
   function gerarDaProposta(c) {
-    // OC = itens da PO + dados de compra emprestados desta proposta
     const prop = { ...c.proposta, cnpj: c.proposta?.cnpj || res.cnpj_cliente || "", uf: ufFromDestino(res.destino) };
     onCriarOC(prop, ocItensDe(c.itens_oc), res.po_numero || "");
     onClose();
@@ -65,6 +73,42 @@ export default function ReceberPO({ token, usuario, onCriarOC, onClose }) {
     onCriarOC(proposta, ocItensDe(res.itens_po), res.po_numero || "");
     onClose();
   }
+
+  // Combina itens de múltiplas propostas selecionadas:
+  // Para cada posição i da PO, usa o primeiro match encontrado entre as candidatas
+  // selecionadas (já ordenadas por score). Fallback: item enriquecido do banco histórico.
+  function gerarCombinada() {
+    const candidatasSel = (res.candidatas || []).filter(c => selecionadas.has(c.proposta.id));
+    if (!candidatasSel.length) return;
+
+    const nItens = (res.itens_po || []).length;
+    const itensComb = [];
+
+    for (let i = 0; i < nItens; i++) {
+      // Procura match entre as candidatas selecionadas (ordem = score)
+      let itemFinal = null;
+      for (const cand of candidatasSel) {
+        const oc = (cand.itens_oc || [])[i];
+        if (oc && oc.match_proposta) { itemFinal = oc; break; }
+      }
+      // Fallback: item enriquecido pelo banco histórico
+      if (!itemFinal) itemFinal = (res.itens_po || [])[i] || {};
+      itensComb.push(itemFinal);
+    }
+
+    // Proposta de referência = candidata de maior score entre as selecionadas
+    const propRef = candidatasSel[0].proposta;
+    const prop = {
+      ...propRef,
+      cliente: propRef.cliente || (res.cnpj_cliente ? `Cliente ${res.cnpj_cliente}` : "Cliente (PO)"),
+      cnpj: propRef.cnpj || res.cnpj_cliente || "",
+      uf: ufFromDestino(res.destino),
+    };
+    onCriarOC(prop, ocItensDe(itensComb), res.po_numero || "");
+    onClose();
+  }
+
+  const numSelecionadas = selecionadas.size;
 
   const Slot = ({ titulo, sub, file, setFile, inputRef, accept, obrig }) => (
     <div
@@ -104,13 +148,14 @@ export default function ReceberPO({ token, usuario, onCriarOC, onClose }) {
             <button onClick={buscar} disabled={loading} className={`${btnPrimary} ${loading ? "opacity-60" : ""}`}>
               <IconSearch size={15} /> {loading ? "Procurando…" : "Localizar proposta"}
             </button>
-            {(poFile || tinyFile) && <button onClick={() => { setPoFile(null); setTinyFile(null); setTexto(""); setRes(null); }} className="text-[12px] text-faint hover:text-ink">limpar</button>}
+            {(poFile || tinyFile) && <button onClick={() => { setPoFile(null); setTinyFile(null); setTexto(""); setRes(null); setSelecionadas(new Set()); }} className="text-[12px] text-faint hover:text-ink">limpar</button>}
           </div>
 
           {erro && <div className="mt-3 rounded-lg border border-rose/30 bg-rosebg px-3 py-2 text-[13px] text-rose">{erro}</div>}
 
           {res && (
             <div className="mt-4 space-y-4">
+              {/* Resumo da PO */}
               <div className="rounded-xl border border-line bg-surface p-4">
                 <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[12.5px]">
                   <span className="text-faint">PO <span className="font-mono text-ink">{res.po_numero || "—"}</span></span>
@@ -126,33 +171,91 @@ export default function ReceberPO({ token, usuario, onCriarOC, onClose }) {
                         <span className="min-w-0 flex-1 truncate text-sub">{it.descricao}</span>
                         <span className="font-mono text-faint">{it.quantidade}x</span>
                         <span className="font-mono text-ink">R$ {brl(it.preco_unitario)}</span>
-                        {it.match_banco && <span className="text-[10px] font-semibold text-signal" title="mesmo item confirmado (preço/descrição batem) — custo e origem preenchidos">✓ mesmo item</span>}
+                        {it.match_banco && <span className="text-[10px] font-semibold text-signal" title="mesmo item confirmado — custo e origem preenchidos">✓ mesmo item</span>}
                       </div>
                     ))}
                   </div>
                 )}
               </div>
 
+              {/* Candidatas */}
               {(res.candidatas || []).length > 0 ? (
                 <div>
-                  <div className="mb-2 text-[11px] uppercase eyebrow text-faint">Propostas do cliente na base ({res.candidatas.length}) — melhor casamento primeiro</div>
-                  <div className="space-y-2">
-                    {res.candidatas.map((c, i) => (
-                      <div key={c.proposta.id} className={`rounded-xl border bg-surface p-3.5 ${i === 0 ? "border-kist/40" : "border-line"}`}>
-                        <div className="flex items-center justify-between gap-3">
-                          <div className="min-w-0">
-                            <div className="truncate text-[13.5px] font-medium text-ink">{c.proposta.cliente}</div>
-                            <div className="mt-0.5 text-[11.5px] text-faint">
-                              proposta <span className="font-mono">{c.proposta.numero_proposta || "—"}</span>
-                              {" · "}{(c.itens_oc || []).filter((x) => x.match_proposta).length}/{(res.itens_po || []).length} itens com dados de compra
-                              {i === 0 && c.score > 0 && <span className="ml-2 font-semibold text-signal">melhor casamento</span>}
-                            </div>
-                          </div>
-                          <button onClick={() => gerarDaProposta(c)} className={`${btnPrimary} flex-shrink-0`}><IconCheck size={14} /> Gerar OC</button>
-                        </div>
-                      </div>
-                    ))}
+                  <div className="mb-2 flex items-center justify-between">
+                    <div className="text-[11px] uppercase eyebrow text-faint">
+                      Propostas do cliente na base ({res.candidatas.length}) — melhor casamento primeiro
+                    </div>
+                    {numSelecionadas > 0 && (
+                      <span className="text-[11px] text-sub">
+                        {numSelecionadas} selecionada{numSelecionadas > 1 ? "s" : ""}
+                      </span>
+                    )}
                   </div>
+                  <div className="space-y-2">
+                    {res.candidatas.map((c, i) => {
+                      const sel = selecionadas.has(c.proposta.id);
+                      return (
+                        <div key={c.proposta.id}
+                          className={`rounded-xl border bg-surface p-3.5 transition-colors ${sel ? "border-kist bg-kist/5" : i === 0 ? "border-kist/30" : "border-line"}`}>
+                          <div className="flex items-center gap-3">
+                            {/* Checkbox multi-proposta */}
+                            <button
+                              onClick={() => toggleSelecionada(c.proposta.id)}
+                              className={`flex h-5 w-5 flex-shrink-0 items-center justify-center rounded border-2 transition-colors
+                                ${sel ? "border-kist bg-kist text-white" : "border-line2 hover:border-kist/60"}`}
+                              title={sel ? "Desmarcar" : "Selecionar para OC combinada"}
+                            >
+                              {sel && <IconCheck size={11} />}
+                            </button>
+                            <div className="min-w-0 flex-1">
+                              <div className="truncate text-[13.5px] font-medium text-ink">{c.proposta.cliente}</div>
+                              <div className="mt-0.5 text-[11.5px] text-faint">
+                                proposta <span className="font-mono">{c.proposta.numero_proposta || "—"}</span>
+                                {" · "}{(c.itens_oc || []).filter((x) => x.match_proposta).length}/{(res.itens_po || []).length} itens com dados de compra
+                                {i === 0 && c.score > 0 && <span className="ml-2 font-semibold text-signal">melhor casamento</span>}
+                              </div>
+                            </div>
+                            {/* Gerar OC desta proposta individualmente */}
+                            <button
+                              onClick={() => gerarDaProposta(c)}
+                              className={`${btnGhost} flex-shrink-0 text-[12px]`}
+                              title="Gerar OC só desta proposta"
+                            >
+                              <IconCheck size={13} /> Gerar OC
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Botão de OC combinada — aparece quando 2+ selecionadas */}
+                  {numSelecionadas >= 2 && (
+                    <div className="mt-3 rounded-xl border border-kist/30 bg-kist/5 p-3.5">
+                      <div className="mb-2 text-[12.5px] font-medium text-ink">
+                        OC combinada — itens das {numSelecionadas} propostas selecionadas
+                      </div>
+                      <p className="mb-3 text-[11.5px] text-sub">
+                        Para cada item da PO, o sistema usa os dados de compra da proposta que melhor casa.
+                        Itens sem match em nenhuma proposta ficam com custo em branco para preenchimento manual.
+                      </p>
+                      <button onClick={gerarCombinada} className={btnPrimary}>
+                        <IconCheck size={14} /> Gerar OC combinada ({numSelecionadas} propostas)
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Dica quando 1 selecionada */}
+                  {numSelecionadas === 1 && (
+                    <p className="mt-2 text-[11px] text-faint">
+                      Selecione mais propostas para gerar uma OC combinada com itens de múltiplas cotações.
+                    </p>
+                  )}
+                  {numSelecionadas === 0 && (
+                    <p className="mt-2 text-[11px] text-faint">
+                      Use os checkboxes para selecionar propostas ou clique em "Gerar OC" diretamente.
+                    </p>
+                  )}
                 </div>
               ) : (
                 <div className="rounded-xl border border-amber/30 bg-amber/5 p-4">
