@@ -816,119 +816,31 @@ Extraia em JSON PURO (sem markdown, sem ``` ):
 Números com ponto decimal. Sem dado -> "" ou 0. Não invente itens. Só o JSON."""
 
 def _pdf_po_texto(data):
-    """Extrai texto de PDF de PO.
-    - Sempre inclui página 1 (CNPJ, número da PO).
-    - Para PDFs com padrão 'Item:NNNNN' (Embraer/SAP): inclui APENAS as páginas
-      que contêm itens, descartando as páginas de T&C (que corrompiam a extração
-      e lotavam o contexto antes dos itens chegarem ao modelo).
-    - Para outros PDFs: comportamento original (extract_tables + extract_text).
-    """
+    """Extrai texto de PDF de PO preservando estrutura de tabelas.
+    Usa extract_tables() primeiro para manter colunas (Qnt separada da Descrição),
+    depois extract_text() para conteúdo fora de tabelas (cabeçalhos, rodapés).
+    Resolve o bug de quantidade=1 causado pelo extract_text() que misturava
+    a coluna Qnt dentro da string de descrição."""
     try:
         import pdfplumber, io as _io
         partes = []
         with pdfplumber.open(_io.BytesIO(data)) as pdf:
-            textos_paginas = []
             for page in pdf.pages:
+                # 1. Tabelas: renderiza como linhas pipe-separadas (preserva colunas)
+                for table in (page.extract_tables() or []):
+                    rows = []
+                    for row in (table or []):
+                        cells = [str(c or "").replace("\n", " ").strip() for c in row]
+                        rows.append(" | ".join(cells))
+                    if rows:
+                        partes.append("\n".join(rows))
+                # 2. Texto livre (info fora de tabelas: assunto, observações etc.)
                 txt = (page.extract_text() or "").strip()
-                textos_paginas.append(txt)
-
-            # Detectar se é formato com Item:NNNNN (Embraer/SAP/similares)
-            tem_item_nnnnn = any(re.search(r'\bItem:\d{5}', t) for t in textos_paginas)
-
-            if tem_item_nnnnn:
-                # Modo filtrado: página 1 (cabeçalho/CNPJ) + páginas com itens reais
-                for i, txt in enumerate(textos_paginas):
-                    if i == 0 or re.search(r'\bItem:\d{5}', txt):
-                        if txt:
-                            partes.append(txt)
-            else:
-                # Modo original: extract_tables + extract_text de todas as páginas
-                for page in pdf.pages:
-                    for table in (page.extract_tables() or []):
-                        rows = []
-                        for row in (table or []):
-                            cells = [str(c or "").replace("\n", " ").strip() for c in row]
-                            rows.append(" | ".join(cells))
-                        if rows:
-                            partes.append("\n".join(rows))
-                    txt = (page.extract_text() or "").strip()
-                    if txt:
-                        partes.append(txt)
-
+                if txt:
+                    partes.append(txt)
         return "\n\n".join(partes)
     except Exception:
         return ""
-
-
-def _parsear_itens_po_nativo(texto):
-    """Parser direto para POs no formato Item:NNNNN (Embraer, SAP e similares).
-    Extrai itens sem depender da IA, contornando o problema de texto concatenado
-    sem espaços que o pdfplumber produz nesse layout.
-    Retorna lista de itens ou None se padrão não detectado.
-    """
-    if not re.search(r'\bItem:\d{5}', texto):
-        return None
-
-    itens = []
-    blocos = re.split(r'(?=\bItem:\d{5}\b)', texto)
-    skip_prefixes = ("Quantidade", "Utilização", "GPX", "Item:", "Assinado", "ValorTotal")
-
-    for bloco in blocos:
-        if not re.match(r'\s*Item:\d{5}', bloco):
-            continue
-        linhas = [l.strip() for l in bloco.split("\n") if l.strip()]
-        if not linhas:
-            continue
-
-        linha1 = linhas[0]
-
-        # PN do item
-        pn = ""
-        pn_m = re.search(r'\bPN:(\S+)', linha1)
-        if pn_m:
-            pn = pn_m.group(1).rstrip("-/")
-
-        # Denominação (pode vir sem espaços — usada como fallback)
-        den = ""
-        den_m = re.search(r'Denominação:(.+)$', linha1, re.I)
-        if den_m:
-            den = den_m.group(1).strip()
-
-        # Linha de dados: DATA QTD UNID PREÇO  ex: "15.JUL.2026 9 UM 175,45 Não ..."
-        qtd, preco = 1, 0.0
-        for linha in linhas[1:5]:
-            m = re.match(r'\d{2}\.\w{3,4}\.\d{4}\s+(\d+)\s+\w+\s+([\d.]+,\d{2})', linha)
-            if m:
-                qtd = int(m.group(1))
-                try:
-                    preco = float(m.group(2).replace(".", "").replace(",", "."))
-                except Exception:
-                    pass
-                break
-
-        # Linha de complemento: texto em maiúsculas com espaços (a parte legível da descrição)
-        complemento = ""
-        for linha in linhas[2:7]:
-            if any(linha.startswith(p) for p in skip_prefixes):
-                continue
-            if re.match(r'\d{2}\.\w{3,4}\.\d{4}', linha):
-                continue
-            if re.match(r'^[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ0-9/,.+ ()*\-]+$', linha) and len(linha) > 3:
-                complemento = linha
-                break
-
-        # Descrição final: preferir complemento (legível) + PN; cair no den se necessário
-        if complemento:
-            descricao = f"{complemento} PN:{pn}" if pn else complemento
-        elif den:
-            descricao = f"{den} PN:{pn}" if pn else den
-        else:
-            descricao = f"PN:{pn}" if pn else ""
-
-        if descricao:
-            itens.append({"descricao": descricao, "quantidade": qtd, "preco_unitario": preco})
-
-    return itens if itens else None
 
 async def _ler_po(arquivo):
     nome = (arquivo.filename or "").lower()
@@ -1115,33 +1027,23 @@ async def casar_po(
     po_num = pos[0].strip() if pos else ""
 
     itens_po, destino = [], ""
-    # Tenta parser nativo primeiro (PDFs no formato Item:NNNNN — Embraer/SAP/similares)
-    # Evita o problema de texto concatenado sem espaços que confunde a IA
-    itens_nativo = _parsear_itens_po_nativo(conteudo)
-    if itens_nativo:
-        itens_po = itens_nativo
-        # Destino ainda vai pela IA (ou regex rápido abaixo)
-        dest_m = re.search(r'SHIP\s+TO[:\s]+(.+?)(?=\n\n|\Z)', conteudo, re.I | re.S)
-        if dest_m:
-            destino = " ".join(dest_m.group(1).split())[:120]
-    else:
-        try:
-            import json
-            claude = get_claude()
-            r = claude.messages.create(
-                model="claude-haiku-4-5-20251001", max_tokens=2000,
-                system=SYSTEM_PO,
-                messages=[{"role": "user", "content": conteudo[:8000]}],
-            )
-            t = "".join(b.text for b in r.content if getattr(b, "type", "") == "text").strip()
-            t = t.strip("`")
-            if t.lower().startswith("json"):
-                t = t[4:]
-            data = json.loads(t)
-            itens_po = data.get("itens", []) or []
-            destino = data.get("destino", "") or ""
-        except Exception:
-            pass
+    try:
+        import json
+        claude = get_claude()
+        r = claude.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=2000,
+            system=SYSTEM_PO,
+            messages=[{"role": "user", "content": conteudo[:8000]}],
+        )
+        t = "".join(b.text for b in r.content if getattr(b, "type", "") == "text").strip()
+        t = t.strip("`")
+        if t.lower().startswith("json"):
+            t = t[4:]
+        data = json.loads(t)
+        itens_po = data.get("itens", []) or []
+        destino = data.get("destino", "") or ""
+    except Exception:
+        pass
 
     # Proposta do Tiny (opcional) — pra povoar a base quando a proposta não existe
     prop_tiny = None
@@ -1178,12 +1080,9 @@ async def casar_po(
     KIST_CNPJ = "10573732000396"
     cnpj_cliente = next((c for c in cnpjs_dig if len(c) == 14 and c != KIST_CNPJ), "")
 
-    # Deduplicar CNPJs (PDFs multi-página repetem o mesmo CNPJ em cada cabeçalho)
-    cnpjs_uniq = list(dict.fromkeys(cnpjs))
-
     return {
         "po_numero": po_num,
-        "cnpjs": cnpjs_uniq,
+        "cnpjs": cnpjs,
         "cnpj_cliente": cnpj_cliente,
         "destino": destino,
         "itens_po": _enriquecer_itens_po(itens_po),   # itens da PO já enriquecidos pelo histórico
@@ -1368,17 +1267,43 @@ async def excluir_oc(oc_id: int, usuario: str = Depends(verificar_token)):
 async def atualizar_item_oc(
     item_id: int, payload: dict, usuario: str = Depends(verificar_token)
 ):
-    """Atualiza campos de um item de OC (preço custo, pagamento, rastreio etc)"""
+    """Atualiza campos de um item de OC"""
     sb = get_supabase()
     campos = {}
-    for f in ["quantidade_comprar","preco_custo","frete_vinda","nome_fornecedor","link_fornecedor",
-              "sku_fornecedor","forma_pagamento","numero_parcelas","data_vencimento",
-              "final_cartao","status_pagamento","status_item","numero_pedido_fornecedor",
+    for f in ["descricao","unidade","quantidade_comprar","preco_venda","preco_custo",
+              "frete_vinda","nome_fornecedor","link_fornecedor","sku_fornecedor",
+              "forma_pagamento","numero_parcelas","data_vencimento","final_cartao",
+              "status_pagamento","status_item","numero_pedido_fornecedor",
               "prazo_entrega","rastreio","obs"]:
         if f in payload:
             campos[f] = payload[f]
+    if not campos:
+        return {"ok": True}
     sb.table("oc_itens").update(campos).eq("id", item_id).execute()
     return {"ok": True}
+
+
+@app.post("/oc-itens")
+async def adicionar_item_oc(payload: dict, usuario: str = Depends(verificar_token)):
+    """Adiciona um novo item a uma OC existente"""
+    sb = get_supabase()
+    oc_id = payload.get("oc_id")
+    if not oc_id:
+        raise HTTPException(status_code=400, detail="oc_id obrigatorio")
+    row = {
+        "oc_id": oc_id,
+        "descricao": payload.get("descricao") or "",
+        "unidade": payload.get("unidade") or "UN",
+        "quantidade_proposta": float(payload.get("quantidade") or 1),
+        "quantidade_comprar": float(payload.get("quantidade") or 1),
+        "preco_venda": float(payload.get("preco_venda") or 0),
+        "preco_custo": float(payload.get("preco_custo") or 0),
+        "frete_vinda": 0.0,
+        "status_item": "pendente",
+    }
+    res = sb.table("oc_itens").insert(row).execute()
+    novo = res.data[0] if res.data else row
+    return novo
 
 
 @app.get("/cartoes")

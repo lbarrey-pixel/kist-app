@@ -6,15 +6,22 @@ const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
 export default function ReceberPO({ token, usuario, onCriarOC, onClose }) {
   const [poFile, setPoFile] = useState(null);
-  const [tinyFile, setTinyFile] = useState(null);
+  const [tinyFiles, setTinyFiles] = useState([]);   // lista — suporta múltiplas propostas
   const [texto, setTexto] = useState("");
   const [loading, setLoading] = useState(false);
   const [erro, setErro] = useState("");
   const [res, setRes] = useState(null);
-  // Multi-proposta: Set de IDs selecionados
   const [selecionadas, setSelecionadas] = useState(new Set());
   const poRef = useRef(null);
   const tinyRef = useRef(null);
+
+  function addTinyFile(f) {
+    if (!f) return;
+    setTinyFiles(prev => prev.find(x => x.name === f.name) ? prev : [...prev, f]);
+  }
+  function removeTinyFile(idx) {
+    setTinyFiles(prev => prev.filter((_, i) => i !== idx));
+  }
 
   async function buscar() {
     setErro(""); setRes(null); setSelecionadas(new Set());
@@ -24,7 +31,7 @@ export default function ReceberPO({ token, usuario, onCriarOC, onClose }) {
       const fd = new FormData();
       if (poFile) fd.append("arquivo", poFile);
       else if (texto.trim()) fd.append("texto", texto.trim());
-      if (tinyFile) fd.append("proposta_tiny", tinyFile);
+      tinyFiles.forEach(f => fd.append("proposta_tiny", f));
       const r = await fetch(`${API}/casar-po`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: fd });
       const data = await r.json();
       if (data.erro) setErro(data.erro);
@@ -137,7 +144,36 @@ export default function ReceberPO({ token, usuario, onCriarOC, onClose }) {
         <div className="px-5 py-4">
           <div className="grid grid-cols-2 gap-3">
             <Slot titulo="PO do cliente" sub="e-mail .msg ou .pdf" file={poFile} setFile={setPoFile} inputRef={poRef} accept=".msg,.pdf" obrig />
-            <Slot titulo="Proposta do Tiny" sub="opcional · ajuda a localizar" file={tinyFile} setFile={setTinyFile} inputRef={tinyRef} accept=".msg,.pdf" />
+            {/* Slot de proposta(s) do Tiny — suporta múltiplas */}
+            <div>
+              <div
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => { e.preventDefault(); addTinyFile(e.dataTransfer.files?.[0]); }}
+                onClick={() => tinyRef.current?.click()}
+                className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-4 py-4 text-center transition-colors ${tinyFiles.length ? "border-signal/50 bg-signal/5" : "border-line2 bg-surface hover:border-kist/50"}`}>
+                {tinyFiles.length
+                  ? <IconCheck size={18} className="text-signal" />
+                  : <IconSearch size={18} className="text-faint" />}
+                <div className="mt-1.5 text-[12.5px] font-medium text-ink">
+                  Proposta(s) do Tiny
+                  {tinyFiles.length > 0 && <span className="ml-1.5 rounded-full bg-kist/10 px-1.5 py-0.5 text-[10px] font-semibold text-kist">{tinyFiles.length}</span>}
+                </div>
+                <div className="mt-0.5 text-[11px] text-faint">opcional · clique ou arraste para adicionar</div>
+                <input ref={tinyRef} type="file" accept=".msg,.pdf" className="hidden"
+                  onChange={(e) => { addTinyFile(e.target.files?.[0]); e.target.value = ""; }} />
+              </div>
+              {/* Lista dos arquivos adicionados */}
+              {tinyFiles.length > 0 && (
+                <div className="mt-1.5 space-y-1">
+                  {tinyFiles.map((f, idx) => (
+                    <div key={idx} className="flex items-center gap-1.5 rounded-lg bg-surface px-2 py-1">
+                      <span className="min-w-0 flex-1 truncate text-[11px] text-sub">{f.name}</span>
+                      <button onClick={() => removeTinyFile(idx)} className="flex-shrink-0 text-faint hover:text-rose"><IconX size={11} /></button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
           {!poFile && (
             <textarea value={texto} onChange={(e) => setTexto(e.target.value)} rows={2}
@@ -148,7 +184,7 @@ export default function ReceberPO({ token, usuario, onCriarOC, onClose }) {
             <button onClick={buscar} disabled={loading} className={`${btnPrimary} ${loading ? "opacity-60" : ""}`}>
               <IconSearch size={15} /> {loading ? "Procurando…" : "Localizar proposta"}
             </button>
-            {(poFile || tinyFile) && <button onClick={() => { setPoFile(null); setTinyFile(null); setTexto(""); setRes(null); setSelecionadas(new Set()); }} className="text-[12px] text-faint hover:text-ink">limpar</button>}
+            {(poFile || tinyFiles.length > 0) && <button onClick={() => { setPoFile(null); setTinyFiles([]); setTexto(""); setRes(null); setSelecionadas(new Set()); }} className="text-[12px] text-faint hover:text-ink">limpar</button>}
           </div>
 
           {erro && <div className="mt-3 rounded-lg border border-rose/30 bg-rosebg px-3 py-2 text-[13px] text-rose">{erro}</div>}
@@ -261,8 +297,8 @@ export default function ReceberPO({ token, usuario, onCriarOC, onClose }) {
                 <div className="rounded-xl border border-amber/30 bg-amber/5 p-4">
                   <div className="text-[13px] font-medium text-ink">Nenhuma proposta na base para esse cliente.</div>
                   <p className="mt-1 text-[12px] text-sub">
-                    {tinyFile ? "Mesmo com a proposta do Tiny, não achei nada conclusivo. " : "Não achei proposta com esse CNPJ. "}
-                    {!tinyFile && "Anexe a proposta do Tiny acima e tente de novo, ou "}gere a OC com os dados da PO — os itens que reconheci no histórico já vêm preenchidos.
+                    {tinyFiles.length ? "Mesmo com a(s) proposta(s) do Tiny, não achei nada conclusivo. " : "Não achei proposta com esse CNPJ. "}
+                    {!tinyFiles.length && "Anexe a proposta do Tiny acima e tente de novo, ou "}gere a OC com os dados da PO — os itens que reconheci no histórico já vêm preenchidos.
                   </p>
                   <div className="mt-2 text-[11px] text-faint">
                     {(res.itens_po || []).filter((i) => i.match_banco).length} de {(res.itens_po || []).length} itens reconhecidos no banco (custo/link/fornecedor preenchidos).

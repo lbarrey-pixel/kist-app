@@ -528,6 +528,7 @@ function OCDetalhe({ oc, token, onClose, onChanged, onDeleted }) {
   const [imposto, setImposto] = useState(oc.imposto_percent ?? 12);
   const [confirmDel, setConfirmDel] = useState(false);
   const [cartoes, setCartoes] = useState({});
+  const [novoItem, setNovoItem] = useState(null); // null = oculto; {} = formulário aberto
 
   useEffect(() => {
     setLoading(true);
@@ -589,6 +590,32 @@ function OCDetalhe({ oc, token, onClose, onChanged, onDeleted }) {
     setItens((prev) => prev.map((i) => (i.id === itemId ? { ...i, ...campos } : i)));
     try {
       await fetch(`${API}/oc-itens/${itemId}`, { method: "PUT", headers: jsonHeaders(), body: JSON.stringify(campos) });
+    } catch (e) {}
+  }
+  async function adicionarItem() {
+    const desc = (novoItem?.descricao || "").trim();
+    if (!desc) return;
+    try {
+      const r = await fetch(`${API}/oc-itens`, {
+        method: "POST", headers: jsonHeaders(),
+        body: JSON.stringify({
+          oc_id: ocId,
+          descricao: desc,
+          unidade: novoItem?.unidade || "UN",
+          quantidade: parseFloat(novoItem?.quantidade) || 1,
+          preco_venda: parseFloat(novoItem?.preco_venda) || 0,
+          preco_custo: parseFloat(novoItem?.preco_custo) || 0,
+        }),
+      });
+      const novo = await r.json();
+      setItens((prev) => [...prev, novo]);
+      setNovoItem(null);
+    } catch (e) {}
+  }
+  async function excluirItem(itemId) {
+    setItens((prev) => prev.filter((i) => i.id !== itemId));
+    try {
+      await fetch(`${API}/oc-itens/${itemId}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } });
     } catch (e) {}
   }
   async function excluirOC() {
@@ -752,6 +779,11 @@ function OCDetalhe({ oc, token, onClose, onChanged, onDeleted }) {
         <div className="min-w-0 flex-1 px-8 py-6">
           <div className="mb-4 flex items-center justify-between">
             <Eyebrow>Itens · {itens.length} produto{itens.length !== 1 ? "s" : ""}</Eyebrow>
+            <button
+              onClick={() => setNovoItem({ descricao: "", unidade: "UN", quantidade: "1", preco_venda: "", preco_custo: "" })}
+              className="inline-flex items-center gap-1 rounded-lg border border-line2 px-2.5 py-1 text-[12px] text-sub hover:border-kist/40 hover:text-kist">
+              + Adicionar item
+            </button>
           </div>
 
           {loading ? (
@@ -770,24 +802,40 @@ function OCDetalhe({ oc, token, onClose, onChanged, onDeleted }) {
 
                     {/* Linha 1 — descrição + status */}
                     <div className="flex items-start justify-between gap-4">
-                      <div className="text-[13.5px] font-medium leading-snug text-ink">{it.descricao}</div>
-                      <select value={it.status_item || "pendente"}
-                        onChange={(e) => salvarItem(it.id, { status_item: e.target.value })}
-                        className={`shrink-0 rounded-md border border-line2 bg-paper px-2 py-0.5 text-[11px] font-medium outline-none focus:ring-1 focus:ring-kist
-                          ${it.status_item === "entregue" ? "text-signal" : it.status_item === "comprado" ? "text-kist" : "text-sub"}`}>
-                        <option value="pendente">pendente</option>
-                        <option value="comprado">comprado</option>
-                        <option value="entregue_parcial">entr. parcial</option>
-                        <option value="entregue">entregue</option>
-                      </select>
+                      <textarea defaultValue={it.descricao}
+                        onBlur={(e) => { const v = e.target.value.trim(); if (v !== it.descricao) salvarItem(it.id, { descricao: v }); }}
+                        rows={2}
+                        className="flex-1 resize-none rounded bg-paper px-1.5 py-0.5 text-[13.5px] font-medium leading-snug text-ink outline-none placeholder:text-faint focus:ring-1 focus:ring-kist" />
+                      <div className="flex shrink-0 flex-col items-end gap-1">
+                        <select value={it.status_item || "pendente"}
+                          onChange={(e) => salvarItem(it.id, { status_item: e.target.value })}
+                          className={`rounded-md border border-line2 bg-paper px-2 py-0.5 text-[11px] font-medium outline-none focus:ring-1 focus:ring-kist
+                            ${it.status_item === "entregue" ? "text-signal" : it.status_item === "comprado" ? "text-kist" : "text-sub"}`}>
+                          <option value="pendente">pendente</option>
+                          <option value="comprado">comprado</option>
+                          <option value="entregue_parcial">entr. parcial</option>
+                          <option value="entregue">entregue</option>
+                        </select>
+                        <button onClick={() => excluirItem(it.id)}
+                          className="text-[10.5px] text-faint/60 hover:text-rose" title="Excluir item">
+                          × excluir
+                        </button>
+                      </div>
                     </div>
 
                     {/* Linha 2 — números: qtd | custo | venda | frete | lucro */}
                     <div className="mt-3 grid grid-cols-5 gap-3 border-t border-line/60 pt-3 text-[11.5px]">
-                      {/* Qtd */}
+                      {/* Qtd + Unidade */}
                       <div>
                         <div className="text-faint">Qtd</div>
-                        <div className="mt-0.5 font-mono text-ink">{qd} <span className="text-faint">{it.unidade}</span></div>
+                        <div className="mt-0.5 flex items-center gap-1">
+                          <input type="number" step="1" min="0" defaultValue={qd}
+                            onBlur={(e) => { const v = parseFloat(e.target.value) || 0; if (v !== qd) salvarItem(it.id, { quantidade_comprar: v }); }}
+                            className="w-14 rounded bg-paper px-1 py-0.5 text-right font-mono text-ink outline-none focus:ring-1 focus:ring-kist" />
+                          <input defaultValue={it.unidade || "UN"}
+                            onBlur={(e) => { const v = e.target.value.trim() || "UN"; if (v !== it.unidade) salvarItem(it.id, { unidade: v }); }}
+                            className="w-12 rounded bg-paper px-1 py-0.5 font-mono text-[11px] text-faint outline-none focus:ring-1 focus:ring-kist" />
+                        </div>
                       </div>
                       {/* Custo un */}
                       <div>
@@ -803,7 +851,13 @@ function OCDetalhe({ oc, token, onClose, onChanged, onDeleted }) {
                       {/* Venda un */}
                       <div>
                         <div className="text-faint">Venda un.</div>
-                        <div className="mt-0.5 font-mono text-ink">R$ {brl(it.preco_venda)}</div>
+                        <div className="mt-0.5 flex items-center gap-0.5">
+                          <span className="text-faint">R$</span>
+                          <input type="number" step="0.01" defaultValue={it.preco_venda || ""}
+                            onBlur={(e) => { const v = parseFloat(e.target.value) || 0; if (v !== it.preco_venda) salvarItem(it.id, { preco_venda: v }); }}
+                            placeholder="—"
+                            className="w-20 rounded bg-paper px-1 py-0.5 text-right font-mono text-ink outline-none focus:bg-white focus:ring-1 focus:ring-kist" />
+                        </div>
                       </div>
                       {/* Frete vinda */}
                       <div>
@@ -895,7 +949,57 @@ function OCDetalhe({ oc, token, onClose, onChanged, onDeleted }) {
                   </div>
                 );
               })}
-              {itens.length === 0 && <div className="py-10 text-center text-[13px] text-faint">Sem itens.</div>}
+              {itens.length === 0 && !novoItem && <div className="py-10 text-center text-[13px] text-faint">Sem itens.</div>}
+
+              {/* Formulário de novo item */}
+              {novoItem && (
+                <div className="rounded-xl border-2 border-dashed border-kist/30 bg-kist/3 p-4">
+                  <div className="mb-3 text-[12px] font-semibold text-sub">Novo item</div>
+                  <div className="space-y-2">
+                    <textarea
+                      value={novoItem.descricao}
+                      onChange={(e) => setNovoItem((p) => ({ ...p, descricao: e.target.value }))}
+                      placeholder="Descrição do item *"
+                      rows={2}
+                      className="w-full resize-none rounded-lg border border-line2 bg-paper px-3 py-2 text-[13px] text-ink outline-none focus:ring-1 focus:ring-kist placeholder:text-faint" />
+                    <div className="grid grid-cols-4 gap-2">
+                      <div>
+                        <div className="text-[10px] text-faint">Qtd</div>
+                        <input type="number" min="0" step="1" value={novoItem.quantidade}
+                          onChange={(e) => setNovoItem((p) => ({ ...p, quantidade: e.target.value }))}
+                          className="mt-0.5 w-full rounded border border-line2 bg-paper px-2 py-1 text-right font-mono text-[12px] text-ink outline-none focus:ring-1 focus:ring-kist" />
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-faint">Unidade</div>
+                        <input value={novoItem.unidade}
+                          onChange={(e) => setNovoItem((p) => ({ ...p, unidade: e.target.value.toUpperCase() }))}
+                          className="mt-0.5 w-full rounded border border-line2 bg-paper px-2 py-1 font-mono text-[12px] text-ink outline-none focus:ring-1 focus:ring-kist" />
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-faint">Venda un. (R$)</div>
+                        <input type="number" step="0.01" value={novoItem.preco_venda}
+                          onChange={(e) => setNovoItem((p) => ({ ...p, preco_venda: e.target.value }))}
+                          placeholder="0,00"
+                          className="mt-0.5 w-full rounded border border-line2 bg-paper px-2 py-1 text-right font-mono text-[12px] text-ink outline-none focus:ring-1 focus:ring-kist" />
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-faint">Custo un. (R$)</div>
+                        <input type="number" step="0.01" value={novoItem.preco_custo}
+                          onChange={(e) => setNovoItem((p) => ({ ...p, preco_custo: e.target.value }))}
+                          placeholder="0,00"
+                          className="mt-0.5 w-full rounded border border-line2 bg-paper px-2 py-1 text-right font-mono text-[12px] text-ink outline-none focus:ring-1 focus:ring-kist" />
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 pt-1">
+                      <button onClick={adicionarItem} disabled={!novoItem.descricao.trim()}
+                        className={`${btnPrimary} ${!novoItem.descricao.trim() ? "opacity-50" : ""}`}>
+                        <IconCheck size={14} /> Adicionar
+                      </button>
+                      <button onClick={() => setNovoItem(null)} className={btnGhost}>Cancelar</button>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </div>
