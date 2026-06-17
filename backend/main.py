@@ -957,9 +957,17 @@ def _parsear_itens_convergint(texto):
         re.MULTILINE
     )
 
+    # Remove NCM da descrição — capturado porque fica entre descrição e data no PDF.
+    # Trata NCMs limpos (8536.90.90) e garbled (PR8A5T3A6.90.90).
+    _NCM_TRAIL  = re.compile(r'\s+\S*\.\d{2}\.\d{2}\S*$')
+    _PREP_TRAIL = re.compile(r'\s+(?:DE|DO|DA|DOS|DAS|EM|NO|NA|E|A|O|,)\s*$', re.I)
+    def _limpar_desc(d):
+        d = _NCM_TRAIL.sub('', d).strip()
+        return _PREP_TRAIL.sub('', d).strip()
+
     itens = []
     for m in ITEM_PAT.finditer(texto):
-        desc  = m.group(3).strip()
+        desc  = _limpar_desc(m.group(3).strip())
         qtd   = _parse_numero(m.group(4))
         preco = _parse_numero(m.group(5))
         total = _parse_numero(m.group(6))
