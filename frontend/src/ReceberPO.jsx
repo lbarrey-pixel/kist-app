@@ -189,6 +189,16 @@ export default function ReceberPO({ token, usuario, onCriarOC, onClose }) {
 
           {erro && <div className="mt-3 rounded-lg border border-rose/30 bg-rosebg px-3 py-2 text-[13px] text-rose">{erro}</div>}
 
+          {/* Avisos de validação cruzada (subtotal/contagem diverge) */}
+          {res && (res.avisos || []).length > 0 && (
+            <div className="mt-3 rounded-lg border border-amber/40 bg-amber/5 px-3 py-2 text-[12.5px] text-amber-700">
+              <span className="font-semibold">⚠ Validação — verifique os itens antes de gerar a OC:</span>
+              <ul className="mt-1 list-disc pl-4">
+                {res.avisos.map((a, i) => <li key={i}>{a}</li>)}
+              </ul>
+            </div>
+          )}
+
           {res && (
             <div className="mt-4 space-y-4">
               {/* Resumo da PO */}

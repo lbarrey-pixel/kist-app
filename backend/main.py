@@ -805,7 +805,7 @@ async def atualizar_origem_item(
 # ============================================================================
 SYSTEM_PO = """Você recebe o texto de uma ORDEM DE COMPRA (PO) enviada por um cliente.
 O texto pode incluir tabelas no formato "Coluna1 | Coluna2 | ..." — use essas tabelas como fonte principal.
-A coluna "Qnt" ou "Quantidade" é a quantidade do item. Dimensões na descrição (ex: "430MM X 240MM X 300MM") NÃO são quantidade.
+A coluna "Qnt", "Quantidade", "QTDE" ou "Qty" é a quantidade do item. Dimensões na descrição (ex: "430MM X 240MM X 300MM") NÃO são quantidade.
 Extraia em JSON PURO (sem markdown, sem ``` ):
 {"itens":[{"descricao":"...","quantidade":0,"preco_unitario":0}],"destino":"endereço/cidade-UF de entrega ou ''"}
 quantidade e preco_unitario são números (ponto decimal). Sem preço -> 0. Não invente itens. Só o JSON."""
@@ -839,6 +839,11 @@ def _pdf_po_texto(data):
             with pdfplumber.open(_io.BytesIO(data)) as pdf:
                 for page in pdf.pages:
                     for table in (page.extract_tables() or []):
+                        # Pular tabelas header-only (1 linha) — a IA usaria
+                        # a tabela vazia como "fonte principal" e ignoraria
+                        # o extract_text onde os itens realmente estão
+                        if len(table or []) <= 1:
+                            continue
                         rows = []
                         for row in (table or []):
                             cells = [str(c or "").replace("\n", " ").strip() for c in row]
@@ -854,12 +859,126 @@ def _pdf_po_texto(data):
         return ""
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# EXTRAÇÃO DE PO — Arquitetura em 3 camadas:
+#   1. Parser determinístico (regex com âncoras confiáveis, sem IA)
+#   2. Validação cruzada independente (subtotal PDF × soma dos itens)
+#   3. IA como fallback + revalidação
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _parse_numero(s):
+    """Converte número do PDF para float detectando o formato separador.
+    - '6.00' ou '11.00'  → ponto decimal (Anglo/SAP) → float direto
+    - '59,60'            → vírgula decimal (BR)
+    - '1.234,56'         → ponto milhar + vírgula decimal (BR extenso)
+    """
+    s = re.sub(r'[^\d.,]', '', s or '')
+    if not s:
+        return 0.0
+    if '.' in s and ',' in s:
+        return float(s.replace('.', '').replace(',', '.'))
+    elif ',' in s:
+        return float(s.replace(',', '.'))
+    else:
+        return float(s)
+
+
+def _extrair_validacao_po(texto):
+    """Extrai dados de validação INDEPENDENTES do corpo do PDF
+    (subtotal, valor total, n° de itens). Usados para checar qualquer
+    método de extração sem se basear nos itens em si."""
+    dados = {}
+    m = re.search(r'[Ss]ubtotal\s+R\$\s*([\d.]+,\d{2})', texto)
+    if m:
+        dados['subtotal'] = _parse_numero(m.group(1))
+    m = re.search(r'[Vv]alor\s+[Tt]otal[:\s]+R\$\s*([\d.]+,\d{2})', texto)
+    if m:
+        dados['valor_total'] = _parse_numero(m.group(1))
+    # "Total dos itens 479,78" (formato proposta Kist/Tiny)
+    m = re.search(r'[Tt]otal\s+dos\s+itens\s+([\d.,]+)', texto)
+    if m and 'subtotal' not in dados:
+        dados['subtotal'] = _parse_numero(m.group(1))
+    # "Número de itens: N"
+    m = re.search(r'[Nn][uú]mero\s+de\s+itens[:\s]+(\d+)', texto)
+    if m:
+        dados['n_itens'] = int(m.group(1))
+    return dados
+
+
+def _validar_itens_po(itens, dados_val):
+    """Valida itens extraídos contra os totais independentes do PDF.
+    Retorna (ok: bool, avisos: list[str]).
+    - Subtotal: soma(qtde × preco) deve bater com o subtotal do PDF (tol. R$1)
+    - Contagem: n° itens deve bater com 'Número de itens' do PDF (se presente)
+    """
+    if not itens:
+        return False, ['nenhum item extraído']
+    avisos = []
+    sub_calc = sum(_parse_numero(str(i.get('quantidade', 0))) *
+                   _parse_numero(str(i.get('preco_unitario', 0))) for i in itens)
+    if 'subtotal' in dados_val and dados_val['subtotal'] > 0:
+        diff = abs(sub_calc - dados_val['subtotal'])
+        if diff > 1.0:
+            avisos.append(
+                f"subtotal diverge: calculado R${sub_calc:.2f} "
+                f"≠ PDF R${dados_val['subtotal']:.2f} (Δ R${diff:.2f})"
+            )
+    if 'n_itens' in dados_val and len(itens) != dados_val['n_itens']:
+        avisos.append(
+            f"contagem diverge: extraídos {len(itens)} "
+            f"≠ PDF {dados_val['n_itens']} itens"
+        )
+    return len(avisos) == 0, avisos
+
+
+def _parsear_itens_convergint(texto):
+    """Parser determinístico para POs no formato Convergint / SAP Business One.
+    Âncora principal: data DD/MM/YYYY divide descrição dos dados numéricos.
+    Cada linha de item tem: SEQ SKU DESCRIÇÃO DATA [UNID] QTDE R$ PREÇO R$ TOTAL
+
+    Detectado por: presença de 'DD/MM/YYYY' + 'R$ X,XX  R$ X,XX' em linhas de item.
+    Validação item-a-item: QTDE × PREÇO ≈ TOTAL (tolerância R$0,02/unidade).
+    """
+    if not re.search(
+        r'^\s*\d+\s+\S+\s.+\d{2}/\d{2}/\d{4}.+R\$\s*[\d.]+,\d{2}\s+R\$',
+        texto, re.M
+    ):
+        return None
+
+    ITEM_PAT = re.compile(
+        r'^\s*(\d+)\s+'          # seq
+        r'(\S+)\s+'               # SKU
+        r'(.+?)\s+'                # descrição (lazy, não cruza linha)
+        r'\d{2}/\d{2}/\d{4}\s+' # data (âncora, consumida)
+        r'(?:[A-Za-zÀ-ÿ]{1,4}\s+)?' # unidade opcional (UN/un/PC/m…)
+        r'(\d+[.,]\d{1,3})\s+'   # quantidade
+        r'R\$\s*([\d.]+,\d{2})\s+' # preço unitário
+        r'R\$\s*([\d.]+,\d{2})', # valor total
+        re.MULTILINE
+    )
+
+    itens = []
+    for m in ITEM_PAT.finditer(texto):
+        desc  = m.group(3).strip()
+        qtd   = _parse_numero(m.group(4))
+        preco = _parse_numero(m.group(5))
+        total = _parse_numero(m.group(6))
+
+        # Validação item: qtde × preço ≈ total (tol. 2 cents por unidade)
+        esperado = round(qtd * preco, 2)
+        preco_ok = abs(esperado - total) <= max(0.02 * max(1, qtd), 0.05)
+        itens.append({
+            'descricao':    desc,
+            'quantidade':   qtd,
+            'preco_unitario': preco if preco_ok else 0.0,
+        })
+
+    return itens if itens else None
+
+
 def _parsear_itens_po_nativo(texto):
     """Parser direto para POs no formato Item:NNNNN (Embraer, SAP e similares).
-    Extrai itens sem depender da IA, contornando o problema de texto concatenado
-    sem espaços que o pdfplumber produz nesse layout.
-    Retorna lista de itens ou None se padrão não detectado.
-    """
+    Retorna lista de itens ou None se padrão não detectado."""
     if not re.search(r'\bItem:\d{5}', texto):
         return None
 
@@ -873,18 +992,15 @@ def _parsear_itens_po_nativo(texto):
         linhas = [l.strip() for l in bloco.split("\n") if l.strip()]
         if not linhas:
             continue
-
         linha1 = linhas[0]
         pn = ""
         pn_m = re.search(r'\bPN:(\S+)', linha1)
         if pn_m:
             pn = pn_m.group(1).rstrip("-/")
-
         den = ""
         den_m = re.search(r'Denomina\w+:(.+)$', linha1, re.I)
         if den_m:
             den = den_m.group(1).strip()
-
         qtd, preco = 1, 0.0
         for linha in linhas[1:5]:
             m = re.match(r'\d{2}\.\w{3,4}\.\d{4}\s+(\d+)\s+\w+\s+([\d.]+,\d{2})', linha)
@@ -895,7 +1011,6 @@ def _parsear_itens_po_nativo(texto):
                 except Exception:
                     pass
                 break
-
         complemento = ""
         for linha in linhas[2:7]:
             if any(linha.startswith(p) for p in skip_prefixes):
@@ -905,18 +1020,22 @@ def _parsear_itens_po_nativo(texto):
             if re.match(r'^[A-Z\xC0-\xFF0-9/,.+ ()*\-]+$', linha) and len(linha) > 3:
                 complemento = linha
                 break
-
         if complemento:
             descricao = f"{complemento} PN:{pn}" if pn else complemento
         elif den:
             descricao = f"{den} PN:{pn}" if pn else den
         else:
             descricao = f"PN:{pn}" if pn else ""
-
         if descricao:
             itens.append({"descricao": descricao, "quantidade": qtd, "preco_unitario": preco})
 
     return itens if itens else None
+
+# PDFs irrelevantes em emails de PO (políticas, T&Cs, etc.)
+_PDF_SKIP = re.compile(
+    r'politic|policy|pagamento|payment|entrega|delivery|termo|term|condi',
+    re.I
+)
 
 async def _ler_po(arquivo):
     nome = (arquivo.filename or "").lower()
@@ -925,12 +1044,20 @@ async def _ler_po(arquivo):
         with open("/tmp/po_upload.msg", "wb") as f:
             f.write(dados)
         msg = extract_msg.openMsg("/tmp/po_upload.msg")
-        texto = f"Assunto: {msg.subject}\n\n{(msg.body or '').strip()}"
+
+        # PDFs relevantes primeiro — body depois (body é conversa, PDF tem os dados da PO)
+        # Pula PDFs de política/T&C que inflam o conteúdo sem agregar nada útil
+        pdfs_txt = []
         for att in msg.attachments:
             fn = (att.longFilename or att.shortFilename or "").lower()
-            if att.data and fn.endswith(".pdf"):
-                texto += "\n\n[ANEXO PDF]\n" + _pdf_po_texto(att.data)
-        return texto
+            if att.data and fn.endswith(".pdf") and not _PDF_SKIP.search(fn):
+                t = _pdf_po_texto(att.data)
+                if t.strip():
+                    pdfs_txt.append(t)
+
+        corpo = f"Assunto: {msg.subject}\n\n{(msg.body or '').strip()}"
+        partes = pdfs_txt + [corpo]
+        return "\n\n[---]\n\n".join(p for p in partes if p.strip())
     if nome.endswith(".pdf"):
         return _pdf_po_texto(dados)
     try:
@@ -1103,30 +1230,65 @@ async def casar_po(
     pos = re.findall(r"PO[-\s]?\d{5,}", conteudo, re.I)
     po_num = pos[0].strip() if pos else ""
 
+    import json as _json_po
     itens_po, destino = [], ""
-    # Tenta parser nativo primeiro (PDFs no formato Item:NNNNN — Embraer/SAP/similares)
-    itens_nativo = _parsear_itens_po_nativo(conteudo)
-    if itens_nativo:
-        itens_po = itens_nativo
-        dest_m = re.search(r'SHIP\s+TO[:\s]+(.+?)(?=\n\n|\Z)', conteudo, re.I | re.S)
-        if dest_m:
-            destino = " ".join(dest_m.group(1).split())[:120]
-    else:
+    avisos_extracao: list[str] = []
+
+    # ── Extrai dados de validação independentes (subtotal, n° itens) ─────────
+    dados_val = _extrair_validacao_po(conteudo)
+
+    # ── Camada 1: parser determinístico Embraer/SAP (Item:NNNNN) ─────────────
+    _candidato = _parsear_itens_po_nativo(conteudo)
+    if _candidato:
+        ok, av = _validar_itens_po(_candidato, dados_val)
+        if ok:
+            itens_po = _candidato
+            dest_m = re.search(r'SHIP\s+TO[:\s]+(.+?)(?=\n\n|\Z)', conteudo, re.I | re.S)
+            if dest_m:
+                destino = " ".join(dest_m.group(1).split())[:120]
+        else:
+            avisos_extracao.extend([f"[parser Embraer] {a}" for a in av])
+            itens_po = _candidato  # parser determinístico tem precedência mesmo com aviso
+
+    # ── Camada 2: parser determinístico Convergint/SAP-BO (data-anchored) ────
+    if not itens_po:
+        _candidato = _parsear_itens_convergint(conteudo)
+        if _candidato:
+            ok, av = _validar_itens_po(_candidato, dados_val)
+            if ok:
+                itens_po = _candidato
+            else:
+                avisos_extracao.extend([f"[parser Convergint] {a}" for a in av])
+                itens_po = _candidato  # usar mesmo assim; aviso fica registrado
+
+    # ── Camada 3: IA como fallback universal ──────────────────────────────────
+    if not itens_po:
         try:
-            import json
+            # Enriquece o prompt com os dados de validação como dica para a IA
+            hint = ""
+            if dados_val.get("subtotal"):
+                hint = f"\n\n[VALIDAÇÃO] Subtotal esperado: R$ {dados_val['subtotal']:.2f}"
+                if dados_val.get("n_itens"):
+                    hint += f" | {dados_val['n_itens']} itens."
             claude = get_claude()
             r = claude.messages.create(
                 model="claude-haiku-4-5-20251001", max_tokens=2000,
                 system=SYSTEM_PO,
-                messages=[{"role": "user", "content": conteudo[:8000]}],
+                messages=[{"role": "user", "content": conteudo[:12000] + hint}],
             )
             t = "".join(b.text for b in r.content if getattr(b, "type", "") == "text").strip()
             t = t.strip("`")
             if t.lower().startswith("json"):
                 t = t[4:]
-            data = json.loads(t)
-            itens_po = data.get("itens", []) or []
-            destino = data.get("destino", "") or ""
+            _ia_data = _json_po.loads(t)
+            itens_ia  = _ia_data.get("itens", []) or []
+            destino   = _ia_data.get("destino", "") or ""
+            ok, av = _validar_itens_po(itens_ia, dados_val)
+            if ok:
+                itens_po = itens_ia
+            else:
+                avisos_extracao.extend([f"[IA] {a}" for a in av])
+                itens_po = itens_ia  # melhor que vazio
         except Exception:
             pass
 
@@ -1173,6 +1335,7 @@ async def casar_po(
         "destino": destino,
         "itens_po": _enriquecer_itens_po(itens_po),
         "candidatas": candidatas,
+        "avisos": avisos_extracao,  # lista de divergências de validação (vazia = tudo OK)
     }
 
 @app.post("/ordens-compra")
