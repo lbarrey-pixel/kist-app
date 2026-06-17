@@ -267,17 +267,41 @@ async def extrair_email(
                     pass
         if textos_anexos:
             conteudo += "\n\n" + "\n\n".join(textos_anexos)
+
+        # Coletar imagens embutidas do .msg (itens colados como print/tabela do Excel)
+        # Ignora logos/assinaturas: arquivos com "logo"/"assinatura" no nome
+        # ou muito pequenos (< 5 KB — ícones/bullets de email)
+        _IMG_SKIP = re.compile(r'logo|logotipo|assinatura|signature|bullet|icon', re.I)
+        imgs_msg = []
+        for att in msg.attachments:
+            fname = att.longFilename or att.shortFilename or ""
+            flo = fname.lower()
+            if not att.data:
+                continue
+            if not flo.endswith((".png", ".jpg", ".jpeg", ".webp")):
+                continue
+            if _IMG_SKIP.search(flo):
+                continue
+            if len(att.data) < 5000:  # < 5 KB → provavelmente ícone/logo
+                continue
+            imgs_msg.append((fname, att.data))
+
     elif texto:
         conteudo = texto
+        imgs_msg = []
+    else:
+        imgs_msg = []
 
     # 2. Montar mensagem para o Claude (texto + imagens)
     conteudo_msg = []
     if conteudo.strip():
         conteudo_msg.append({"type": "text", "text": f"Número da proposta: {numero_proposta}\n\nConteúdo:\n{conteudo[:8000]}"})
 
+    # Imagens: direto do upload (prints colados pelo operador) + embutidas no .msg
     imgs_validas = [img for img in (imagens or []) if img and img.filename]
-    if imgs_validas:
-        conteudo_msg.append({"type": "text", "text": f"{'Além do conteúdo acima, analise também os' if conteudo.strip() else 'Extrai os itens dos'} {len(imgs_validas)} print(s):"})
+    todas_imgs_len = len(imgs_validas) + len(imgs_msg)
+    if todas_imgs_len > 0:
+        conteudo_msg.append({"type": "text", "text": f"{'Além do conteúdo acima, analise também os' if conteudo.strip() else 'Extrai os itens dos'} {todas_imgs_len} print(s)/imagem(ns):"})
         for img in imgs_validas[:6]:
             img_bytes = await img.read()
             img_b64 = _b64.standard_b64encode(img_bytes).decode()
@@ -285,6 +309,12 @@ async def extrair_email(
             media_type = "image/png" if fname_lower.endswith(".png") else \
                          "image/jpeg" if fname_lower.endswith((".jpg", ".jpeg")) else \
                          "image/webp" if fname_lower.endswith(".webp") else "image/png"
+            conteudo_msg.append({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}})
+        for fname, img_bytes in imgs_msg[:4]:  # máx 4 imagens do .msg
+            img_b64 = _b64.standard_b64encode(img_bytes).decode()
+            flo = fname.lower()
+            media_type = "image/jpeg" if flo.endswith((".jpg", ".jpeg")) else \
+                         "image/webp" if flo.endswith(".webp") else "image/png"
             conteudo_msg.append({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}})
 
     if not conteudo_msg:
