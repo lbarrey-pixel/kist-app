@@ -517,7 +517,16 @@ async def extrair_email(
             messages=[{"role": "user", "content": msg_content}],
         )
         raw = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
-        raw = re.sub(r'^```json\s*', '', raw); raw = re.sub(r'\s*```$', '', raw)
+        # Extração robusta: remove backticks/preamble e extrai pelo primeiro { → último }
+        raw = re.sub(r'^```(?:json)?\s*', '', raw.strip())
+        raw = re.sub(r'\s*```$', '', raw.strip())
+        # Se ainda tiver texto antes do JSON (ex: preamble "Aqui está:" ou "json" no início)
+        start = raw.find('{')
+        if start > 0:
+            raw = raw[start:]
+        end = raw.rfind('}')
+        if end != -1 and end < len(raw) - 1:
+            raw = raw[:end + 1]
         try:
             parsed = _json_ext.loads(raw)
             # Normalizar: se retornar formato antigo (sem propostas[]), encapsular
