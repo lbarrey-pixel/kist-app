@@ -346,6 +346,116 @@ Lembre: fabricante diferente = null. Categoria diferente = null. Seja rigoroso."
     return itens_com_preco
 
 
+def _parsear_excel_estruturado(data: bytes):
+    """Parser determinístico para Excel com tabela de itens estruturada.
+    Detecta colunas pelo header e extrai dados sem chamar a IA.
+    Retorna lista de propostas no formato padrão, ou None se não detectar estrutura.
+    """
+    try:
+        import openpyxl, io as _io2
+        HQTD2  = re.compile(r'\bqtd|\bquant', re.I)
+        HDESC2 = re.compile(r'descri|material|servi[çc]|equipamento', re.I)
+        HMETA2 = re.compile(r'cnpj|empresa|cliente|faturamento|rfq|referência|nº\s*rc|pedido', re.I)
+        CNPJ_PAT = re.compile(r'(\d{2}\.?\d{3}\.?\d{3}[\/]?\d{4}-?\d{2})')
+
+        wb = openpyxl.load_workbook(_io2.BytesIO(data), read_only=True, data_only=True)
+        for sname in wb.sheetnames:
+            ws = wb[sname]
+            rows = list(ws.iter_rows(values_only=True))
+            metadados_raw, item_rows_raw, header_row, header_idx = [], [], None, None
+
+            for i, row in enumerate(rows):
+                vals = [str(c).strip() if c is not None else "" for c in row]
+                nao_v = [v for v in vals if v and v != "None"]
+                if not nao_v:
+                    continue
+                linha = " | ".join(nao_v)
+                first = nao_v[0]
+                if header_idx is None:
+                    if len(nao_v) >= 4 and HQTD2.search(linha) and HDESC2.search(linha):
+                        header_idx = i
+                        header_row = vals
+                        continue
+                    if HMETA2.search(linha):
+                        metadados_raw.append(linha)
+                    continue
+                try:
+                    int(first)
+                    item_rows_raw.append(vals)
+                except ValueError:
+                    pass
+
+            if not header_row or not item_rows_raw:
+                continue
+
+            def _col(pattern, headers):
+                for i, h in enumerate(headers):
+                    if h and pattern.search(str(h)):
+                        return i
+                return None
+
+            i_desc = _col(HDESC2, header_row)
+            i_qtd  = _col(HQTD2, header_row)
+            i_und  = _col(re.compile(r'\bund|\bun\b|\bunid', re.I), header_row)
+
+            if i_desc is None or i_qtd is None:
+                continue
+
+            # Extrair metadados: CNPJ, cliente, RC
+            cnpj, cliente, rc_neg = None, None, None
+            for meta in metadados_raw:
+                if not cnpj:
+                    cm = CNPJ_PAT.search(meta)
+                    if cm:
+                        raw_cnpj = cm.group(1)
+                        # Verificar que tem 14 dígitos
+                        if len(re.sub(r'\D', '', raw_cnpj)) == 14:
+                            cnpj = raw_cnpj
+                if not cliente:
+                    m2 = re.search(r'(?:empresa|cliente)[^\|]*\|\s*([^|]+)', meta, re.I)
+                    if m2:
+                        cliente = m2.group(1).strip()
+                if not rc_neg:
+                    m3 = re.search(r'(?:rfq|nº\s*rc|n[uú]mero\s*rc|pedido)[^\|]*\|\s*(\S+)', meta, re.I)
+                    if m3:
+                        rc_neg = m3.group(1).strip()
+
+            # Extrair itens
+            itens = []
+            for vals in item_rows_raw:
+                def _cell(idx):
+                    if idx is None or idx >= len(vals): return ""
+                    v = vals[idx]
+                    return str(v).strip() if v is not None else ""
+                desc = _cell(i_desc)
+                if not desc or desc == "None":
+                    continue
+                try:
+                    qtd = float(_cell(i_qtd).replace(",", "."))
+                    if qtd <= 0: qtd = 1
+                except Exception:
+                    qtd = 1
+                unid = (_cell(i_und) or "UN").upper()
+                if not unid or unid == "NONE": unid = "UN"
+                itens.append({
+                    "descricao":          desc[:120],
+                    "descricao_original": desc[:400],
+                    "specs_complementares": None,
+                    "quantidade":  int(qtd) if qtd == int(qtd) else qtd,
+                    "unidade":     unid,
+                    "sugerir_pn":  False,
+                })
+
+            if not itens:
+                continue
+
+            return [{"titulo": sname, "cliente": cliente or "",
+                     "cnpj": cnpj, "rc_neg": rc_neg, "itens": itens}]
+    except Exception:
+        pass
+    return None
+
+
 @app.post("/extrair")
 async def extrair_email(
     texto: str = Form(None),
@@ -448,9 +558,25 @@ async def extrair_email(
                 if not att.data:
                     continue
                 if afn.endswith((".xlsx", ".xls", ".xlsm")):
-                    xl = _extrair_excel_bytes(att.data, afn)
-                    if xl.strip():
-                        conteudo_files.append((att.longFilename or att.shortFilename, xl))
+                    # Tentar parser determinístico primeiro (Excel estruturado com header)
+                    _props_det = _parsear_excel_estruturado(att.data)
+                    if _props_det:
+                        # Enriquecer com contexto do email (CNPJ pode estar no body)
+                        for _p in _props_det:
+                            if not _p.get("cnpj"):
+                                _m = re.search(r'(\d{2}\.?\d{3}\.?\d{3}[/]?\d{4}-?\d{2})', contexto_email)
+                                if _m and len(re.sub(r'\D', '', _m.group(1))) == 14:
+                                    _p["cnpj"] = _m.group(1)
+                            if not _p.get("cliente") and contexto_email:
+                                _mc = re.search(r'(?:empresa|cliente|razão social)[:\s]+([^\n\|]{3,60})', contexto_email, re.I)
+                                if _mc:
+                                    _p["cliente"] = _mc.group(1).strip()
+                        propostas_raw.extend(_props_det)
+                    else:
+                        # Fallback: extração por texto (IA vai processar)
+                        xl = _extrair_excel_bytes(att.data, afn)
+                        if xl.strip():
+                            conteudo_files.append((att.longFilename or att.shortFilename, xl))
                 elif afn.endswith(".pdf") and not _PDF_SKIP.search(afn) and len(att.data) <= _PDF_MAX_BYTES:
                     pt = _pdf_po_texto(att.data)
                     if pt.strip():
@@ -460,9 +586,18 @@ async def extrair_email(
                         imgs_msg.append((afn, att.data))
 
         elif flo.endswith((".xlsx", ".xls", ".xlsm")):
-            xl = _extrair_excel_bytes(dados, fname)
-            if xl.strip():
-                conteudo_files.append((fname, xl))
+            _props_det = _parsear_excel_estruturado(dados)
+            if _props_det:
+                for _p in _props_det:
+                    if not _p.get("cnpj") and contexto_email:
+                        _m = re.search(r'(\d{2}\.?\d{3}\.?\d{3}[/]?\d{4}-?\d{2})', contexto_email)
+                        if _m and len(re.sub(r'\D', '', _m.group(1))) == 14:
+                            _p["cnpj"] = _m.group(1)
+                propostas_raw.extend(_props_det)
+            else:
+                xl = _extrair_excel_bytes(dados, fname)
+                if xl.strip():
+                    conteudo_files.append((fname, xl))
 
         elif flo.endswith(".pdf") and not _PDF_SKIP.search(flo) and len(dados) <= _PDF_MAX_BYTES:
             pt = _pdf_po_texto(dados)
