@@ -6,6 +6,7 @@ import {
   CONF, brl, btnPrimary, btnGhost, Eyebrow, StateLabel, PageHeader,
   CertaintyStrip, Sidebar,
   IconUpload, IconBolt, IconArrow, IconDownload, IconCheck, IconLink, IconX,
+  IconGoogle, IconBell,
 } from "./kist-ui.jsx";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
@@ -16,6 +17,88 @@ const isLink = (s) => typeof s === "string" && /^https?:\/\//i.test(s.trim());
 // ── Linha de item da revisão ───────────────────────────────────────────────
 function ItemRow({ item, index, onChange, token, apiUrl }) {
   const [loadingPn, setLoadingPn] = useState(false);
+  // ── Alerta ────────────────────────────────────────────────────────────
+  const [mostrarAlerta, setMostrarAlerta] = useState(false);
+  const [alertaTexto, setAlertaTexto] = useState(() => item.alerta_produto?.texto || "");
+  const [alertaLinks, setAlertaLinks] = useState(() => (item.alerta_produto?.links || []).join("\n"));
+  const [alertaThumb, setAlertaThumb] = useState(() => item.alerta_produto?.thumb_b64 || null);
+  const [alertaImagem, setAlertaImagem] = useState(null);          // full — carregada sob demanda
+  const [loadingImagem, setLoadingImagem] = useState(false);
+  const [salvandoAlerta, setSalvandoAlerta] = useState(false);
+  const [imgFullUrl, setImgFullUrl] = useState(null);              // preview overlay
+
+  const temAlerta = !!(item.alerta_produto?.texto || item.alerta_produto?.thumb_b64 ||
+                       (item.alerta_produto?.links || []).length > 0);
+
+  // Gerar thumbnail em canvas (150px wide, JPEG q0.6)
+  async function gerarThumb(file) {
+    return new Promise((res) => {
+      const img = new Image();
+      const url = URL.createObjectURL(file);
+      img.onload = () => {
+        const W = 150, ratio = Math.min(W / img.width, 1);
+        const cv = document.createElement("canvas");
+        cv.width = img.width * ratio; cv.height = img.height * ratio;
+        cv.getContext("2d").drawImage(img, 0, 0, cv.width, cv.height);
+        URL.revokeObjectURL(url);
+        res(cv.toDataURL("image/jpeg", 0.6));
+      };
+      img.src = url;
+    });
+  }
+
+  // Converter imagem full para base64
+  async function fileToB64(file) {
+    return new Promise((res) => {
+      const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(file);
+    });
+  }
+
+  async function handleImagemUpload(e) {
+    const file = e.target.files?.[0]; if (!file) return;
+    const [thumb, full] = await Promise.all([gerarThumb(file), fileToB64(file)]);
+    setAlertaThumb(thumb);
+    setAlertaImagem(full);
+  }
+
+  async function salvarAlerta() {
+    setSalvandoAlerta(true);
+    const links = alertaLinks.split("\n").map(l => l.trim()).filter(l => /^https?:\/\//i.test(l));
+    const alertaObj = { texto: alertaTexto.trim(), links, thumb_b64: alertaThumb || null };
+    const payload = {
+      descricao: item.descricao_final,
+      alerta: alertaObj,
+      ...(alertaImagem ? { alerta_imagem: alertaImagem } : {}),
+    };
+    try {
+      await fetch(`${apiUrl}/produto-alerta`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify(payload),
+      });
+      // Atualizar item no estado local
+      onChange(index, "alerta_produto", alertaObj);
+    } catch (e) { console.warn("Alerta não salvo:", e); }
+    finally { setSalvandoAlerta(false); }
+  }
+
+  async function buscarImagemFull() {
+    if (imgFullUrl) { setImgFullUrl(null); return; }          // toggle
+    if (alertaImagem) { setImgFullUrl(alertaImagem); return; } // já carregada
+    const thumb = item.alerta_produto?.thumb_b64;
+    if (!thumb) return;
+    // Buscar do banco
+    setLoadingImagem(true);
+    try {
+      const r = await fetch(
+        `${apiUrl}/produto-alerta-imagem?descricao=${encodeURIComponent(item.descricao_final)}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const d = await r.json();
+      if (d.alerta_imagem) { setAlertaImagem(d.alerta_imagem); setImgFullUrl(d.alerta_imagem); }
+    } catch (e) {}
+    finally { setLoadingImagem(false); }
+  }
   const [sugestoes, setSugestoes] = useState(null);
   const [mostrarSugestoes, setMostrarSugestoes] = useState(false);
   const [mostrarSpecs, setMostrarSpecs] = useState(false);
@@ -56,11 +139,32 @@ function ItemRow({ item, index, onChange, token, apiUrl }) {
           {String(index + 1).padStart(2, "0")}
         </td>
         <td className="py-2 pr-3">
-          <input
-            className="w-full rounded-md bg-transparent px-1.5 py-1 text-[13px] text-ink cell-input"
-            value={item.descricao_final}
-            onChange={(e) => onChange(index, "descricao_final", e.target.value)}
-          />
+          <div className="flex items-center gap-1">
+            <input
+              className="min-w-0 flex-1 rounded-md bg-transparent px-1.5 py-1 text-[13px] text-ink cell-input"
+              value={item.descricao_final}
+              onChange={(e) => onChange(index, "descricao_final", e.target.value)}
+            />
+            {/* Buscar no Google */}
+            <a href={`https://www.google.com/search?q=${encodeURIComponent(item.descricao_final)}`}
+              target="_blank" rel="noopener noreferrer"
+              title="Buscar no Google"
+              className="flex-shrink-0 rounded-md p-1 text-faint/60 transition-colors hover:bg-paper hover:text-ink"
+              onClick={(e) => e.stopPropagation()}>
+              <IconGoogle size={15} />
+            </a>
+            {/* Alerta do produto */}
+            <button
+              onClick={() => setMostrarAlerta((v) => !v)}
+              title={temAlerta ? "Ver / editar alerta" : "Adicionar alerta"}
+              className={`relative flex-shrink-0 rounded-md p-1 transition-colors hover:bg-paper
+                ${temAlerta ? "text-amber" : "text-faint/60 hover:text-ink"}`}>
+              <IconBell size={15} />
+              {temAlerta && (
+                <span className="absolute -right-0.5 -top-0.5 flex h-3 w-3 items-center justify-center rounded-full bg-amber text-[8px] font-bold text-white">!</span>
+              )}
+            </button>
+          </div>
           <div className="mt-0.5 flex flex-wrap items-center gap-2 pl-1.5">
             <StateLabel conf={confianca} />
             {confianca === "baixa" && item.banco_candidato && (
@@ -184,6 +288,95 @@ function ItemRow({ item, index, onChange, token, apiUrl }) {
             <p className="mt-1.5 pl-1 text-[11px] text-faint">
               Essa referência acompanha o item quando a proposta virar ordem de compra. <span className="text-faint/80">Custo é interno — não vai pro Tiny.</span>
             </p>
+          </td>
+        </tr>
+      )}
+
+      {/* ── Painel de Alerta ─────────────────────────────────────────────── */}
+      {mostrarAlerta && (
+        <tr className="border-b border-line/70 bg-amberbg/30">
+          <td /><td />
+          <td colSpan={4} className="px-3 pb-3 pt-2">
+            <div className="rounded-xl border border-amber/30 bg-amber/5 p-3">
+              <div className="mb-2 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <IconBell size={13} className="text-amber" />
+                  <span className="text-[12px] font-semibold text-amber">Alerta do produto</span>
+                  <span className="text-[10.5px] text-faint">— salvo no banco, não vai pro Tiny</span>
+                </div>
+                <button onClick={() => setMostrarAlerta(false)} className="text-faint hover:text-rose"><IconX size={13} /></button>
+              </div>
+
+              {/* Texto */}
+              <textarea rows={3} value={alertaTexto}
+                onChange={(e) => setAlertaTexto(e.target.value)}
+                placeholder="Ex: prazo fabricação 45 dias · registrar oportunidade no CRM · produto descontinuado…"
+                className="w-full resize-none rounded-lg border border-amber/30 bg-paper px-3 py-2 text-[12.5px] text-ink outline-none placeholder:text-faint/60 focus:ring-1 focus:ring-amber/50" />
+
+              {/* Links */}
+              <div className="mt-2">
+                <div className="mb-1 text-[10.5px] text-faint">Links (um por linha)</div>
+                <textarea rows={2} value={alertaLinks}
+                  onChange={(e) => setAlertaLinks(e.target.value)}
+                  placeholder="https://fornecedor.com/produto&#10;https://..."
+                  className="w-full resize-none rounded-lg border border-line2 bg-paper px-3 py-1.5 font-mono text-[11.5px] text-ink outline-none placeholder:text-faint/60 focus:ring-1 focus:ring-kist" />
+              </div>
+
+              {/* Imagem */}
+              <div className="mt-2 flex items-start gap-3">
+                <div className="flex-1">
+                  <div className="mb-1 text-[10.5px] text-faint">Print / imagem (thumb exibida, full sob demanda)</div>
+                  <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-line2 bg-paper px-3 py-1.5 text-[12px] text-sub hover:border-kist/40 hover:text-kist">
+                    <IconUpload size={13} />
+                    {alertaThumb ? "Trocar imagem" : "Adicionar print"}
+                    <input type="file" accept="image/*" className="hidden" onChange={handleImagemUpload} />
+                  </label>
+                </div>
+                {alertaThumb && (
+                  <div className="relative flex-shrink-0">
+                    <img src={alertaThumb} alt="thumb"
+                      className="h-16 w-24 cursor-pointer rounded-lg border border-amber/30 object-cover hover:border-amber"
+                      onClick={buscarImagemFull}
+                      title={loadingImagem ? "Carregando…" : "Clique para ver a imagem completa"} />
+                    {loadingImagem && (
+                      <div className="absolute inset-0 flex items-center justify-center rounded-lg bg-white/70">
+                        <span className="animate-spin text-amber"><IconBolt size={14} /></span>
+                      </div>
+                    )}
+                    <button onClick={() => { setAlertaThumb(null); setAlertaImagem(null); }}
+                      className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-rose text-[9px] text-white">✕</button>
+                  </div>
+                )}
+              </div>
+
+              {/* Overlay imagem full */}
+              {imgFullUrl && (
+                <div className="mt-2 rounded-xl border border-line bg-paper p-2 text-center">
+                  <img src={imgFullUrl} alt="alerta full" className="mx-auto max-h-96 rounded-lg object-contain" />
+                  <button onClick={() => setImgFullUrl(null)} className="mt-1.5 text-[11px] text-faint hover:text-rose">fechar</button>
+                </div>
+              )}
+
+              {/* Links renderizados */}
+              {alertaLinks.trim() && (
+                <div className="mt-2 space-y-0.5">
+                  {alertaLinks.split("\n").map(l => l.trim()).filter(l => /^https?:\/\//i.test(l)).map((l, i) => (
+                    <a key={i} href={l} target="_blank" rel="noopener noreferrer"
+                      className="flex items-center gap-1 text-[12px] text-kist hover:underline">
+                      <IconLink size={11} /> {l.length > 60 ? l.slice(0, 60) + "…" : l}
+                    </a>
+                  ))}
+                </div>
+              )}
+
+              <div className="mt-3 flex items-center gap-2">
+                <button onClick={salvarAlerta} disabled={salvandoAlerta}
+                  className={`${btnPrimary} py-1.5 text-[12px] ${salvandoAlerta ? "opacity-60" : ""}`}>
+                  {salvandoAlerta ? "Salvando…" : <><IconCheck size={13} /> Salvar alerta</>}
+                </button>
+                <span className="text-[10.5px] text-faint">salvo no banco · aparece em cotações futuras</span>
+              </div>
+            </div>
           </td>
         </tr>
       )}
