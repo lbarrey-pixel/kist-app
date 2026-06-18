@@ -537,6 +537,9 @@ async def extrair_email(
         except Exception:
             return ""
 
+    propostas_raw: list = []   # acumulador — declarado aqui para estar disponível
+    #                              durante o loop de arquivos (parser det. insere direto)
+
     # ── Processar cada arquivo enviado ──────────────────────────────────────
     for arq in (arquivos or []):
         if not (arq and arq.filename):
@@ -624,8 +627,6 @@ async def extrair_email(
     todas_imgs_len = len(imgs_validas) + len(imgs_msg)
     modelo_extracao = "claude-sonnet-4-6" if todas_imgs_len > 0 else "claude-haiku-4-5-20251001"
     claude = get_claude()
-
-    propostas_raw: list = []
 
     async def _chamar_extracao(payload_txt, imgs_inline=None, imgs_upload=None):
         """Monta o payload e chama o Claude para extração."""
