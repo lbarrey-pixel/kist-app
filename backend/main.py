@@ -202,21 +202,44 @@ def ping():
 
 @app.get("/proxima-proposta")
 def proxima_proposta():
+    """Retorna o próximo número de proposta disponível.
+    Fonte primária: propostas.numero_proposta (mais confiável).
+    Fallback: produtos.proposta_tiny (banco de preços).
+    """
     sb = get_supabase()
-    try:
-        res = sb.table('produtos').select('proposta_tiny')\
-            .not_.is_('proposta_tiny', 'null')\
-            .order('proposta_tiny', desc=True).limit(50).execute()
-        numeros = []
-        for r in res.data:
+    def _max_numeros(registros, campo):
+        nums = []
+        for r in registros:
             try:
-                numeros.append(int(r['proposta_tiny']))
+                v = r.get(campo, "")
+                if v:
+                    nums.append(int(str(v).strip()))
             except Exception:
                 pass
-        if numeros:
-            return {"proximo": str(max(numeros) + 1)}
+        return max(nums) if nums else None
+
+    try:
+        # Fonte 1: tabela de propostas
+        res = sb.table("propostas").select("numero_proposta") \
+            .not_.is_("numero_proposta", "null") \
+            .order("numero_proposta", desc=True).limit(20).execute()
+        maximo = _max_numeros(res.data or [], "numero_proposta")
+        if maximo:
+            return {"proximo": str(maximo + 1)}
     except Exception:
         pass
+
+    try:
+        # Fallback: banco de preços
+        res = sb.table("produtos").select("proposta_tiny") \
+            .not_.is_("proposta_tiny", "null") \
+            .order("proposta_tiny", desc=True).limit(50).execute()
+        maximo = _max_numeros(res.data or [], "proposta_tiny")
+        if maximo:
+            return {"proximo": str(maximo + 1)}
+    except Exception:
+        pass
+
     return {"proximo": ""}
 
 @app.get("/banco/stats")
@@ -387,7 +410,7 @@ async def extrair_email(
                     xl = _extrair_excel_bytes(att.data, afn)
                     if xl.strip():
                         conteudo_files.append((att.longFilename or att.shortFilename, xl))
-                elif afn.endswith(".pdf") and not _PDF_SKIP.search(afn):
+                elif afn.endswith(".pdf") and not _PDF_SKIP.search(afn) and len(att.data) <= _PDF_MAX_BYTES:
                     pt = _pdf_po_texto(att.data)
                     if pt.strip():
                         conteudo_files.append((att.longFilename or att.shortFilename, pt))
@@ -400,7 +423,7 @@ async def extrair_email(
             if xl.strip():
                 conteudo_files.append((fname, xl))
 
-        elif flo.endswith(".pdf"):
+        elif flo.endswith(".pdf") and not _PDF_SKIP.search(flo) and len(dados) <= _PDF_MAX_BYTES:
             pt = _pdf_po_texto(dados)
             if pt.strip():
                 conteudo_files.append((fname, pt))
@@ -1165,9 +1188,14 @@ def _parsear_itens_po_nativo(texto):
 
 # PDFs irrelevantes em emails de PO (políticas, T&Cs, etc.)
 _PDF_SKIP = re.compile(
-    r'politic|policy|pagamento|payment|entrega|delivery|termo|term|condi',
+    r'politic|policy|pagamento|payment|entrega|delivery'
+    r'|termo|term|condi|cartilha|recebimento|manual|instruc'
+    r'|instrucao|instrução|procedimento|cadastro|homologac'
+    r'|geral|norma|regul|contrato|contract|acordo|agreement',
     re.I
 )
+# PDFs de lista de itens nunca passam de 1,5 MB — acima disso é manual/T&C
+_PDF_MAX_BYTES = 1_500_000
 
 async def _ler_po(arquivo):
     nome = (arquivo.filename or "").lower()
@@ -1182,7 +1210,7 @@ async def _ler_po(arquivo):
         pdfs_txt = []
         for att in msg.attachments:
             fn = (att.longFilename or att.shortFilename or "").lower()
-            if att.data and fn.endswith(".pdf") and not _PDF_SKIP.search(fn):
+            if att.data and fn.endswith(".pdf") and not _PDF_SKIP.search(fn) and len(att.data) <= _PDF_MAX_BYTES:
                 t = _pdf_po_texto(att.data)
                 if t.strip():
                     pdfs_txt.append(t)
