@@ -244,11 +244,13 @@ export default function App() {
   const [salvandoBanco, setSalvandoBanco] = useState(false);
   const [erro, setErro] = useState("");
   const [texto, setTexto] = useState("");
-  const [arquivo, setArquivo] = useState(null);
+  const [arquivos, setArquivos] = useState([]);   // múltiplos arquivos (email + Excel + PDF)
   const [imagens, setImagens] = useState([]);
   const [isDragging, setIsDragging] = useState(false);
   const [numeroProposta, setNumeroProposta] = useState("");
-  const [resultado, setResultado] = useState(null);
+  const [propostas, setPropostas] = useState([]);   // array de propostas extraídas
+  const [propostaIdx, setPropostaIdx] = useState(0);
+  const [downloadados, setDownloadados] = useState(new Set());
   const [stats, setStats] = useState(null);
   const [bancoInfo, setBancoInfo] = useState(null);
   const fileRef = useRef();
@@ -318,7 +320,8 @@ export default function App() {
 
   function logout() {
     setUsuario(null); setToken(null); setStep("input"); setResultado(null);
-    setTexto(""); setArquivo(null); setImagens([]); setNumeroProposta(""); setErro("");
+    setTexto(""); setArquivos([]); setImagens([]); setNumeroProposta(""); setErro("");
+    setPropostas([]); setPropostaIdx(0); setDownloadados(new Set());
     setPagina("nova"); setNovaOCPayload(null); setShowDocs(false);
   }
 
@@ -331,47 +334,53 @@ export default function App() {
     const files = Array.from(e.dataTransfer.files || []);
     if (files.length > 0) {
       const imgs = files.filter((f) => f.type.startsWith("image/"));
-      const msgs = files.filter((f) => f.name.toLowerCase().endsWith(".msg") || f.name.toLowerCase().endsWith(".eml"));
-      if (imgs.length > 0) { setImagens((prev) => [...prev, ...imgs].slice(0, 6)); return; }
-      if (msgs.length > 0) { setArquivo(msgs[0]); setTexto(""); return; }
-      setArquivo(files[0]); setTexto(""); return;
+      const outros = files.filter((f) => !f.type.startsWith("image/"));
+      if (imgs.length > 0) setImagens((prev) => [...prev, ...imgs].slice(0, 6));
+      if (outros.length > 0) setArquivos((prev) => {
+        const nomes = new Set(prev.map((x) => x.name));
+        return [...prev, ...outros.filter((f) => !nomes.has(f.name))];
+      });
+      if (imgs.length > 0 || outros.length > 0) return;
     }
     const plain = e.dataTransfer.getData("text/plain");
     const html = e.dataTransfer.getData("text/html");
-    if (plain?.trim()) { setTexto(plain.trim()); setArquivo(null); }
+    if (plain?.trim()) setTexto(plain.trim());
     else if (html) {
       const tmp = document.createElement("div"); tmp.innerHTML = html;
       const txt = tmp.innerText || tmp.textContent || "";
-      if (txt.trim()) { setTexto(txt.trim()); setArquivo(null); }
+      if (txt.trim()) setTexto(txt.trim());
     }
   }, []);
 
-  function handleArquivo(e) {
-    const f = e.target.files[0];
-    if (f) { setArquivo(f); setTexto(""); }
+  function handleArquivos(e) {
+    const files = Array.from(e.target.files || []);
+    setArquivos((prev) => {
+      const nomes = new Set(prev.map((x) => x.name));
+      return [...prev, ...files.filter((f) => !nomes.has(f.name))];
+    });
   }
 
   async function processar() {
     if (!numeroProposta.trim()) { setErro("Informe o número da proposta."); return; }
-    if (!texto.trim() && !arquivo && imagens.length === 0) {
-      setErro("Cole o texto, arraste um .msg, cole uma imagem (Ctrl+V) ou envie prints."); return;
+    if (!texto.trim() && arquivos.length === 0 && imagens.length === 0) {
+      setErro("Arraste arquivos, cole o texto ou adicione prints."); return;
     }
     setErro(""); setLoading(true);
     try {
       const form = new FormData();
       form.append("numero_proposta", numeroProposta);
-      if (arquivo) form.append("arquivo", arquivo);
-      else if (texto) form.append("texto", texto);
+      arquivos.forEach((f) => form.append("arquivos", f));
+      if (texto) form.append("texto", texto);
       imagens.forEach((img) => form.append("imagens", img));
 
       const controller = new AbortController();
-      const tid = setTimeout(() => controller.abort(), 90000);
+      const tid = setTimeout(() => controller.abort(), 120000);
       let res;
       try {
         res = await fetch(`${API}/extrair`, { method: "POST", headers: authHeaders(), body: form, signal: controller.signal });
       } catch (fe) {
         clearTimeout(tid);
-        if (fe.name === "AbortError") throw new Error("Tempo limite (90s). Tente com um e-mail mais curto.");
+        if (fe.name === "AbortError") throw new Error("Tempo limite (120s). Tente com menos arquivos.");
         throw fe;
       }
       clearTimeout(tid);
@@ -381,53 +390,67 @@ export default function App() {
         throw new Error(err.detail || "Erro no servidor");
       }
       const data = await res.json();
-      setResultado(data); setStep("resultado");
+      // Normalizar: backend sempre retorna {propostas:[...]}, mas suportar legado {itens:[...]}
+      const props = data.propostas || [data];
+      setPropostas(props); setPropostaIdx(0); setDownloadados(new Set());
+      setStep("resultado");
     } catch (e) { setErro(e.message); }
     finally { setLoading(false); }
   }
 
   function atualizarItem(index, campo, valor) {
-    setResultado((prev) => ({ ...prev, itens: prev.itens.map((item, i) => (i === index ? { ...item, [campo]: valor } : item)) }));
+    // Atualiza item na proposta ativa
+    setPropostas((prev) => prev.map((p, pi) =>
+      pi !== propostaIdx ? p : { ...p, itens: p.itens.map((item, i) => i === index ? { ...item, [campo]: valor } : item) }
+    ));
   }
 
-  async function baixarCSV() {
+  async function baixarCSV(idx = propostaIdx) {
+    const prop = propostas[idx];
+    if (!prop) return;
     setLoading(true); setSalvandoBanco(true); setBancoInfo(null);
     try {
-      const itensCom = resultado.itens.filter((i) => i.preco_un > 0);
+      const payload = { ...prop, usuario_nome: usuario.nome };
+      const itensCom = (prop.itens || []).filter((i) => i.preco_un > 0);
       if (itensCom.length > 0) {
         try {
           const resBanco = await fetch(`${API}/upsert-precos`, {
             method: "POST", headers: { "Content-Type": "application/json", ...authHeaders() },
-            body: JSON.stringify(resultado),
+            body: JSON.stringify(prop),
           });
           if (resBanco.ok) setBancoInfo(await resBanco.json());
         } catch (e) { console.warn("Aviso banco:", e); }
       }
       try {
         await fetch(`${API}/salvar-proposta`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", ...authHeaders() },
-          body: JSON.stringify({ ...resultado, usuario_nome: usuario.nome }),
+          method: "POST", headers: { "Content-Type": "application/json", ...authHeaders() },
+          body: JSON.stringify(payload),
         });
       } catch (e) { console.warn("Aviso salvar proposta:", e); }
       setSalvandoBanco(false);
       const res = await fetch(`${API}/gerar-csv`, {
         method: "POST", headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify(resultado),
+        body: JSON.stringify(prop),
       });
       if (!res.ok) throw new Error("Erro ao gerar CSV");
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a"); a.href = url;
-      a.download = `proposta_${resultado.proposta}.csv`; a.click();
-      URL.revokeObjectURL(url); setStep("download");
+      a.download = `proposta_${prop.proposta}.csv`; a.click();
+      URL.revokeObjectURL(url);
+      // Marcar proposta como baixada; só avança para download quando todas forem baixadas
+      setDownloadados((prev) => {
+        const next = new Set(prev); next.add(idx);
+        if (next.size >= propostas.length) setStep("download");
+        return next;
+      });
     } catch (e) { setErro(e.message); }
     finally { setLoading(false); setSalvandoBanco(false); }
   }
 
   function reiniciar() {
-    setStep("input"); setResultado(null); setBancoInfo(null);
-    setTexto(""); setArquivo(null); setImagens([]); setNumeroProposta(""); setErro("");
+    setStep("input"); setPropostas([]); setPropostaIdx(0); setDownloadados(new Set()); setBancoInfo(null);
+    setTexto(""); setArquivos([]); setImagens([]); setNumeroProposta(""); setErro("");
     fetch(`${API}/proxima-proposta`).then((r) => r.json())
       .then((d) => { if (d.proximo) setNumeroProposta(d.proximo); }).catch(() => {});
   }
@@ -493,66 +516,66 @@ export default function App() {
                   </div>
 
                   <div>
-                    <label className="mb-1.5 block text-[12.5px] font-medium text-ink">E-mail ou prints da cotação</label>
+                    <label className="mb-1.5 block text-[12.5px] font-medium text-ink">
+                      Arquivos e prints da cotação
+                      <span className="ml-2 text-[11px] font-normal text-faint">e-mail · Excel · PDF · imagens — pode combinar</span>
+                    </label>
+                    {/* Zona de drop — aceita múltiplos arquivos de qualquer tipo */}
                     <div onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}
-                      onClick={() => !arquivo && !texto && imagens.length === 0 && fileRef.current.click()}
+                      onClick={() => arquivos.length === 0 && imagens.length === 0 && fileRef.current.click()}
                       className={`cursor-pointer rounded-xl border-2 border-dashed transition-all
                         ${isDragging ? "border-kist bg-kist/[0.04]"
-                          : imagens.length > 0 ? "border-kist/40 bg-kist/[0.03]"
-                          : arquivo ? "border-kist/40 bg-kist/[0.03]"
+                          : (arquivos.length > 0 || imagens.length > 0) ? "border-kist/40 bg-kist/[0.03]"
                           : "border-line2 bg-paper hover:border-faint"}`}>
-                      {imagens.length > 0 ? (
-                        <div className="p-4">
-                          <div className="mb-2 flex items-center justify-between">
-                            <span className="text-[12px] font-medium text-kist">{imagens.length} print(s) — cole mais com Ctrl+V</span>
-                            <button onClick={(e) => { e.stopPropagation(); setImagens([]); }} className="text-[11px] text-faint hover:text-rose">limpar tudo</button>
-                          </div>
-                          <div className="flex flex-wrap gap-2">
-                            {imagens.map((img, i) => (
-                              <div key={i} className="group/img relative">
-                                <img src={URL.createObjectURL(img)} alt="" className="h-16 w-16 rounded-lg border border-line object-cover" />
-                                <button onClick={(e) => { e.stopPropagation(); setImagens((prev) => prev.filter((_, j) => j !== i)); }}
-                                  className="absolute -right-1 -top-1 hidden h-4 w-4 items-center justify-center rounded-full bg-rose text-[10px] text-white group-hover/img:flex">✕</button>
+                      {(arquivos.length > 0 || imagens.length > 0) ? (
+                        <div className="p-3 space-y-1.5">
+                          {/* Arquivos (email, excel, pdf) */}
+                          {arquivos.map((f, i) => (
+                            <div key={i} className="flex items-center gap-2.5 rounded-lg bg-paper px-3 py-2">
+                              <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg bg-kist/10 text-kist"><IconUpload size={14} /></div>
+                              <div className="min-w-0 flex-1">
+                                <div className="truncate text-[12.5px] font-medium text-ink">{f.name}</div>
+                                <div className="font-mono text-[10.5px] text-faint">{(f.size / 1024).toFixed(0)} KB</div>
                               </div>
-                            ))}
-                            {imagens.length < 6 && (
-                              <div className="flex h-16 w-16 items-center justify-center rounded-lg border-2 border-dashed border-line2 text-center text-[10px] text-faint">+Ctrl+V</div>
-                            )}
-                          </div>
-                        </div>
-                      ) : arquivo ? (
-                        <div className="flex items-center justify-between p-4">
-                          <div className="flex items-center gap-3">
-                            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-kist/10 text-kist"><IconUpload size={18} /></div>
-                            <div>
-                              <div className="text-[13px] font-medium text-ink">{arquivo.name}</div>
-                              <div className="font-mono text-[11px] text-faint">{(arquivo.size / 1024).toFixed(0)} KB</div>
+                              <button onClick={(e) => { e.stopPropagation(); setArquivos((prev) => prev.filter((_, j) => j !== i)); }}
+                                className="flex-shrink-0 text-faint hover:text-rose"><IconX size={14} /></button>
                             </div>
+                          ))}
+                          {/* Imagens (prints) */}
+                          {imagens.length > 0 && (
+                            <div className="flex flex-wrap gap-2 px-1 pt-1">
+                              {imagens.map((img, i) => (
+                                <div key={i} className="group/img relative">
+                                  <img src={URL.createObjectURL(img)} alt="" className="h-14 w-14 rounded-lg border border-line object-cover" />
+                                  <button onClick={(e) => { e.stopPropagation(); setImagens((prev) => prev.filter((_, j) => j !== i)); }}
+                                    className="absolute -right-1 -top-1 hidden h-4 w-4 items-center justify-center rounded-full bg-rose text-[10px] text-white group-hover/img:flex">✕</button>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                          {/* Ações */}
+                          <div className="flex items-center gap-3 px-1 pb-1">
+                            <button onClick={(e) => { e.stopPropagation(); fileRef.current.click(); }}
+                              className="text-[11.5px] text-kist hover:underline">+ Adicionar mais</button>
+                            <button onClick={(e) => { e.stopPropagation(); setArquivos([]); setImagens([]); }}
+                              className="text-[11px] text-faint hover:text-rose">limpar tudo</button>
                           </div>
-                          <button onClick={(e) => { e.stopPropagation(); setArquivo(null); }} className="px-2 text-faint hover:text-rose"><IconX size={16} /></button>
-                        </div>
-                      ) : texto ? (
-                        <div className="p-4">
-                          <div className="mb-2 flex items-center justify-between">
-                            <span className="text-[12px] font-medium text-sub">Texto colado</span>
-                            <button onClick={() => setTexto("")} className="text-[11px] text-faint hover:text-rose">limpar</button>
-                          </div>
-                          <p className="line-clamp-3 font-mono text-[11.5px] text-sub">{texto.slice(0, 200)}…</p>
                         </div>
                       ) : (
                         <div className="px-6 py-10 text-center">
                           <div className="mx-auto mb-3 flex h-11 w-11 items-center justify-center rounded-xl bg-kist/10 text-kist"><IconUpload size={20} /></div>
-                          <div className="text-[13.5px] font-medium text-ink">{isDragging ? "Solte aqui" : "Arraste o e-mail ou prints"}</div>
+                          <div className="text-[13.5px] font-medium text-ink">{isDragging ? "Solte aqui" : "Arraste os arquivos"}</div>
                           <div className="mt-1 text-[12px] text-sub">
-                            Cole prints com <kbd className="rounded border border-line2 bg-surface px-1.5 py-0.5 font-mono text-[10.5px]">Ctrl</kbd>{" "}
-                            <kbd className="rounded border border-line2 bg-surface px-1.5 py-0.5 font-mono text-[10.5px]">V</kbd>
+                            Pode combinar: .msg + Excel + PDF + prints
                           </div>
-                          <div className="mt-1 text-[11.5px] text-faint">Aceita .msg · PNG/JPG (até 6) · PDF · Excel</div>
-                          <button onClick={(e) => { e.stopPropagation(); fileRef.current.click(); }} className={`${btnGhost} mt-3`}>Procurar arquivo</button>
+                          <div className="mt-1 text-[11.5px] text-faint">
+                            Cole prints com <kbd className="rounded border border-line2 bg-surface px-1 py-0.5 font-mono text-[10px]">Ctrl+V</kbd>
+                          </div>
+                          <button onClick={(e) => { e.stopPropagation(); fileRef.current.click(); }} className={`${btnGhost} mt-3`}>Procurar arquivos</button>
                         </div>
                       )}
                     </div>
-                    <input ref={fileRef} type="file" accept=".msg,.eml" className="hidden" onChange={handleArquivo} />
+                    <input ref={fileRef} type="file" multiple accept=".msg,.eml,.xlsx,.xls,.xlsm,.pdf,.png,.jpg,.jpeg" className="hidden" onChange={handleArquivos} />
                   </div>
 
                   <div className="relative py-1 text-center">
@@ -577,25 +600,55 @@ export default function App() {
             )}
 
             {/* RESULTADO */}
-            {step === "resultado" && resultado && (
+            {step === "resultado" && propostas.length > 0 && (() => {
+              const prop = propostas[propostaIdx] || {};
+              const jaBaixado = downloadados.has(propostaIdx);
+              return (
               <div className="rise">
-                <PageHeader eyebrow="Etapa 2 de 3 · Revisão"
-                  title={`Proposta ${resultado.proposta}`}
-                  sub={<span className="flex flex-wrap items-center gap-2">
-                    <span className="font-medium text-ink">{resultado.cliente}</span>
-                    {resultado.cnpj && <span className="font-mono text-[12px] text-faint">{resultado.cnpj}</span>}
-                    {resultado.rc_neg && <span className="rounded-md bg-paper px-2 py-0.5 font-mono text-[11px] text-sub">{resultado.rc_neg}</span>}
-                  </span>}
+                <PageHeader eyebrow={`Etapa 2 de 3 · Revisão${propostas.length > 1 ? ` — ${propostas.length} propostas` : ""}`}
+                  title={propostas.length > 1 ? "Propostas geradas" : `Proposta ${prop.proposta}`}
+                  sub={propostas.length === 1 ? <span className="flex flex-wrap items-center gap-2">
+                    <span className="font-medium text-ink">{prop.cliente}</span>
+                    {prop.cnpj && <span className="font-mono text-[12px] text-faint">{prop.cnpj}</span>}
+                    {prop.rc_neg && <span className="rounded-md bg-paper px-2 py-0.5 font-mono text-[11px] text-sub">{prop.rc_neg}</span>}
+                  </span> : null}
                   actions={<>
                     <button onClick={reiniciar} className={btnGhost}>Recomeçar</button>
-                    <button onClick={baixarCSV} disabled={loading || salvandoBanco} className={btnPrimary}>
+                    <button onClick={() => baixarCSV(propostaIdx)} disabled={loading || salvandoBanco || jaBaixado} className={btnPrimary}>
                       {salvandoBanco
                         ? <><span className="inline-block animate-spin"><IconBolt size={15} /></span> Salvando…</>
-                        : loading ? "Gerando…" : <><IconDownload size={15} /> Confirmar e baixar CSV</>}
+                        : jaBaixado ? <><IconCheck size={15} /> CSV baixado</>
+                        : loading ? "Gerando…"
+                        : <><IconDownload size={15} /> Confirmar e baixar CSV{propostas.length > 1 ? ` — Proposta ${propostaIdx + 1}` : ""}</>}
                     </button>
                   </>} />
 
-                <div className="mt-6"><CertaintyStrip itens={resultado.itens} /></div>
+                {/* Tabs de proposta — visíveis só quando há múltiplas */}
+                {propostas.length > 1 && (
+                  <div className="mt-4 flex gap-1 overflow-x-auto rounded-xl border border-line bg-surface p-1">
+                    {propostas.map((p, i) => (
+                      <button key={i} onClick={() => setPropostaIdx(i)}
+                        className={`flex min-w-0 flex-1 items-center justify-between gap-2 rounded-lg px-3 py-2 text-[12.5px] font-medium transition-colors
+                          ${i === propostaIdx ? "bg-kist text-white" : "text-sub hover:bg-paper"}`}>
+                        <span className="truncate">{p.titulo || `Proposta ${i + 1}`}</span>
+                        <span className="flex-shrink-0 text-[10px] opacity-70">{(p.itens || []).length} itens</span>
+                        {downloadados.has(i) && <span className="flex-shrink-0 text-[10px]">✓</span>}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {/* Cabeçalho da proposta ativa quando há múltiplas */}
+                {propostas.length > 1 && (
+                  <div className="mt-3 flex flex-wrap items-center gap-2 text-[13px]">
+                    <span className="font-semibold text-ink">Proposta {prop.proposta}</span>
+                    {prop.cliente && <span className="text-sub">{prop.cliente}</span>}
+                    {prop.cnpj && <span className="font-mono text-faint">{prop.cnpj}</span>}
+                    {prop.rc_neg && <span className="rounded bg-paper px-2 py-0.5 font-mono text-[11px] text-sub">{prop.rc_neg}</span>}
+                  </div>
+                )}
+
+                <div className="mt-4"><CertaintyStrip itens={prop.itens || []} /></div>
 
                 {/* Dados da proposta para o Tiny — preenchidos aqui, exportados no CSV */}
                 <div className="mt-4 rounded-xl border border-line bg-surface p-4">
@@ -603,15 +656,15 @@ export default function App() {
                   <div className="mt-2 grid grid-cols-2 gap-3">
                     <label className="block">
                       <div className="text-[11.5px] text-sub">Prazo de entrega</div>
-                      <input value={resultado.prazo_entrega || ""}
-                        onChange={(e) => setResultado((p) => ({ ...p, prazo_entrega: e.target.value }))}
+                      <input value={prop.prazo_entrega || ""}
+                        onChange={(e) => setPropostas((prev) => prev.map((p, pi) => pi === propostaIdx ? { ...p, prazo_entrega: e.target.value } : p))}
                         placeholder="ex: 15 dias úteis"
                         className="mt-1 w-full rounded-lg border border-line2 bg-paper px-2.5 py-1.5 text-[13px] text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
                     </label>
                     <label className="block">
                       <div className="text-[11.5px] text-sub">Frete (R$)</div>
-                      <input inputMode="decimal" value={resultado.frete ?? ""}
-                        onChange={(e) => setResultado((p) => ({ ...p, frete: e.target.value }))}
+                      <input inputMode="decimal" value={prop.frete ?? ""}
+                        onChange={(e) => setPropostas((prev) => prev.map((p, pi) => pi === propostaIdx ? { ...p, frete: e.target.value } : p))}
                         placeholder="0,00"
                         className="mt-1 w-full rounded-lg border border-line2 bg-paper px-2.5 py-1.5 font-mono text-[13px] text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
                     </label>
@@ -633,7 +686,7 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {resultado.itens.map((item, i) => (
+                      {(prop.itens || []).map((item, i) => (
                         <ItemRow key={i} item={item} index={i} onChange={atualizarItem} token={token} apiUrl={API} />
                       ))}
                     </tbody>
@@ -643,7 +696,7 @@ export default function App() {
                     <div className="flex items-baseline gap-2">
                       <span className="text-[11px] uppercase eyebrow text-faint">Total estimado</span>
                       <span className="font-mono text-[16px] font-semibold text-ink">
-                        R$ {brl(resultado.itens.reduce((s, i) => s + (i.preco_un || 0) * (parseFloat(i.quantidade) || 0), 0))}
+                        R$ {brl((prop.itens || []).reduce((s, i) => s + (i.preco_un || 0) * (parseFloat(i.quantidade) || 0), 0))}
                       </span>
                     </div>
                   </div>
@@ -652,10 +705,10 @@ export default function App() {
                 {/* Custo & lucro — uso INTERNO, não vai para o CSV do Tiny */}
                 {(() => {
                   const num = (v) => { let s = String(v ?? "").trim(); if (s.includes(",")) s = s.replace(/\./g, "").replace(",", "."); return parseFloat(s) || 0; };
-                  const prodVenda = resultado.itens.reduce((s, i) => s + (i.preco_un || 0) * (parseFloat(i.quantidade) || 0), 0);
-                  const prodCusto = resultado.itens.reduce((s, i) => s + (i.preco_custo || 0) * (parseFloat(i.quantidade) || 0), 0);
-                  const custoFreteItens = resultado.itens.reduce((s, i) => s + num(i.frete_vinda), 0); // frete único por item, SEM ×qtd
-                  const freteCobr = num(resultado.frete);
+                  const prodVenda = (prop.itens || []).reduce((s, i) => s + (i.preco_un || 0) * (parseFloat(i.quantidade) || 0), 0);
+                  const prodCusto = (prop.itens || []).reduce((s, i) => s + (i.preco_custo || 0) * (parseFloat(i.quantidade) || 0), 0);
+                  const custoFreteItens = (prop.itens || []).reduce((s, i) => s + num(i.frete_vinda), 0); // frete único por item, SEM ×qtd
+                  const freteCobr = num(prop.frete);
                   const base = prodVenda + freteCobr;
                   const lucro = base - prodCusto - custoFreteItens;
                   const margem = base > 0 ? (lucro / base) * 100 : 0;
@@ -682,13 +735,14 @@ export default function App() {
                   );
                 })()}
               </div>
-            )}
+              );
+            })()}
             {step === "download" && (
               <div className="mx-auto max-w-md py-16 text-center rise">
                 <div className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-2xl bg-signalbg text-signal"><IconCheck size={26} /></div>
                 <h2 className="text-[22px] font-semibold tracking-tight text-ink">CSV pronto</h2>
                 <p className="mx-auto mt-2 max-w-xs text-[13.5px] text-sub">
-                  O arquivo <code className="rounded bg-paper px-1.5 py-0.5 font-mono text-[12px] text-ink">proposta_{resultado?.proposta}.csv</code> foi baixado e está pronto para importar no Tiny.
+                  {propostas.length > 1 ? `${propostas.length} CSVs baixados e prontos para importar no Tiny.` : <>O arquivo <code className="rounded bg-paper px-1.5 py-0.5 font-mono text-[12px] text-ink">proposta_{propostas[0]?.proposta}.csv</code> foi baixado e está pronto para importar no Tiny.</>}
                 </p>
                 {bancoInfo && (
                   <div className="mx-auto mt-5 max-w-xs rounded-lg border border-signal/30 bg-signalbg px-4 py-3 text-left text-[12.5px] text-signal">

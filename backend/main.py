@@ -62,42 +62,50 @@ def get_supabase():
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 SYSTEM_EXTRACAO = """Você é o assistente comercial da Kist Soluções em Telecom e Energia.
-Extraia itens de cotação de e-mails, textos ou imagens/prints e retorne JSON.
+Extraia itens de cotação de e-mails, textos, planilhas ou imagens e retorne JSON.
 
 RETORNE APENAS JSON VÁLIDO. Sem markdown, sem ```json, sem ```. Só o objeto JSON puro.
 
-Formato:
+Formato — SEMPRE retorne um array de propostas, mesmo que seja apenas uma:
 {
-  "cliente": "NOME DO CLIENTE",
-  "cnpj": "XX.XXX.XXX/XXXX-XX ou null",
-  "rc_neg": "RC XXXXX ou NEG-XXXXXXX ou null",
-  "proposta": "número informado ou null",
-  "itens": [
+  "propostas": [
     {
-      "descricao": "descrição comercial curta — máx 120 chars",
-      "descricao_original": "texto exato do cliente, preservado integralmente",
-      "specs_complementares": "specs técnicas detalhadas se descrição original > 150 chars ou em formato de tabela, senão null",
-      "quantidade": 1,
-      "unidade": "UN",
-      "sugerir_pn": false
+      "titulo": "identificador curto da demanda (ex: 'SC 18712 Rack', 'RC 45321', 'Planilha 1')",
+      "cliente": "NOME DO CLIENTE",
+      "cnpj": "XX.XXX.XXX/XXXX-XX ou null",
+      "rc_neg": "RC XXXXX ou NEG-XXXXXXX ou null",
+      "itens": [
+        {
+          "descricao": "descrição comercial curta — máx 120 chars",
+          "descricao_original": "texto exato do cliente, preservado integralmente",
+          "specs_complementares": "specs técnicas ou PN se presentes, senão null",
+          "quantidade": 1,
+          "unidade": "UN",
+          "sugerir_pn": false
+        }
+      ]
     }
   ]
 }
 
+QUANDO CRIAR MÚLTIPLAS PROPOSTAS:
+- O conteúdo traz seções claramente separadas por arquivo/planilha/aba → uma proposta por seção
+- O e-mail menciona explicitamente múltiplos projetos, RCs ou solicitações distintas → uma por demanda
+- Lista de itens é única (mesmo que longa) → uma única proposta
+
 REGRAS DE DESCRIÇÃO:
 - "descricao": sempre curta e comercial. Formato: [Categoria] [Marca/Modelo] [Spec principal]
-  Ex: "Smartphone Samsung Galaxy A55 5G 128GB", "Monitor 24pol Full HD IPS", "Cabo FTP CAT5E 305m"
-  Se vier como tabela de specs (RAM: 4GB | Tela: 6.5" | ...), monte a descrição comercial a partir delas
 - "descricao_original": preservar EXATAMENTE como veio, sem alterar nada
-- "specs_complementares": preencher quando descrição original for longa ou em tabela. Null caso contrário
-- "sugerir_pn": true SOMENTE se (1) item de alto valor agregado (notebook, desktop, servidor, monitor,
-  switch gerenciável, roteador, UPS, câmera IP, projetor, TV, tablet, storage) E (2) sem PN/modelo
-  específico já definido. Commodities e itens com modelo específico → sempre false
+- "specs_complementares": preencher quando original for longa ou tabela; incluir PN/código se presente
+- "sugerir_pn": true SÓ para itens de alto valor (notebook, servidor, switch gerenciável, UPS,
+  câmera IP, storage) sem modelo específico definido. Commodities → sempre false
 
 REGRAS GERAIS:
 - Extraia TODOS os itens, inclusive de imagens/prints
-- Múltiplos prints: consolide sem duplicatas
 - quantidade = número, nunca string
+- Em tabelas com coluna Qtd/Quantidade/QTDE: leia a célula exata da coluna. A quantidade NÃO
+  é o número da linha nem o código do item. Verifique cada linha antes de confirmar.
+- Em tabelas com coluna PN/Código/Nº do item/SKU: inclua em specs_complementares como "PN: XXXXX"
 """
 
 SYSTEM_MATCHING = """Você é especialista em materiais elétricos, telecom, infraestrutura e TI.
@@ -207,166 +215,21 @@ def banco_stats():
     except Exception as e:
         return {"erro": str(e)}
 
-@app.post("/extrair")
-async def extrair_email(
-    texto: str = Form(None),
-    arquivo: UploadFile = File(None),
-    imagens: list[UploadFile] = File(default=[]),
-    numero_proposta: str = Form(...),
-    token_form: str = Form(None),
-    request: Request = None,
-    usuario: str = Depends(verificar_token)
-):
-    """Extrai itens do e-mail/prints e faz matching inteligente com o banco"""
+def _fazer_matching(itens_raw: list, claude, sb) -> list:
+    """Faz matching dos itens extraídos com o banco de preços via Claude Haiku.
+    Reutilizável pelo endpoint /extrair para cada proposta individualmente."""
+    import json as _jm
 
-    # 1. Obter conteúdo textual
-    conteudo = ""
-    if arquivo and arquivo.filename.endswith(".msg"):
-        dados = await arquivo.read()
-        with open("/tmp/upload.msg", "wb") as f:
-            f.write(dados)
-        msg = extract_msg.openMsg("/tmp/upload.msg")
-        corpo = (msg.body or "").strip()
-        conteudo = f"Assunto: {msg.subject}\n\nCorpo:\n{corpo}"
-
-        # Extrair anexos
-        textos_anexos = []
-        for att in msg.attachments:
-            fname = att.longFilename or att.shortFilename or ""
-            fname_lower = fname.lower()
-            if not att.data:
-                continue
-            if fname_lower.endswith(".pdf"):
-                try:
-                    import pdfplumber, io as _io
-                    with pdfplumber.open(_io.BytesIO(att.data)) as pdf:
-                        texto_pdf = "".join((p.extract_text() or "") + "\n" for p in pdf.pages)
-                    if texto_pdf.strip():
-                        textos_anexos.append(f"[ANEXO PDF: {fname}]\n{texto_pdf.strip()}")
-                except Exception as e:
-                    textos_anexos.append(f"[ANEXO PDF: {fname} - erro: {str(e)}]")
-            elif fname_lower.endswith((".xlsx", ".xls", ".xlsm")):
-                try:
-                    import openpyxl, io as _io
-                    wb = openpyxl.load_workbook(_io.BytesIO(att.data), read_only=True, data_only=True)
-                    for sname in wb.sheetnames:
-                        ws = wb[sname]
-                        linhas = []
-                        for row in ws.iter_rows(values_only=True):
-                            vals = [str(c).strip() if c is not None else "" for c in row]
-                            if any(vals):
-                                linhas.append(" | ".join(vals))
-                        if linhas:
-                            textos_anexos.append(f"[ANEXO EXCEL: {fname}/{sname}]\n" + "\n".join(linhas[:200]))
-                except Exception:
-                    pass
-            elif fname_lower.endswith(".csv"):
-                try:
-                    textos_anexos.append(f"[ANEXO CSV: {fname}]\n{att.data.decode('utf-8-sig', errors='replace')[:3000]}")
-                except Exception:
-                    pass
-        if textos_anexos:
-            conteudo += "\n\n" + "\n\n".join(textos_anexos)
-
-        # Coletar imagens embutidas do .msg (itens colados como print/tabela do Excel)
-        # Ignora logos/assinaturas: arquivos com "logo"/"assinatura" no nome
-        # ou muito pequenos (< 5 KB — ícones/bullets de email)
-        _IMG_SKIP = re.compile(r'logo|logotipo|assinatura|signature|bullet|icon', re.I)
-        imgs_msg = []
-        for att in msg.attachments:
-            fname = att.longFilename or att.shortFilename or ""
-            flo = fname.lower()
-            if not att.data:
-                continue
-            if not flo.endswith((".png", ".jpg", ".jpeg", ".webp")):
-                continue
-            if _IMG_SKIP.search(flo):
-                continue
-            if len(att.data) < 5000:  # < 5 KB → provavelmente ícone/logo
-                continue
-            imgs_msg.append((fname, att.data))
-
-    elif texto:
-        conteudo = texto
-        imgs_msg = []
-    else:
-        imgs_msg = []
-
-    # 2. Montar mensagem para o Claude (texto + imagens)
-    conteudo_msg = []
-    if conteudo.strip():
-        conteudo_msg.append({"type": "text", "text": f"Número da proposta: {numero_proposta}\n\nConteúdo:\n{conteudo[:8000]}"})
-
-    # Imagens: direto do upload (prints colados pelo operador) + embutidas no .msg
-    imgs_validas = [img for img in (imagens or []) if img and img.filename]
-    todas_imgs_len = len(imgs_validas) + len(imgs_msg)
-    if todas_imgs_len > 0:
-        conteudo_msg.append({"type": "text", "text": f"{'Além do conteúdo acima, analise também os' if conteudo.strip() else 'Extrai os itens dos'} {todas_imgs_len} print(s)/imagem(ns):"})
-        for img in imgs_validas[:6]:
-            img_bytes = await img.read()
-            img_b64 = _b64.standard_b64encode(img_bytes).decode()
-            fname_lower = (img.filename or "").lower()
-            media_type = "image/png" if fname_lower.endswith(".png") else \
-                         "image/jpeg" if fname_lower.endswith((".jpg", ".jpeg")) else \
-                         "image/webp" if fname_lower.endswith(".webp") else "image/png"
-            conteudo_msg.append({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}})
-        for fname, img_bytes in imgs_msg[:4]:  # máx 4 imagens do .msg
-            img_b64 = _b64.standard_b64encode(img_bytes).decode()
-            flo = fname.lower()
-            media_type = "image/jpeg" if flo.endswith((".jpg", ".jpeg")) else \
-                         "image/webp" if flo.endswith(".webp") else "image/png"
-            conteudo_msg.append({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}})
-
-    if not conteudo_msg:
-        raise HTTPException(400, "Envie texto, arquivo .msg, imagem ou print")
-
-    # 3. Extração dos itens via Claude
-    t0 = time.time()
-    claude = get_claude()
-    resp_extracao = claude.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=4000,
-        system=SYSTEM_EXTRACAO,
-        messages=[{"role": "user", "content": conteudo_msg}],
-        timeout=45.0
-    )
-    t_extracao = time.time() - t0
-
-    import json
-    raw = resp_extracao.content[0].text.strip()
-    raw = re.sub(r'^```(?:json)?\s*', '', raw)
-    raw = re.sub(r'\s*```$', '', raw.strip())
-    try:
-        dados_email = json.loads(raw)
-    except Exception as e:
-        raise HTTPException(500, f"Erro ao parsear extração: {str(e)} | Resposta: {raw[:300]}")
-
-    itens_raw = dados_email.get("itens", [])
     if not itens_raw:
-        return {
-            "cliente": dados_email.get("cliente", ""),
-            "cnpj": dados_email.get("cnpj"),
-            "rc_neg": dados_email.get("rc_neg"),
-            "proposta": numero_proposta,
-            "itens": [],
-            "total_itens": 0, "com_preco": 0, "sem_preco": 0
-        }
+        return []
 
-    # 4. Buscar candidatos do banco (1 query)
-    sb = get_supabase()
-    t_banco = time.time()
+    # Buscar candidatos em lote
     try:
-        res_batch = sb.table('produtos')\
-            .select('descricao,preco_un,proposta_tiny,data_ref')\
-            .order('data_ref', desc=True).limit(500).execute()
+        res_batch = sb.table("produtos")            .select("descricao,preco_un,proposta_tiny,data_ref")            .order("data_ref", desc=True).limit(500).execute()
         todos_candidatos = res_batch.data or []
     except Exception:
         todos_candidatos = []
 
-    # 5. Matching inteligente via Claude — para cada item, pré-filtrar candidatos e pedir match
-    t_match = time.time()
-
-    # Montar prompt de matching com todos os itens de uma vez
     itens_txt = ""
     for i, item in enumerate(itens_raw):
         itens_txt += f"\nItem {i}: {item.get('descricao', '')}"
@@ -374,7 +237,7 @@ async def extrair_email(
     candidatos_por_item = []
     candidatos_txt = ""
     for i, item in enumerate(itens_raw):
-        candidatos = _prefiltro_candidatos(item.get('descricao', ''), todos_candidatos)
+        candidatos = _prefiltro_candidatos(item.get("descricao", ""), todos_candidatos)
         candidatos_por_item.append(candidatos)
         if candidatos:
             candidatos_txt += f"\n\n--- Candidatos para Item {i} ({item.get('descricao','')[:60]}) ---\n"
@@ -388,31 +251,25 @@ Candidatos do banco de preços:{candidatos_txt}
 Para cada item, identifique qual candidato é o mesmo produto ou retorne null se nenhum for adequado.
 Lembre: fabricante diferente = null. Categoria diferente = null. Seja rigoroso."""
 
-    resp_match = claude.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=3000,
-        system=SYSTEM_MATCHING,
-        messages=[{"role": "user", "content": prompt_matching}],
-        temperature=0.0,  # matching analítico — máxima consistência
-        timeout=30.0
-    )
-
-    raw_match = resp_match.content[0].text.strip()
-    raw_match = re.sub(r'^```(?:json)?\s*', '', raw_match)
-    raw_match = re.sub(r'\s*```$', '', raw_match.strip())
     try:
-        resultado_match = json.loads(raw_match)
-        matches = {m["indice"]: m for m in resultado_match.get("matches", [])}
+        resp_match = claude.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=3000,
+            system=SYSTEM_MATCHING,
+            messages=[{"role": "user", "content": prompt_matching}],
+            temperature=0.0, timeout=30.0
+        )
+        raw_match = resp_match.content[0].text.strip()
+        raw_match = re.sub(r'^```(?:json)?\s*', '', raw_match)
+        raw_match = re.sub(r'\s*```$', '', raw_match.strip())
+        matches = {m["indice"]: m for m in _jm.loads(raw_match).get("matches", [])}
     except Exception:
         matches = {}
 
-    # 6. Montar resposta final
     itens_com_preco = []
     for i, item in enumerate(itens_raw):
         desc = item.get("descricao", "")
         desc_original = item.get("descricao_original", desc) or desc
         specs_comp = item.get("specs_complementares") or ""
-
         match = matches.get(i, {})
         confianca = match.get("confianca", "nenhuma")
         preco_un = 0.0
@@ -420,15 +277,12 @@ Lembre: fabricante diferente = null. Categoria diferente = null. Seja rigoroso."
         obs_item = "SEM PREÇO"
 
         if confianca in ("alta", "media") and match.get("banco_descricao"):
-            # Match confiável: usa descrição do banco (mais completa/canônica)
             desc_final = match["banco_descricao"]
             preco_un = float(match.get("banco_preco") or 0)
             proposta_ref = match.get("banco_proposta", "")
             obs_item = f"{'✓' if confianca == 'alta' else '~'} ref {proposta_ref}" if proposta_ref else ""
         elif confianca == "baixa" and match.get("banco_descricao"):
-            # Match incerto: PRESERVA descrição original do cliente
-            # mas guarda o candidato do banco para o operador conferir
-            desc_final = desc  # descrição original do cliente, sem alterar
+            desc_final = desc
             preco_un = float(match.get("banco_preco") or 0)
             obs_item = f"⚠ CONFIRA — candidato no banco: {match['banco_descricao']} | motivo: {match.get('motivo','')}"
 
@@ -448,17 +302,197 @@ Lembre: fabricante diferente = null. Categoria diferente = null. Seja rigoroso."
             "sugerir_pn": _validar_sugerir_pn(item.get("sugerir_pn", False), desc)
         })
 
-    com_preco = sum(1 for i in itens_com_preco if i["tem_preco"])
-    return {
-        "cliente": dados_email.get("cliente", ""),
-        "cnpj": dados_email.get("cnpj"),
-        "rc_neg": dados_email.get("rc_neg"),
-        "proposta": numero_proposta,
-        "itens": itens_com_preco,
-        "total_itens": len(itens_com_preco),
-        "com_preco": com_preco,
-        "sem_preco": len(itens_com_preco) - com_preco
-    }
+    return itens_com_preco
+
+
+@app.post("/extrair")
+async def extrair_email(
+    texto: str = Form(None),
+    arquivos: list[UploadFile] = File(default=[]),   # múltiplos arquivos (email + Excels + PDFs)
+    imagens: list[UploadFile] = File(default=[]),
+    numero_proposta: str = Form(...),
+    token_form: str = Form(None),
+    request: Request = None,
+    usuario: str = Depends(verificar_token)
+):
+    """Extrai itens do e-mail/prints/planilhas e faz matching com o banco.
+    Aceita múltiplos arquivos simultaneamente; retorna uma ou mais propostas."""
+
+    import json as _json_ext
+
+    imgs_msg: list = []        # imagens embutidas nos .msg
+    contexto_email = ""        # body/assunto do email (contexto de cliente/CNPJ)
+    conteudo_files: list = []  # [(nome, texto)] por arquivo de conteúdo (Excel, PDF)
+    todas_imgs_len = 0
+
+    _IMG_SKIP_EXT = re.compile(r'logo|logotipo|assinatura|signature|bullet|icon', re.I)
+
+    def _extrair_excel_bytes(data, fname):
+        try:
+            import openpyxl, io as _io
+            wb = openpyxl.load_workbook(_io.BytesIO(data), read_only=True, data_only=True)
+            partes = []
+            for sname in wb.sheetnames:
+                ws = wb[sname]
+                linhas = []
+                for row in ws.iter_rows(values_only=True):
+                    vals = [str(c).strip() if c is not None else "" for c in row]
+                    if any(v and v != "None" for v in vals):
+                        linhas.append(" | ".join(vals))
+                if linhas:
+                    partes.append(f"[ABA: {sname}]\n" + "\n".join(linhas[:300]))
+            return "\n\n".join(partes)
+        except Exception:
+            return ""
+
+    # ── Processar cada arquivo enviado ──────────────────────────────────────
+    for arq in (arquivos or []):
+        if not (arq and arq.filename):
+            continue
+        fname = arq.filename
+        flo = fname.lower()
+        dados = await arq.read()
+
+        if flo.endswith(".msg"):
+            # Email: extrai corpo (contexto) + anexos do email
+            with open("/tmp/ext_upload.msg", "wb") as _f:
+                _f.write(dados)
+            _msg = extract_msg.openMsg("/tmp/ext_upload.msg")
+            corpo = (_msg.body or "").strip()
+            contexto_email += f"Assunto: {_msg.subject}\n\nCorpo:\n{corpo}\n\n"
+
+            for att in _msg.attachments:
+                afn = (att.longFilename or att.shortFilename or "").lower()
+                if not att.data:
+                    continue
+                if afn.endswith((".xlsx", ".xls", ".xlsm")):
+                    xl = _extrair_excel_bytes(att.data, afn)
+                    if xl.strip():
+                        conteudo_files.append((att.longFilename or att.shortFilename, xl))
+                elif afn.endswith(".pdf") and not _PDF_SKIP.search(afn):
+                    pt = _pdf_po_texto(att.data)
+                    if pt.strip():
+                        conteudo_files.append((att.longFilename or att.shortFilename, pt))
+                elif afn.endswith((".png", ".jpg", ".jpeg", ".webp")):
+                    if not _IMG_SKIP_EXT.search(afn) and len(att.data) >= 5000:
+                        imgs_msg.append((afn, att.data))
+
+        elif flo.endswith((".xlsx", ".xls", ".xlsm")):
+            xl = _extrair_excel_bytes(dados, fname)
+            if xl.strip():
+                conteudo_files.append((fname, xl))
+
+        elif flo.endswith(".pdf"):
+            pt = _pdf_po_texto(dados)
+            if pt.strip():
+                conteudo_files.append((fname, pt))
+
+        elif flo.endswith((".png", ".jpg", ".jpeg", ".webp")):
+            if not _IMG_SKIP_EXT.search(flo):
+                imgs_msg.append((flo, dados))
+
+        else:
+            try:
+                contexto_email += dados.decode("utf-8", "ignore")[:4000] + "\n\n"
+            except Exception:
+                pass
+
+    if texto:
+        contexto_email += texto
+
+    # ── Montar chamadas de extração ──────────────────────────────────────────
+    # Regra: um arquivo de conteúdo (Excel/PDF) = uma proposta candidata
+    # Sem arquivos de conteúdo = tudo junto em uma chamada (body + imagens)
+    imgs_validas = [img for img in (imagens or []) if img and img.filename]
+    todas_imgs_len = len(imgs_validas) + len(imgs_msg)
+    modelo_extracao = "claude-sonnet-4-6" if todas_imgs_len > 0 else "claude-haiku-4-5-20251001"
+    claude = get_claude()
+
+    propostas_raw: list = []
+
+    async def _chamar_extracao(payload_txt, imgs_inline=None, imgs_upload=None):
+        """Monta o payload e chama o Claude para extração."""
+        msg_content = []
+        if payload_txt.strip():
+            msg_content.append({"type": "text", "text": payload_txt[:12000]})
+        if imgs_inline:
+            msg_content.append({"type": "text", "text": f"Analise também {len(imgs_inline)} imagem(ns):"})
+            for _, img_bytes in (imgs_inline or [])[:4]:
+                msg_content.append({"type": "image", "source": {"type": "base64",
+                    "media_type": "image/png", "data": _b64.standard_b64encode(img_bytes).decode()}})
+        if imgs_upload:
+            for img in (imgs_upload or [])[:4]:
+                ib = await img.read()
+                flo2 = (img.filename or "").lower()
+                mt = "image/jpeg" if flo2.endswith((".jpg", ".jpeg")) else "image/png"
+                msg_content.append({"type": "image", "source": {"type": "base64", "media_type": mt,
+                    "data": _b64.standard_b64encode(ib).decode()}})
+        if not msg_content:
+            return []
+        resp = claude.messages.create(
+            model=modelo_extracao, max_tokens=4000,
+            system=SYSTEM_EXTRACAO,
+            messages=[{"role": "user", "content": msg_content}],
+        )
+        raw = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+        raw = re.sub(r'^```json\s*', '', raw); raw = re.sub(r'\s*```$', '', raw)
+        try:
+            parsed = _json_ext.loads(raw)
+            # Normalizar: se retornar formato antigo (sem propostas[]), encapsular
+            if "itens" in parsed and "propostas" not in parsed:
+                parsed = {"propostas": [parsed]}
+            return parsed.get("propostas", [])
+        except Exception:
+            return []
+
+    if conteudo_files:
+        # Uma chamada por arquivo de conteúdo
+        for nome_arq, conteudo_arq in conteudo_files:
+            ctx = f"CONTEXTO (cliente/CNPJ/referência do e-mail):\n{contexto_email[:3000]}\n\n" \
+                  f"CONTEÚDO PARA COTAÇÃO — arquivo: {nome_arq}\n{conteudo_arq}"
+            props = await _chamar_extracao(ctx)
+            for p in props:
+                p.setdefault("titulo", nome_arq)
+            propostas_raw.extend(props)
+    else:
+        # Tudo junto (body + imagens)
+        props = await _chamar_extracao(contexto_email, imgs_inline=imgs_msg, imgs_upload=imgs_validas)
+        propostas_raw.extend(props)
+
+    if not propostas_raw:
+        propostas_raw = [{"titulo": "", "cliente": "", "cnpj": None,
+                          "rc_neg": None, "itens": []}]
+
+    # ── Matching com banco + atribuição de números de proposta ──────────────
+    try:
+        base_num = int(numero_proposta)
+    except Exception:
+        base_num = None
+
+    t0 = time.time()
+    resultado_propostas = []
+    for idx_p, prop_raw in enumerate(propostas_raw):
+        num_prop = str(base_num + idx_p) if base_num is not None else (
+            numero_proposta if idx_p == 0 else f"{numero_proposta}-{idx_p + 1}")
+        prop_raw["proposta"] = num_prop
+
+        itens_brutos = prop_raw.get("itens", []) or []
+        if not itens_brutos:
+            resultado_propostas.append({**prop_raw, "itens": []})
+            continue
+
+        # Matching com o banco de preços
+        sb = get_supabase()
+        try:
+            itens_enriquecidos = _fazer_matching(itens_brutos, claude, sb)
+        except Exception:
+            itens_enriquecidos = itens_brutos
+
+        resultado_propostas.append({**prop_raw, "itens": itens_enriquecidos})
+
+    elapsed = time.time() - t0
+
+    return {"propostas": resultado_propostas, "elapsed": round(elapsed, 2)}
 
 
 @app.post("/upsert-precos")
