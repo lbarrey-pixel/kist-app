@@ -482,7 +482,6 @@ export default function App() {
       }
       if (imgs.length > 0) {
         setImagens((prev) => [...prev, ...imgs].slice(0, 6));
-        setArquivo(null);
       }
     }
     document.addEventListener("paste", handlePaste);
@@ -779,7 +778,7 @@ export default function App() {
                   <textarea rows={5}
                     className="w-full resize-none rounded-lg border border-line2 bg-paper px-3 py-2.5 font-mono text-[12.5px] text-ink cell-input"
                     placeholder="Cole aqui o conteúdo do e-mail de cotação…" value={texto}
-                    onChange={(e) => { setTexto(e.target.value); setArquivo(null); }} />
+                    onChange={(e) => setTexto(e.target.value)} />
 
                   {erro && <div className="rounded-lg border border-rose/30 bg-rosebg px-4 py-3 text-[13px] text-rose">{erro}</div>}
 
