@@ -369,20 +369,61 @@ async def extrair_email(
     _IMG_SKIP_EXT = re.compile(r'logo|logotipo|assinatura|signature|bullet|icon', re.I)
 
     def _extrair_excel_bytes(data, fname):
+        """Extrai Excel priorizando linhas de item.
+        Detecta o header da tabela e extrai só metadados-chave + linhas de item.
+        Fallback para extração bruta se header não for detectável.
+        """
         try:
             import openpyxl, io as _io
             wb = openpyxl.load_workbook(_io.BytesIO(data), read_only=True, data_only=True)
             partes = []
+            HQTD = re.compile(r'\bqtd|\bquant', re.I)
+            HDESC = re.compile(r'descri|material|servi[çc]|equipamento', re.I)
+            HMETA = re.compile(r'cnpj|empresa|cliente|faturamento|rfq|referência|nº\s*rc|pedido', re.I)
             for sname in wb.sheetnames:
                 ws = wb[sname]
+                rows = list(ws.iter_rows(values_only=True))
+                metadados, item_rows, header_idx = [], [], None
+                for i, row in enumerate(rows):
+                    vals = [str(c).strip() if c is not None else "" for c in row]
+                    nao_v = [v for v in vals if v and v != "None"]
+                    if not nao_v:
+                        continue
+                    linha = " | ".join(nao_v)
+                    first = nao_v[0]
+                    if header_idx is None:
+                        if len(nao_v) >= 4 and HQTD.search(linha) and HDESC.search(linha):
+                            header_idx = i
+                            item_rows.append(f"COLUNAS: {linha}")
+                            continue
+                        if HMETA.search(linha):
+                            metadados.append(linha)
+                        continue
+                    try:
+                        int(first)
+                        item_rows.append(linha)
+                    except ValueError:
+                        pass
+                if metadados:
+                    partes.append("[META]\n" + "\n".join(metadados[:12]))
+                if item_rows:
+                    partes.append(f"[ITENS - {sname}]\n" + "\n".join(item_rows))
+            resultado = "\n\n".join(partes)
+            if resultado.strip():
+                return resultado
+            # Fallback: extração bruta para planilhas simples sem header detectável
+            partes2 = []
+            wb2 = openpyxl.load_workbook(_io.BytesIO(data), read_only=True, data_only=True)
+            for sname in wb2.sheetnames:
+                ws = wb2[sname]
                 linhas = []
                 for row in ws.iter_rows(values_only=True):
                     vals = [str(c).strip() if c is not None else "" for c in row]
                     if any(v and v != "None" for v in vals):
                         linhas.append(" | ".join(vals))
                 if linhas:
-                    partes.append(f"[ABA: {sname}]\n" + "\n".join(linhas[:300]))
-            return "\n\n".join(partes)
+                    partes2.append(f"[ABA: {sname}]\n" + "\n".join(linhas[:300]))
+            return "\n\n".join(partes2)
         except Exception:
             return ""
 
@@ -455,7 +496,7 @@ async def extrair_email(
         """Monta o payload e chama o Claude para extração."""
         msg_content = []
         if payload_txt.strip():
-            msg_content.append({"type": "text", "text": payload_txt[:12000]})
+            msg_content.append({"type": "text", "text": payload_txt[:20000]})
         if imgs_inline:
             msg_content.append({"type": "text", "text": f"Analise também {len(imgs_inline)} imagem(ns):"})
             for _, img_bytes in (imgs_inline or [])[:4]:
@@ -490,7 +531,7 @@ async def extrair_email(
         # Uma chamada por arquivo de conteúdo
         for nome_arq, conteudo_arq in conteudo_files:
             ctx = f"CONTEXTO (cliente/CNPJ/referência do e-mail):\n{contexto_email[:3000]}\n\n" \
-                  f"CONTEÚDO PARA COTAÇÃO — arquivo: {nome_arq}\n{conteudo_arq}"
+                  f"CONTEÚDO PARA COTAÇÃO — arquivo: {nome_arq}\n{conteudo_arq[:15000]}"
             props = await _chamar_extracao(ctx)
             for p in props:
                 p.setdefault("titulo", nome_arq)
