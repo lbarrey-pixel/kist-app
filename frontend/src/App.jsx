@@ -427,11 +427,25 @@ function ItemRow({ item, index, onChange, token, apiUrl }) {
 }
 
 export default function App() {
-  const [usuario, setUsuario] = useState(null);
+  // Sessão persistida em sessionStorage: sobrevive a refresh/deploy,
+  // limpa ao fechar a aba. auto_select no Google reconecta silenciosamente
+  // na maioria dos casos sem interação do usuário.
+  const [token, setToken] = useState(() => {
+    try {
+      const cred = sessionStorage.getItem("kist_token");
+      if (!cred) return null;
+      const exp = JSON.parse(atob(cred.split(".")[1])).exp;
+      if (exp * 1000 < Date.now()) { sessionStorage.removeItem("kist_token"); return null; }
+      return cred;
+    } catch { return null; }
+  });
+  const [usuario, setUsuario] = useState(() => {
+    try { const u = sessionStorage.getItem("kist_user"); return u ? JSON.parse(u) : null; }
+    catch { return null; }
+  });
   const [showDocs, setShowDocs] = useState(false);
   const [pagina, setPagina] = useState("nova"); // nova | propostas | ordens
   const [novaOCPayload, setNovaOCPayload] = useState(null);
-  const [token, setToken] = useState(null);
   const [step, setStep] = useState("input");
   const [loading, setLoading] = useState(false);
   const [salvandoBanco, setSalvandoBanco] = useState(false);
@@ -491,13 +505,23 @@ export default function App() {
   function handleGoogleResponse(response) {
     const credential = response.credential;
     const payload = JSON.parse(atob(credential.split(".")[1]));
+    const user = { nome: payload.name, email: payload.email, foto: payload.picture };
     setToken(credential);
-    setUsuario({ nome: payload.name, email: payload.email, foto: payload.picture });
+    setUsuario(user);
+    // Persistir na aba atual — sobrevive a refresh/deploy do Render
+    try {
+      sessionStorage.setItem("kist_token", credential);
+      sessionStorage.setItem("kist_user", JSON.stringify(user));
+    } catch (e) {}
+    // Renovar token ~5min antes de expirar (sem interação do usuário)
     const renovarEm = payload.exp * 1000 - Date.now() - 5 * 60 * 1000;
     if (renovarEm > 0) {
       setTimeout(() => {
         if (window.google) {
-          window.google.accounts.id.initialize({ client_id: GOOGLE_CLIENT_ID, callback: handleGoogleResponse, ux_mode: "popup" });
+          window.google.accounts.id.initialize({
+            client_id: GOOGLE_CLIENT_ID, callback: handleGoogleResponse,
+            ux_mode: "popup", auto_select: true,
+          });
           window.google.accounts.id.prompt(() => {});
         }
       }, renovarEm);
@@ -506,11 +530,19 @@ export default function App() {
 
   function renderBotaoGoogle(el) {
     if (!el || !window.google || !GOOGLE_CLIENT_ID) return;
-    window.google.accounts.id.initialize({ client_id: GOOGLE_CLIENT_ID, callback: handleGoogleResponse, ux_mode: "popup" });
+    window.google.accounts.id.initialize({
+      client_id: GOOGLE_CLIENT_ID, callback: handleGoogleResponse,
+      ux_mode: "popup", auto_select: true,
+    });
+    // Tentativa de reconexão silenciosa (funciona se o usuário ainda está logado no Google)
+    window.google.accounts.id.prompt(() => {});
     window.google.accounts.id.renderButton(el, { theme: "outline", size: "large", text: "signin_with", locale: "pt-BR", width: 280 });
   }
 
   function logout() {
+    try { sessionStorage.removeItem("kist_token"); sessionStorage.removeItem("kist_user"); } catch (e) {}
+    // Cancelar auto_select para não logar de volta imediatamente após logout explícito
+    try { if (window.google) window.google.accounts.id.disableAutoSelect(); } catch (e) {}
     setUsuario(null); setToken(null); setStep("input"); setResultado(null);
     setTexto(""); setArquivos([]); setImagens([]); setNumeroProposta(""); setErro("");
     setPropostas([]); setPropostaIdx(0); setDownloadados(new Set());
