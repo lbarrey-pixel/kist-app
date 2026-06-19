@@ -50,7 +50,7 @@ function ApprovalModal({ proposta, itens, onClose, onConfirm }) {
   );
 }
 
-export default function Propostas({ token, usuario, onCriarOC }) {
+export default function Propostas({ token, usuario, onCriarOC, onAbrirProposta }) {
   const authHeaders = () => ({ Authorization: `Bearer ${token}` });
   const [mostrarPO, setMostrarPO] = useState(false);
 
@@ -182,7 +182,23 @@ export default function Propostas({ token, usuario, onCriarOC }) {
                         {(p.usuario_nome || "?").charAt(0).toUpperCase()}
                       </span>
                     </td>
-                    <td className="px-4 py-3 text-right text-[12px] text-faint">{aberta ? "fechar" : "abrir"}</td>
+                    <td className="px-4 py-3">
+                      <div className="flex items-center justify-end gap-2">
+                        {p.status === "rascunho" && (
+                          <span className="rounded-md bg-amber/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber">
+                            Rascunho
+                          </span>
+                        )}
+                        {onAbrirProposta && (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); onAbrirProposta(p.id ?? p.numero_proposta); }}
+                            className="rounded-md border border-line2 bg-surface px-2 py-0.5 text-[11px] text-sub hover:border-kist/40 hover:text-kist">
+                            Abrir e editar
+                          </button>
+                        )}
+                        <span className="text-[11px] text-faint">{aberta ? "fechar" : "ver itens"}</span>
+                      </div>
+                    </td>
                   </tr>
 
                   {aberta && (

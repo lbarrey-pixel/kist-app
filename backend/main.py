@@ -995,56 +995,79 @@ async def buscar_alerta_imagem(descricao: str, usuario: str = Depends(verificar_
 
 @app.post("/salvar-proposta")
 async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)):
-    """Salva proposta e itens no banco após confirmação"""
+    """Upsert de proposta e itens. status: 'rascunho' | 'confirmada'.
+    Identifica pelo numero_proposta — cria se não existir, atualiza se existir.
+    Itens antigos são substituídos pelos novos (delete + insert).
+    """
     sb = get_supabase()
-
-    # Calcular valor total estimado
     itens = payload.get("itens", [])
     valor_total = sum(
         float(i.get("preco_un") or 0) * float(i.get("quantidade") or 1)
         for i in itens
     )
+    com_preco  = sum(1 for i in itens if float(i.get("preco_un") or 0) > 0)
+    sem_preco  = len(itens) - com_preco
+    status     = payload.get("status", "confirmada")
+    numero     = str(payload.get("proposta") or payload.get("numero_proposta") or "")
 
-    # Inserir proposta
-    res = sb.table("propostas").insert({
-        "numero_proposta": payload.get("proposta"),
-        "cliente":         payload.get("cliente"),
-        "cnpj":            payload.get("cnpj"),
-        "rc_neg":          payload.get("rc_neg"),
-        "usuario_email":   usuario,
-        "usuario_nome":    payload.get("usuario_nome", ""),
-        "total_itens":     len(itens),
-        "com_preco":       payload.get("com_preco", 0),
-        "sem_preco":       payload.get("sem_preco", 0),
+    prop_data = {
+        "numero_proposta":      numero,
+        "cliente":              payload.get("cliente", ""),
+        "cnpj":                 payload.get("cnpj") or None,
+        "rc_neg":               payload.get("rc_neg") or None,
+        "usuario_email":        usuario,
+        "usuario_nome":         payload.get("usuario_nome", ""),
+        "total_itens":          len(itens),
+        "com_preco":            com_preco,
+        "sem_preco":            sem_preco,
         "valor_total_estimado": valor_total,
-        "frete_recebimento": float(payload.get("frete_recebimento") or 0),
-    }).execute()
+        "frete_recebimento":    float(payload.get("frete") or payload.get("frete_recebimento") or 0),
+        "prazo_entrega":        payload.get("prazo_entrega") or None,
+        "status":               status,
+    }
 
-    proposta_id = res.data[0]["id"]
+    # Upsert: buscar pelo numero_proposta
+    existing = sb.table("propostas").select("id").eq("numero_proposta", numero).limit(1).execute()
+    if existing.data:
+        proposta_id = existing.data[0]["id"]
+        sb.table("propostas").update(prop_data).eq("id", proposta_id).execute()
+        # Substituir itens
+        sb.table("itens_proposta").delete().eq("proposta_id", proposta_id).execute()
+    else:
+        res = sb.table("propostas").insert(prop_data).execute()
+        proposta_id = res.data[0]["id"]
 
-    # Inserir itens
     if itens:
-        rows = []
-        for i in itens:
-            rows.append({
-                "proposta_id":       proposta_id,
-                "descricao_original": i.get("descricao_original", ""),
-                "descricao_final":   i.get("descricao_final", ""),
-                "quantidade":        float(i.get("quantidade") or 1),
-                "unidade":           i.get("unidade", "UN"),
-                "preco_venda":       float(i.get("preco_un") or 0),
-                "preco_custo":       float(i.get("preco_custo") or 0),
-                "frete_vinda":       float(i.get("frete_vinda") or 0),
-                "confianca_match":   i.get("confianca_match", ""),
-                "specs_complementares": i.get("specs_complementares", ""),
-                "fornecedor":        i.get("fornecedor", ""),
-                "link_fornecedor":   i.get("link_fornecedor", ""),
-                "sku_fornecedor":    i.get("sku_fornecedor", ""),
-                "obs_interna":       i.get("obs_interna", ""),
-            })
+        rows = [{
+            "proposta_id":          proposta_id,
+            "descricao_original":   i.get("descricao_original", ""),
+            "descricao_final":      i.get("descricao_final", ""),
+            "quantidade":           float(i.get("quantidade") or 1),
+            "unidade":              i.get("unidade", "UN"),
+            "preco_venda":          float(i.get("preco_un") or 0),
+            "preco_custo":          float(i.get("preco_custo") or 0),
+            "frete_vinda":          float(i.get("frete_vinda") or 0),
+            "confianca_match":      i.get("confianca_match", ""),
+            "specs_complementares": i.get("specs_complementares", ""),
+            "fornecedor":           i.get("fornecedor", ""),
+            "link_fornecedor":      i.get("link_fornecedor", ""),
+            "sku_fornecedor":       i.get("sku_fornecedor", ""),
+            "obs_interna":          i.get("obs_interna", ""),
+        } for i in itens]
         sb.table("itens_proposta").insert(rows).execute()
 
-    return {"proposta_id": proposta_id, "total_itens": len(itens)}
+    return {"proposta_id": proposta_id, "total_itens": len(itens), "status": status}
+
+
+@app.get("/propostas/{proposta_id}/detalhe")
+async def detalhe_proposta(proposta_id: int, usuario: str = Depends(verificar_token)):
+    """Retorna proposta completa + itens para reabrir na tela de revisão."""
+    sb = get_supabase()
+    prop = sb.table("propostas").select("*").eq("id", proposta_id).limit(1).execute()
+    if not prop.data:
+        raise HTTPException(status_code=404, detail="Proposta não encontrada")
+    itens = sb.table("itens_proposta").select("*").eq("proposta_id", proposta_id).execute()
+    return {"proposta": prop.data[0], "itens": itens.data or []}
 
 
 @app.get("/propostas")

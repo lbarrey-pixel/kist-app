@@ -430,6 +430,12 @@ export default function App() {
   // Sessão persistida em sessionStorage: sobrevive a refresh/deploy,
   // limpa ao fechar a aba. auto_select no Google reconecta silenciosamente
   // na maioria dos casos sem interação do usuário.
+  const [propostaId, setPropostaId]     = useState(null);   // DB id após primeiro save
+  const [salvando,   setSalvando]       = useState(false);  // indicator de auto-save
+  const [ultimoSalvo, setUltimoSalvo]   = useState(null);   // timestamp do último save
+  const autoSaveRef   = useRef(null);                        // timer debounce
+  const modificadoRef = useRef(false);                       // flag: usuário editou algo
+
   const [token, setToken] = useState(() => {
     try {
       const cred = sessionStorage.getItem("kist_token");
@@ -617,16 +623,107 @@ export default function App() {
       // Normalizar: backend sempre retorna {propostas:[...]}, mas suportar legado {itens:[...]}
       const props = data.propostas || [data];
       setPropostas(props); setPropostaIdx(0); setDownloadados(new Set());
+      modificadoRef.current = true;   // marca como modificado para o save funcionar
       setStep("resultado");
+      // Reservar o número no banco imediatamente — impede outro operador de receber o mesmo número
+      setTimeout(() => salvarRascunho(true), 100);
     } catch (e) { setErro(e.message); }
     finally { setLoading(false); }
   }
 
   function atualizarItem(index, campo, valor) {
-    // Atualiza item na proposta ativa
     setPropostas((prev) => prev.map((p, pi) =>
       pi !== propostaIdx ? p : { ...p, itens: p.itens.map((item, i) => i === index ? { ...item, [campo]: valor } : item) }
     ));
+    _dispararAutoSave();
+  }
+
+  function _dispararAutoSave() {
+    modificadoRef.current = true;
+    if (autoSaveRef.current) clearTimeout(autoSaveRef.current);
+    autoSaveRef.current = setTimeout(() => salvarRascunho(true), 1500);
+  }
+
+  async function salvarRascunho(silent = false) {
+    if (!modificadoRef.current) return;
+    const prop = propostas[propostaIdx];
+    if (!prop || !numeroProposta) return;
+    if (!silent) setSalvando(true);
+    else setSalvando(true);
+    try {
+      const payload = {
+        ...prop,
+        proposta: prop.proposta || numeroProposta,
+        status: "rascunho",
+        usuario_nome: usuario?.nome || "",
+      };
+      // Upsert banco de preços (itens com preço)
+      const comPreco = (prop.itens || []).filter(i => (i.preco_un || 0) > 0);
+      if (comPreco.length > 0) {
+        fetch(`${API}/upsert-precos`, {
+          method: "POST", headers: { "Content-Type": "application/json", ...authHeaders() },
+          body: JSON.stringify(prop),
+        }).catch(() => {});
+      }
+      // Upsert proposta
+      const r = await fetch(`${API}/salvar-proposta`, {
+        method: "POST", headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify(payload),
+      });
+      const d = await r.json();
+      if (d.proposta_id && !propostaId) setPropostaId(d.proposta_id);
+      setUltimoSalvo(new Date());
+      modificadoRef.current = false;
+    } catch (e) { /* auto-save silencioso */ }
+    finally { setSalvando(false); }
+  }
+
+  async function abrirPropostaExistente(id) {
+    setLoading(true); setErro("");
+    try {
+      const r = await fetch(`${API}/propostas/${id}/detalhe`, { headers: authHeaders() });
+      if (!r.ok) throw new Error("Não encontrado");
+      const data = await r.json();
+      const prop = data.proposta;
+      const itens = (data.itens || []).map(it => ({
+        descricao_original:   it.descricao_original || "",
+        descricao_final:      it.descricao_final || "",
+        specs_complementares: it.specs_complementares || "",
+        quantidade:           Number(it.quantidade) || 1,
+        unidade:              it.unidade || "UN",
+        preco_un:             Number(it.preco_venda) || 0,
+        preco_custo:          Number(it.preco_custo) || 0,
+        frete_vinda:          Number(it.frete_vinda) || 0,
+        confianca_match:      it.confianca_match || "nenhuma",
+        obs:                  it.obs_interna || "",
+        fornecedor:           it.fornecedor || null,
+        link_fornecedor:      it.link_fornecedor || null,
+        sku_fornecedor:       it.sku_fornecedor || null,
+        tem_preco:            Number(it.preco_venda) > 0,
+        sugerir_pn:           false,
+        alerta_produto:       null,
+      }));
+      setNumeroProposta(prop.numero_proposta || "");
+      setPropostas([{
+        titulo:        prop.numero_proposta || "",
+        cliente:       prop.cliente || "",
+        cnpj:          prop.cnpj || null,
+        rc_neg:        prop.rc_neg || null,
+        proposta:      prop.numero_proposta || "",
+        frete:         prop.frete_recebimento || 0,
+        prazo_entrega: prop.prazo_entrega || "",
+        status:        prop.status || "rascunho",
+        itens,
+      }]);
+      setPropostaId(id);
+      setPropostaIdx(0);
+      setDownloadados(new Set());
+      modificadoRef.current = false;
+      setStep("resultado");
+      setPagina("nova");
+    } catch (e) {
+      setErro("Erro ao carregar proposta: " + e.message);
+    } finally { setLoading(false); }
   }
 
   async function baixarCSV(idx = propostaIdx) {
@@ -648,8 +745,10 @@ export default function App() {
       try {
         await fetch(`${API}/salvar-proposta`, {
           method: "POST", headers: { "Content-Type": "application/json", ...authHeaders() },
-          body: JSON.stringify(payload),
+          body: JSON.stringify({ ...payload, status: "confirmada" }),
         });
+        modificadoRef.current = false;
+        setUltimoSalvo(new Date());
       } catch (e) { console.warn("Aviso salvar proposta:", e); }
       setSalvandoBanco(false);
       const res = await fetch(`${API}/gerar-csv`, {
@@ -675,6 +774,9 @@ export default function App() {
   function reiniciar() {
     setStep("input"); setPropostas([]); setPropostaIdx(0); setDownloadados(new Set()); setBancoInfo(null);
     setTexto(""); setArquivos([]); setImagens([]); setNumeroProposta(""); setErro("");
+    setPropostaId(null); setSalvando(false); setUltimoSalvo(null);
+    modificadoRef.current = false;
+    if (autoSaveRef.current) clearTimeout(autoSaveRef.current);
     fetch(`${API}/proxima-proposta`).then((r) => r.json())
       .then((d) => { if (d.proximo) setNumeroProposta(d.proximo); }).catch(() => {});
   }
@@ -712,7 +814,7 @@ export default function App() {
         {showDocs ? (
           <div className="mx-auto max-w-5xl px-8 py-9"><Docs /></div>
         ) : pagina === "propostas" ? (
-          <Propostas token={token} usuario={usuario}
+          <Propostas token={token} usuario={usuario} onAbrirProposta={abrirPropostaExistente}
             onCriarOC={(proposta, itens, po) => { setNovaOCPayload({ proposta, itens, po }); setPagina("ordens"); }} />
         ) : pagina === "ordens" ? (
           <OrdensCompra token={token} usuario={usuario}
@@ -838,6 +940,14 @@ export default function App() {
                   </span> : null}
                   actions={<>
                     <button onClick={reiniciar} className={btnGhost}>Recomeçar</button>
+                    {/* Indicador de auto-save */}
+                    {salvando && <span className="text-[11.5px] text-faint animate-pulse">Salvando…</span>}
+                    {!salvando && ultimoSalvo && <span className="text-[11.5px] text-faint">✓ Salvo {ultimoSalvo.toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"})}</span>}
+                    <button onClick={() => salvarRascunho(false)} disabled={salvando}
+                      className={`${btnGhost} ${salvando ? "opacity-50" : ""}`}
+                      title="Salvar como rascunho para continuar depois">
+                      Salvar rascunho
+                    </button>
                     <button onClick={() => baixarCSV(propostaIdx)} disabled={loading || salvandoBanco || jaBaixado} className={btnPrimary}>
                       {salvandoBanco
                         ? <><span className="inline-block animate-spin"><IconBolt size={15} /></span> Salvando…</>
@@ -881,14 +991,14 @@ export default function App() {
                     <label className="block">
                       <div className="text-[11.5px] text-sub">Prazo de entrega</div>
                       <input value={prop.prazo_entrega || ""}
-                        onChange={(e) => setPropostas((prev) => prev.map((p, pi) => pi === propostaIdx ? { ...p, prazo_entrega: e.target.value } : p))}
+                        onChange={(e) => { setPropostas((prev) => prev.map((p, pi) => pi === propostaIdx ? { ...p, prazo_entrega: e.target.value } : p)); _dispararAutoSave(); }}
                         placeholder="ex: 15 dias úteis"
                         className="mt-1 w-full rounded-lg border border-line2 bg-paper px-2.5 py-1.5 text-[13px] text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
                     </label>
                     <label className="block">
                       <div className="text-[11.5px] text-sub">Frete (R$)</div>
                       <input inputMode="decimal" value={prop.frete ?? ""}
-                        onChange={(e) => setPropostas((prev) => prev.map((p, pi) => pi === propostaIdx ? { ...p, frete: e.target.value } : p))}
+                        onChange={(e) => { setPropostas((prev) => prev.map((p, pi) => pi === propostaIdx ? { ...p, frete: e.target.value } : p)); _dispararAutoSave(); }}
                         placeholder="0,00"
                         className="mt-1 w-full rounded-lg border border-line2 bg-paper px-2.5 py-1.5 font-mono text-[13px] text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
                     </label>
@@ -933,9 +1043,10 @@ export default function App() {
                   const prodCusto = (prop.itens || []).reduce((s, i) => s + (i.preco_custo || 0) * (parseFloat(i.quantidade) || 0), 0);
                   const custoFreteItens = (prop.itens || []).reduce((s, i) => s + num(i.frete_vinda), 0); // frete único por item, SEM ×qtd
                   const freteCobr = num(prop.frete);
-                  const base = prodVenda + freteCobr;
-                  const lucro = base - prodCusto - custoFreteItens;
-                  const margem = base > 0 ? (lucro / base) * 100 : 0;
+                  const receitaBruta = prodVenda + freteCobr;
+                  const nf12 = receitaBruta * 0.12;
+                  const lucro = receitaBruta - nf12 - prodCusto - custoFreteItens;
+                  const margem = receitaBruta > 0 ? (lucro / receitaBruta) * 100 : 0;
                   const temCusto = prodCusto > 0 || custoFreteItens > 0;
                   return (
                     <div className="mt-4 rounded-xl border border-line bg-surface p-4">
@@ -946,13 +1057,14 @@ export default function App() {
                       <div className="mt-3 rounded-lg bg-paper p-3 text-[12px]">
                         <div className="flex justify-between text-sub"><span>Venda (produtos)</span><span className="font-mono">R$ {brl(prodVenda)}</span></div>
                         {freteCobr > 0 && <div className="flex justify-between text-sub"><span>+ Frete cobrado</span><span className="font-mono">R$ {brl(freteCobr)}</span></div>}
+                        <div className="flex justify-between" style={{color:"#A82F2F"}}><span>− NF 12%</span><span className="font-mono">R$ {brl(nf12)}</span></div>
                         <div className="flex justify-between text-sub"><span>− Custo (produtos)</span><span className="font-mono">R$ {brl(prodCusto)}</span></div>
                         {custoFreteItens > 0 && <div className="flex justify-between text-sub"><span>− Frete (custo)</span><span className="font-mono">R$ {brl(custoFreteItens)}</span></div>}
                         <div className="mt-1.5 flex items-baseline justify-between border-t border-line pt-1.5">
-                          <span className="font-medium text-ink">Previsão de lucro</span>
+                          <span className="font-medium text-ink">Lucro líquido (s/ NF)</span>
                           <span className={`font-mono text-[16px] font-semibold ${lucro >= 0 ? "text-signal" : "text-rose"}`}>R$ {brl(lucro)}</span>
                         </div>
-                        <div className="text-right text-[10.5px] text-faint">{temCusto ? `${margem.toFixed(0)}% margem` : "informe os custos dos itens"}</div>
+                        <div className="text-right text-[10.5px] text-faint">{temCusto ? `${margem.toFixed(0)}% margem` : "informe os custos dos itens"} (margem líquida s/ NF)</div>
                       </div>
                       <div className="mt-2 text-[10.5px] text-faint">O frete de custo de cada item entra no campo “Frete (item)”, junto da origem do preço.</div>
                     </div>
