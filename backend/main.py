@@ -1136,12 +1136,21 @@ async def atualizar_origem_item(
 # ============================================================================
 # Casar PO do cliente com proposta salva (matcher) — reusa leitura .msg/PDF + Claude
 # ============================================================================
-SYSTEM_PO = """Você recebe o texto de uma ORDEM DE COMPRA (PO) enviada por um cliente.
-O texto pode incluir tabelas no formato "Coluna1 | Coluna2 | ..." — use essas tabelas como fonte principal.
-A coluna "Qnt", "Quantidade", "QTDE" ou "Qty" é a quantidade do item. Dimensões na descrição (ex: "430MM X 240MM X 300MM") NÃO são quantidade.
-Extraia em JSON PURO (sem markdown, sem ``` ):
-{"itens":[{"descricao":"...","quantidade":0,"preco_unitario":0}],"destino":"endereço/cidade-UF de entrega ou ''"}
-quantidade e preco_unitario são números (ponto decimal). Sem preço -> 0. Não invente itens. Só o JSON."""
+SYSTEM_PO = """Você é o assistente de compras da Kist Soluções em Telecom e Energia.
+Você recebe um e-mail (assunto + corpo) e possivelmente documentos PDF anexos.
+
+SUA TAREFA: identificar a ORDEM DE COMPRA (PO) emitida pelo cliente para a Kist e extrair os itens dela.
+
+ANÁLISE CRÍTICA OBRIGATÓRIA:
+- O e-mail pode conter: a PO do cliente, proposta da Kist, logotipos, T&Cs.
+- Itens vêm SOMENTE da PO do cliente — nunca da proposta comercial da Kist.
+- Se houver proposta Kist: use APENAS para identificar cliente/CNPJ.
+- Quantidade: coluna QTDE/Quantidade da PO. Dimensões (ex: 430MM X 240MM) NÃO são quantidade.
+- Preco_unitario: valor unitário na PO. Se não houver, use 0.
+- Não invente itens. Se não identificar a PO, retorne itens vazio.
+
+Retorne APENAS JSON puro (sem markdown, sem ``` ):
+{"itens":[{"descricao":"...","quantidade":0,"preco_unitario":0}],"destino":"endereço/cidade-UF de entrega ou ''"}"""
 
 SYSTEM_PROP_TINY = """Você recebe o texto de uma PROPOSTA COMERCIAL / orçamento (sistema Tiny).
 Extraia em JSON PURO (sem markdown, sem ``` ):
@@ -1383,33 +1392,63 @@ _PDF_SKIP = re.compile(
 # PDFs de lista de itens nunca passam de 1,5 MB — acima disso é manual/T&C
 _PDF_MAX_BYTES = 1_500_000
 
+# Nomes de PDF claramente irrelevantes para PO (política, cartilha, manual)
+_PO_SKIP = re.compile(r'politic|cartilha|manual|instrucao|procedimento', re.I)
+# Limite de tamanho para PDF como documento nativo (10 MB — Anthropic aceita até 32 MB)
+_DOC_MAX_BYTES = 10_000_000
+
 async def _ler_po(arquivo):
+    """Lê arquivo de PO e retorna (texto, pdf_docs).
+    - texto: body do email + texto extraído de PDFs legíveis
+    - pdf_docs: [(nome, bytes)] de PDFs baseados em imagem (para Claude Vision/Document)
+    Usada tanto para o arquivo principal quanto para proposta_tiny.
+    """
     nome = (arquivo.filename or "").lower()
     dados = await arquivo.read()
+
     if nome.endswith(".msg"):
         with open("/tmp/po_upload.msg", "wb") as f:
             f.write(dados)
         msg = extract_msg.openMsg("/tmp/po_upload.msg")
 
-        # PDFs relevantes primeiro — body depois (body é conversa, PDF tem os dados da PO)
-        # Pula PDFs de política/T&C que inflam o conteúdo sem agregar nada útil
-        pdfs_txt = []
-        for att in msg.attachments:
-            fn = (att.longFilename or att.shortFilename or "").lower()
-            if att.data and fn.endswith(".pdf") and not _PDF_SKIP.search(fn) and len(att.data) <= _PDF_MAX_BYTES:
-                t = _pdf_po_texto(att.data)
-                if t.strip():
-                    pdfs_txt.append(t)
+        partes_texto = []
+        pdf_docs = []
 
         corpo = f"Assunto: {msg.subject}\n\n{(msg.body or '').strip()}"
-        partes = pdfs_txt + [corpo]
-        return "\n\n[---]\n\n".join(p for p in partes if p.strip())
+        if corpo.strip():
+            partes_texto.append(corpo)
+
+        for att in msg.attachments:
+            fn = att.longFilename or att.shortFilename or ""
+            flo = fn.lower()
+            if not att.data or not flo.endswith(".pdf"):
+                continue
+            if _PO_SKIP.search(flo):
+                continue  # ignorar T&C, cartilhas, manuais
+            if len(att.data) > _DOC_MAX_BYTES:
+                continue  # muito grande para documento nativo
+
+            t = _pdf_po_texto(att.data)
+            if t.strip():
+                partes_texto.append(f"[PDF: {fn}]\n{t}")
+            else:
+                # PDF baseado em imagem (escaneado) → documento nativo para Vision
+                pdf_docs.append((fn, att.data))
+
+        texto = "\n\n[---]\n\n".join(p for p in partes_texto if p.strip())
+        return texto, pdf_docs
+
     if nome.endswith(".pdf"):
-        return _pdf_po_texto(dados)
+        t = _pdf_po_texto(dados)
+        if t.strip():
+            return t, []
+        else:
+            return "", [(arquivo.filename or "po.pdf", dados)]
+
     try:
-        return dados.decode("utf-8", "ignore")
+        return dados.decode("utf-8", "ignore"), []
     except Exception:
-        return ""
+        return "", []
 
 def _digitos(s):
     return re.sub(r"\D", "", s or "")
@@ -1563,12 +1602,16 @@ async def casar_po(
 ):
     """Recebe a PO do cliente (.msg/.pdf/texto), extrai e casa com propostas salvas.
     proposta_tiny aceita múltiplos arquivos (cliente comprou de 2+ cotações distintas)."""
-    conteudo = ""
+    import json as _json_po
+    import base64 as _b64_po
+
+    conteudo, pdf_docs = "", []
     if arquivo and arquivo.filename:
-        conteudo = await _ler_po(arquivo)
+        conteudo, pdf_docs = await _ler_po(arquivo)
     elif texto:
         conteudo = texto
-    if not (conteudo or "").strip():
+
+    if not conteudo.strip() and not pdf_docs:
         return {"erro": "Não consegui ler o conteúdo. Tente o PDF da PO ou cole o texto."}
 
     cnpjs = re.findall(r"\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}", conteudo)
@@ -1576,67 +1619,73 @@ async def casar_po(
     pos = re.findall(r"PO[-\s]?\d{5,}", conteudo, re.I)
     po_num = pos[0].strip() if pos else ""
 
-    import json as _json_po
     itens_po, destino = [], ""
     avisos_extracao: list[str] = []
 
-    # ── Extrai dados de validação independentes (subtotal, n° itens) ─────────
-    dados_val = _extrair_validacao_po(conteudo)
+    # ── Extração definitiva via Claude Sonnet ─────────────────────────────────
+    # Sonnet recebe: PDFs como documentos nativos (escaneados ou textuais)
+    # + texto do email/PDFs legíveis. Lê tudo, identifica a PO e extrai itens.
+    try:
+        msg_content = []
 
-    # ── Camada 1: parser determinístico Embraer/SAP (Item:NNNNN) ─────────────
-    _candidato = _parsear_itens_po_nativo(conteudo)
-    if _candidato:
-        ok, av = _validar_itens_po(_candidato, dados_val)
-        if ok:
-            itens_po = _candidato
-            dest_m = re.search(r'SHIP\s+TO[:\s]+(.+?)(?=\n\n|\Z)', conteudo, re.I | re.S)
-            if dest_m:
-                destino = " ".join(dest_m.group(1).split())[:120]
-        else:
-            avisos_extracao.extend([f"[parser Embraer] {a}" for a in av])
-            itens_po = _candidato  # parser determinístico tem precedência mesmo com aviso
+        # PDFs baseados em imagem → documento nativo (Claude lê diretamente)
+        for fn, pdf_bytes in pdf_docs:
+            msg_content.append({
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": _b64_po.standard_b64encode(pdf_bytes).decode(),
+                },
+            })
 
-    # ── Camada 2: parser determinístico Convergint/SAP-BO (data-anchored) ────
-    if not itens_po:
-        _candidato = _parsear_itens_convergint(conteudo)
-        if _candidato:
-            ok, av = _validar_itens_po(_candidato, dados_val)
-            if ok:
-                itens_po = _candidato
-            else:
-                avisos_extracao.extend([f"[parser Convergint] {a}" for a in av])
-                itens_po = _candidato  # usar mesmo assim; aviso fica registrado
+        # Texto extraído (body email + PDFs legíveis)
+        if conteudo.strip():
+            msg_content.append({"type": "text", "text": conteudo[:15000]})
 
-    # ── Camada 3: IA como fallback universal ──────────────────────────────────
-    if not itens_po:
-        try:
-            # Enriquece o prompt com os dados de validação como dica para a IA
-            hint = ""
-            if dados_val.get("subtotal"):
-                hint = f"\n\n[VALIDAÇÃO] Subtotal esperado: R$ {dados_val['subtotal']:.2f}"
-                if dados_val.get("n_itens"):
-                    hint += f" | {dados_val['n_itens']} itens."
-            claude = get_claude()
-            r = claude.messages.create(
-                model="claude-haiku-4-5-20251001", max_tokens=2000,
-                system=SYSTEM_PO,
-                messages=[{"role": "user", "content": conteudo[:12000] + hint}],
-            )
-            t = "".join(b.text for b in r.content if getattr(b, "type", "") == "text").strip()
-            t = t.strip("`")
-            if t.lower().startswith("json"):
-                t = t[4:]
-            _ia_data = _json_po.loads(t)
-            itens_ia  = _ia_data.get("itens", []) or []
-            destino   = _ia_data.get("destino", "") or ""
-            ok, av = _validar_itens_po(itens_ia, dados_val)
-            if ok:
-                itens_po = itens_ia
-            else:
-                avisos_extracao.extend([f"[IA] {a}" for a in av])
-                itens_po = itens_ia  # melhor que vazio
-        except Exception:
-            pass
+        if not msg_content:
+            raise ValueError("sem conteúdo")
+
+        claude = get_claude()
+        r = claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=3000,
+            system=SYSTEM_PO,
+            messages=[{"role": "user", "content": msg_content}],
+            timeout=90.0,
+        )
+        raw = "".join(b.text for b in r.content if getattr(b, "type", "") == "text").strip()
+        # Extração robusta: primeiro { até último }
+        raw = re.sub(r'^```(?:json)?\s*', '', raw.strip())
+        raw = re.sub(r'\s*```$', '', raw.strip())
+        s = raw.find('{'); e = raw.rfind('}')
+        if s != -1 and e != -1:
+            raw = raw[s:e+1]
+        _ia = _json_po.loads(raw)
+        itens_po = _ia.get("itens", []) or []
+        destino  = _ia.get("destino", "") or ""
+
+        # Extrair CNPJs do texto para enriquecer a busca de candidatas
+        for it in itens_po:
+            if not isinstance(it.get("quantidade"), (int, float)):
+                try: it["quantidade"] = float(str(it["quantidade"]).replace(",","."))
+                except: it["quantidade"] = 1
+            if not isinstance(it.get("preco_unitario"), (int, float)):
+                try: it["preco_unitario"] = float(str(it["preco_unitario"]).replace(",","."))
+                except: it["preco_unitario"] = 0
+
+        # Extrair CNPJs também do raw (Sonnet pode incluir na resposta ou no conteúdo lido)
+        for cnpj_raw in re.findall(r"\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}", raw):
+            d = _digitos(cnpj_raw)
+            if len(d) == 14 and d not in cnpjs_dig:
+                cnpjs_dig.append(d)
+        # Número PO do raw se não encontrado antes
+        if not po_num:
+            pos2 = re.findall(r"PO[-\s]?\d{5,}", raw, re.I)
+            if pos2: po_num = pos2[0].strip()
+
+    except Exception as _ex:
+        avisos_extracao.append(f"Extração Sonnet: {_ex}")
 
     # Propostas do Tiny (opcional, múltiplas) — reforço da busca
     itens_match = list(itens_po)
@@ -1645,7 +1694,7 @@ async def casar_po(
             continue
         try:
             import json as _json
-            ptxt = await _ler_po(pt_file)
+            ptxt, _ = await _ler_po(pt_file)
             if not ptxt.strip():
                 continue
             claude = get_claude()
