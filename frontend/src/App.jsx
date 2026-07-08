@@ -127,7 +127,7 @@ function ItemRow({ item, index, onChange, token, apiUrl }) {
   const confianca = item.confianca_match || "nenhuma";
   const c = CONF[confianca];
   const semPreco = !(item.preco_un > 0);
-  const temOrigem = !!(item.link_fornecedor || item.fornecedor || item.sku_fornecedor);
+  const temOrigem = !!(item.link_fornecedor || item.fornecedor || item.sku_fornecedor || (item.preco_custo > 0));
 
   return (
     <>

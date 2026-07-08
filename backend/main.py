@@ -265,7 +265,7 @@ def _fazer_matching(itens_raw: list, claude, sb) -> list:
 
     # Buscar candidatos em lote
     try:
-        res_batch = sb.table("produtos")            .select("descricao,preco_un,proposta_tiny,data_ref,alerta")            .order("data_ref", desc=True).limit(500).execute()
+        res_batch = sb.table("produtos")            .select("descricao,preco_un,proposta_tiny,data_ref,alerta,preco_custo,link_fornecedor,fornecedor,sku_fornecedor")            .order("data_ref", desc=True).limit(500).execute()
         todos_candidatos = res_batch.data or []
     except Exception:
         todos_candidatos = []
@@ -305,6 +305,14 @@ Lembre: fabricante diferente = null. Categoria diferente = null. Seja rigoroso."
     except Exception:
         matches = {}
 
+    # Lookup descrição do banco -> linha completa (mais recente vence: lista já vem
+    # ordenada por data_ref desc, então só registra a primeira ocorrência).
+    _banco_por_desc = {}
+    for c in todos_candidatos:
+        k = (c.get("descricao") or "").strip().lower()
+        if k and k not in _banco_por_desc:
+            _banco_por_desc[k] = c
+
     itens_com_preco = []
     for i, item in enumerate(itens_raw):
         desc = item.get("descricao", "")
@@ -315,6 +323,11 @@ Lembre: fabricante diferente = null. Categoria diferente = null. Seja rigoroso."
         preco_un = 0.0
         desc_final = desc
         obs_item = "SEM PREÇO"
+        # Origem de compra (custo/link/fornecedor) — só herda em match IDÊNTICO (alta)
+        preco_custo = 0.0
+        link_fornecedor = ""
+        fornecedor = ""
+        sku_fornecedor = ""
 
         if confianca in ("alta", "media") and match.get("banco_descricao"):
             desc_final = match["banco_descricao"]
@@ -326,6 +339,19 @@ Lembre: fabricante diferente = null. Categoria diferente = null. Seja rigoroso."
             preco_un = float(match.get("banco_preco") or 0)
             obs_item = f"⚠ CONFIRA — candidato no banco: {match['banco_descricao']} | motivo: {match.get('motivo','')}"
 
+        # SÓ em 'alta' puxa custo/origem do banco — direto da linha, nunca da IA.
+        # Em media/baixa/nenhuma fica em branco (regra: na dúvida, não arrasta custo do item errado).
+        if confianca == "alta" and match.get("banco_descricao"):
+            _row = _banco_por_desc.get(match["banco_descricao"].strip().lower())
+            if _row:
+                try:
+                    preco_custo = float(_row.get("preco_custo") or 0)
+                except (TypeError, ValueError):
+                    preco_custo = 0.0
+                link_fornecedor = _row.get("link_fornecedor") or ""
+                fornecedor = _row.get("fornecedor") or ""
+                sku_fornecedor = _row.get("sku_fornecedor") or ""
+
         itens_com_preco.append({
             "descricao_original": desc_original,
             "descricao_final": desc_final,
@@ -333,6 +359,10 @@ Lembre: fabricante diferente = null. Categoria diferente = null. Seja rigoroso."
             "quantidade": item.get("quantidade", 1),
             "unidade": item.get("unidade", "UN"),
             "preco_un": preco_un,
+            "preco_custo": preco_custo,
+            "link_fornecedor": link_fornecedor,
+            "fornecedor": fornecedor,
+            "sku_fornecedor": sku_fornecedor,
             "obs": obs_item,
             "confianca_match": confianca,
             "banco_candidato": match.get("banco_descricao") if confianca == "baixa" else None,
@@ -737,6 +767,23 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
         if not desc or not preco or float(preco) <= 0:
             ignorados += 1
             continue
+
+        # Campos de origem — só entram no gravação se o operador realmente preencheu.
+        # Regra: "preencheu = atualiza; veio vazio = mantém o que o banco já sabia."
+        origem = {}
+        try:
+            _c = item.get("preco_custo")
+            if _c is not None and float(_c) > 0:
+                origem["preco_custo"] = float(_c)
+        except (TypeError, ValueError):
+            pass
+        if (item.get("link_fornecedor") or "").strip():
+            origem["link_fornecedor"] = item["link_fornecedor"].strip()
+        if (item.get("fornecedor") or "").strip():
+            origem["fornecedor"] = item["fornecedor"].strip()
+        if (item.get("sku_fornecedor") or "").strip():
+            origem["sku_fornecedor"] = item["sku_fornecedor"].strip()
+
         try:
             res = sb.table("produtos").select("id,preco_un")\
                 .ilike("descricao", desc).limit(1).execute()
@@ -744,6 +791,7 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
                 sb.table("produtos").update({
                     "preco_un": float(preco), "data_ref": hoje,
                     "proposta_tiny": proposta, "cliente": cliente,
+                    **origem,
                 }).eq("id", res.data[0]["id"]).execute()
                 atualizados += 1
             else:
@@ -752,6 +800,7 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
                     "preco_un": float(preco), "data_ref": hoje,
                     "proposta_tiny": proposta, "cliente": cliente,
                     "obs": "inserido automaticamente via app",
+                    **origem,
                 }).execute()
                 inseridos += 1
         except Exception:
