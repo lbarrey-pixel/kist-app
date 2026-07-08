@@ -2126,3 +2126,266 @@ async def arquivar_antigas(usuario: str = Depends(verificar_token)):
         .lt("atualizado_em", limite)\
         .execute()
     return {"arquivadas": len(res.data) if res.data else 0}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ANALISTA DE NEGÓCIOS INTERNO — chamados / sugestões (v3.10)
+# ══════════════════════════════════════════════════════════════════════════════
+import json as _json_an
+
+ADMIN_EMAILS = set(os.environ.get("ADMIN_EMAILS", "leonardobarrey@gmail.com").split(","))
+
+# Apelido usado pelo Analista na conversa (só no papo — o registro guarda nome/e-mail real).
+APELIDOS = {
+    "leonardobarrey@gmail.com": "Leonardo",
+    "fabiokist@gmail.com": "Cavalo",
+    "thiagokist@gmail.com": "José",
+}
+
+
+def _now_iso():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+SYSTEM_ANALISTA = """Você é o Analista de Negócios interno do sistema "Kist Cabine de Compras",
+usado pelos 3 operadores da Kist. Seu papel: receber sugestões de melhoria, bugs e dúvidas,
+entender a fundo o que resolvem, e registrar chamados bem estruturados para o Leonardo (dono/dev) priorizar.
+
+IDIOMA: português do Brasil. Tom: direto, prático, cordial, sem enrolação.
+
+Abaixo deste texto vem o CONHECIMENTO ATUAL do sistema: o que ele já faz (núcleo), as entregas
+recentes já no ar, e os chamados já abertos. Use isso como verdade.
+
+SEU MÉTODO, nesta ordem:
+1. CLASSIFIQUE: é bug, melhoria ou dúvida? (bug = deveria funcionar e não funciona; melhoria = algo
+   novo/diferente; dúvida = a pessoa não sabe como fazer).
+2. CHEQUE SE JÁ EXISTE: compare o pedido com o conhecimento do sistema. Se o sistema JÁ FAZ aquilo,
+   explique onde e como se faz e trate como "já suportado". Se não tiver certeza, PERGUNTE em vez de
+   afirmar. NUNCA invente uma capacidade que não está no conhecimento.
+3. CHEQUE DUPLICATA: se já existe chamado aberto igual/parecido, aponte o número (#NN) e avise que já
+   está na fila.
+4. COLETE O QUE FALTA: no MÁXIMO uma pergunta por vez. Bug: passos pra reproduzir, qual proposta/OC/tela,
+   o que esperava vs. o que aconteceu, print se tiver. Melhoria: a dor real, com que frequência acontece,
+   como faz hoje (contorno), quem se beneficia.
+5. ENTENDA A DOR, não só o pedido. Às vezes o que a pessoa pede não é o que melhor resolve — aponte com cuidado.
+
+QUANDO TIVER INFORMAÇÃO SUFICIENTE, monte a FICHA e proponha abrir o chamado. NÃO abra sozinho: o
+chamado só é registrado depois que o operador confirmar na tela. Enquanto faltar informação, "ficha" fica null.
+
+FORMATO DE RESPOSTA — responda SEMPRE com um JSON válido puro. Sem markdown, sem crases, nada antes ou depois:
+{"reply": "sua mensagem em PT-BR para o operador", "ficha": null}
+
+OU, quando estiver pronto para propor o chamado:
+{"reply": "resumo curto + peça pra conferir e confirmar", "ficha": {
+  "tipo": "bug|melhoria|duvida",
+  "titulo": "título curto e claro",
+  "solicitacao": "o que está sendo pedido, em 1-2 frases",
+  "dor": "a dor/problema que isso resolve",
+  "comportamento_esperado": "como o sistema deve se comportar depois da melhoria/correção",
+  "area": "proposta|banco|oc|receber_po|extracao|login|outro",
+  "ja_suportado": false,
+  "parecer": "seu parecer técnico curto; se ja_suportado=true, diga onde/como já se faz",
+  "prioridade": "baixa|media|alta"
+}}
+
+REGRAS DO JSON:
+- Responda só o objeto JSON. Nada fora dele.
+- "ficha" só deixa de ser null quando você tem tipo, titulo, solicitacao, dor e comportamento_esperado.
+- Se for "já suportado", ainda assim monte a ficha com ja_suportado=true e explique no parecer onde se faz
+  — registrar isso ajuda a mapear o que está difícil de achar no sistema.
+- Nunca prometa prazo nem diga que "vai fazer". Você só registra; quem prioriza e resolve é o Leonardo.
+"""
+
+
+def _conhecimento_agente(sb) -> str:
+    """Monta o conhecimento do agente em 3 camadas: núcleo + entregas + abertos."""
+    nucleo = ""
+    try:
+        r = sb.table("config_kist").select("valor").eq("chave", "capacidades_nucleo").limit(1).execute()
+        if r.data:
+            nucleo = r.data[0].get("valor") or ""
+    except Exception:
+        nucleo = ""
+
+    entregue = []
+    try:
+        r = sb.table("chamados").select("numero,titulo,tipo,resolucao")\
+            .in_("status", ["em_producao", "finalizado"]).order("numero", desc=True).limit(200).execute()
+        for c in (r.data or []):
+            res = (c.get("resolucao") or "").strip()
+            if res:
+                entregue.append(f"- #{c.get('numero')} [{c.get('tipo','')}] {c.get('titulo','')}: {res}")
+    except Exception:
+        pass
+
+    abertos = []
+    try:
+        r = sb.table("chamados").select("numero,titulo,status,solicitacao")\
+            .in_("status", ["aberto", "em_desenvolvimento"]).order("numero", desc=True).limit(200).execute()
+        for c in (r.data or []):
+            abertos.append(f"- #{c.get('numero')} [{c.get('status','')}] {c.get('titulo','')}: {(c.get('solicitacao') or '')[:120]}")
+    except Exception:
+        pass
+
+    partes = ["=== O QUE O SISTEMA JÁ FAZ (núcleo) ===", nucleo or "(indisponível)"]
+    if entregue:
+        partes += ["", "=== ENTREGAS RECENTES (já no ar — considere suportado) ===", "\n".join(entregue)]
+    if abertos:
+        partes += ["", "=== CHAMADOS JÁ ABERTOS (para detectar duplicata) ===", "\n".join(abertos)]
+    return "\n".join(partes)
+
+
+class AnalistaChatIn(BaseModel):
+    mensagens: list
+    operador_nome: Optional[str] = ""
+
+
+@app.post("/analista/chat")
+async def analista_chat(payload: AnalistaChatIn, usuario: str = Depends(verificar_token)):
+    sb = get_supabase()
+    claude = get_claude()
+    apelido = APELIDOS.get(usuario, "")
+    saudacao = (f"\n\nVocê está conversando agora com {apelido}. Trate essa pessoa por esse nome/apelido, "
+                "de forma cordial e natural — sem exagerar, sem repetir a cada frase.") if apelido else ""
+    system = SYSTEM_ANALISTA + saudacao + "\n\n" + _conhecimento_agente(sb)
+
+    msgs = []
+    for m in (payload.mensagens or [])[-40:]:
+        role = m.get("role")
+        content = m.get("content", "")
+        if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+            msgs.append({"role": role, "content": content})
+    if not msgs or msgs[0]["role"] != "user":
+        return {"reply": "Oi! Sou o analista do sistema. Me conta a melhoria que você quer sugerir ou o problema que encontrou.", "ficha": None}
+
+    try:
+        resp = claude.messages.create(
+            model="claude-sonnet-4-6", max_tokens=1500,
+            system=system, messages=msgs, temperature=0.2, timeout=40.0,
+        )
+        raw = resp.content[0].text.strip()
+        raw = re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw.strip())
+        data = _json_an.loads(raw)
+        ficha = data.get("ficha")
+        if not isinstance(ficha, dict):
+            ficha = None
+        return {"reply": data.get("reply") or "", "ficha": ficha}
+    except Exception as e:
+        return {"reply": "Tive um problema pra processar agora. Pode repetir do seu jeito?", "ficha": None, "erro": str(e)}
+
+
+class ChamadoIn(BaseModel):
+    tipo: Optional[str] = "melhoria"
+    titulo: Optional[str] = ""
+    descricao_operador: Optional[str] = ""
+    solicitacao: Optional[str] = ""
+    dor: Optional[str] = ""
+    comportamento_esperado: Optional[str] = ""
+    resumo_analista: Optional[str] = ""
+    parecer_analista: Optional[str] = ""
+    area: Optional[str] = ""
+    ja_suportado: Optional[bool] = False
+    prioridade: Optional[str] = "media"
+    transcript: Optional[list] = None
+    operador_nome: Optional[str] = ""
+
+
+@app.post("/chamados")
+async def criar_chamado(payload: ChamadoIn, usuario: str = Depends(verificar_token)):
+    sb = get_supabase()
+    status = "ja_suportada" if payload.ja_suportado else "aberto"
+    row = {
+        "operador_email": usuario,
+        "operador_nome": payload.operador_nome or "",
+        "tipo": payload.tipo or "melhoria",
+        "titulo": payload.titulo or "",
+        "descricao_operador": payload.descricao_operador or "",
+        "solicitacao": payload.solicitacao or "",
+        "dor": payload.dor or "",
+        "comportamento_esperado": payload.comportamento_esperado or "",
+        "resumo_analista": payload.resumo_analista or "",
+        "parecer_analista": payload.parecer_analista or "",
+        "area": payload.area or "",
+        "ja_suportado": bool(payload.ja_suportado),
+        "prioridade": payload.prioridade or "media",
+        "status": status,
+        "transcript": payload.transcript or [],
+    }
+    if payload.ja_suportado:
+        row["resolvido_em"] = _now_iso()
+    try:
+        r = sb.table("chamados").insert(row).execute()
+        novo = (r.data or [{}])[0]
+        return {"ok": True, "numero": novo.get("numero"), "id": novo.get("id"), "status": status}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao registrar chamado: {str(e)}")
+
+
+@app.get("/chamados")
+async def listar_chamados(status: Optional[str] = None, arquivados: bool = False,
+                          usuario: str = Depends(verificar_token)):
+    sb = get_supabase()
+    is_admin = usuario in ADMIN_EMAILS
+    q = sb.table("chamados").select("*")
+    if is_admin:
+        if not arquivados:
+            q = q.eq("arquivado", False)
+        if status:
+            q = q.eq("status", status)
+    else:
+        q = q.eq("operador_email", usuario)
+    r = q.order("numero", desc=True).execute()
+    return {"chamados": r.data or [], "is_admin": is_admin}
+
+
+class ChamadoUpdate(BaseModel):
+    status: Optional[str] = None
+    resolucao: Optional[str] = None
+    prioridade: Optional[str] = None
+    area: Optional[str] = None
+    duplicada_de: Optional[int] = None
+    arquivado: Optional[bool] = None
+    titulo: Optional[str] = None
+
+
+@app.put("/chamados/{chamado_id}")
+async def atualizar_chamado(chamado_id: int, payload: ChamadoUpdate,
+                            usuario: str = Depends(verificar_token)):
+    if usuario not in ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="Só o admin pode gerenciar chamados.")
+    sb = get_supabase()
+    upd = {"atualizado_em": _now_iso()}
+    for campo in ("status", "resolucao", "prioridade", "area", "duplicada_de", "arquivado", "titulo"):
+        v = getattr(payload, campo)
+        if v is not None:
+            upd[campo] = v
+    if payload.status in ("em_producao", "finalizado"):
+        upd["avisar_operador"] = True
+        upd["resolvido_em"] = _now_iso()
+    try:
+        r = sb.table("chamados").update(upd).eq("id", chamado_id).execute()
+        return {"ok": True, "chamado": (r.data or [{}])[0]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/chamados/{chamado_id}/visto")
+async def marcar_chamado_visto(chamado_id: int, usuario: str = Depends(verificar_token)):
+    """O operador zera o aviso 'no ar' dos próprios chamados quando os vê."""
+    sb = get_supabase()
+    sb.table("chamados").update({"avisar_operador": False})\
+        .eq("id", chamado_id).eq("operador_email", usuario).execute()
+    return {"ok": True}
+
+
+@app.post("/chamados/arquivar-concluidos")
+async def arquivar_concluidos(usuario: str = Depends(verificar_token)):
+    """Limpa do kanban os chamados em produção/finalizados (ficam na base para consulta)."""
+    if usuario not in ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="Só o admin.")
+    sb = get_supabase()
+    r = sb.table("chamados").update({"arquivado": True})\
+        .in_("status", ["em_producao", "finalizado"]).eq("arquivado", False).execute()
+    return {"ok": True, "arquivados": len(r.data or [])}

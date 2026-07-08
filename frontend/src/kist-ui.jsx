@@ -44,6 +44,8 @@ export const IconCopy     = (p) => <Ic {...p} d={<><rect x="9" y="9" width="11" 
 export const IconTrash    = (p) => <Ic {...p} d={<><path d="M4 7h16" /><path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" /><path d="M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13" /><path d="M10 11v6M14 11v6" /></>} />;
 export const IconLogout   = (p) => <Ic {...p} d={<><path d="M14 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2v-2" /><path d="M9 12h11" /><path d="m17 8 4 4-4 4" /></>} />;
 export const IconBell     = (p) => <Ic {...p} d={<><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" /><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" /></>} />;
+export const IconChat     = (p) => <Ic {...p} d={<><path d="M21 12a8 8 0 0 1-11.5 7.2L4 20l.8-5.5A8 8 0 1 1 21 12Z" /><path d="M8.5 11h7M8.5 14h4" /></>} />;
+export const IconInbox    = (p) => <Ic {...p} d={<><path d="M4 13h4l1.5 2.5h5L16 13h4" /><path d="M4 13 6 5h12l2 8v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2Z" /></>} />;
 // Google "G" colorido — não usa o sistema Ic (tem fill próprio)
 export const IconGoogle = ({ size = 16, className = "", ...p }) => (
   <svg width={size} height={size} viewBox="0 0 24 24" className={className} {...p}>
@@ -165,12 +167,14 @@ export function CertaintyStrip({ itens }) {
 }
 
 // ── Sidebar navy (substitui a navegação horizontal) ────────────────────────
-export function Sidebar({ active, onNavigate, usuario, stats, onLogout }) {
+export function Sidebar({ active, onNavigate, usuario, stats, onLogout, isAdmin }) {
   const nav = [
-    { k: "nova",      label: "Nova proposta",    Icon: IconNova },
-    { k: "propostas", label: "Propostas",        Icon: IconList },
-    { k: "ordens",    label: "Ordens de compra", Icon: IconBoard },
-    { k: "docs",      label: "Docs",             Icon: IconBook },
+    { k: "nova",        label: "Nova proposta",     Icon: IconNova },
+    { k: "propostas",   label: "Propostas",         Icon: IconList },
+    { k: "ordens",      label: "Ordens de compra",  Icon: IconBoard },
+    { k: "requisicoes", label: "Requisições",       Icon: IconChat },
+    ...(isAdmin ? [{ k: "chamados", label: "Admin chamados", Icon: IconInbox }] : []),
+    { k: "docs",        label: "Docs",              Icon: IconBook },
   ];
   const inicial = (usuario?.nome || "?").trim().charAt(0).toUpperCase();
   return (

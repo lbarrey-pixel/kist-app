@@ -2,6 +2,8 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import Docs from "./Docs.jsx";
 import Propostas from "./Propostas.jsx";
 import OrdensCompra from "./OrdensCompra.jsx";
+import Analista from "./Analista.jsx";
+import ChamadosAdmin from "./ChamadosAdmin.jsx";
 import {
   CONF, brl, btnPrimary, btnGhost, Eyebrow, StateLabel, PageHeader,
   CertaintyStrip, Sidebar,
@@ -786,6 +788,8 @@ export default function App() {
     setShowDocs(false); setPagina(k);
   }
   const activeNav = showDocs ? "docs" : pagina;
+  // Admin dos chamados = só o Leonardo (mesmo default do backend ADMIN_EMAILS).
+  const isAdmin = (usuario?.email || "").toLowerCase() === "leonardobarrey@gmail.com";
 
   // ── TELA DE LOGIN ─────────────────────────────────────────────────────────
   if (!usuario) {
@@ -808,7 +812,7 @@ export default function App() {
   // ── APP PRINCIPAL ──────────────────────────────────────────────────────────
   return (
     <div className="flex h-screen bg-paper font-sans text-ink antialiased">
-      <Sidebar active={activeNav} onNavigate={navegar} usuario={usuario} stats={stats} onLogout={logout} />
+      <Sidebar active={activeNav} onNavigate={navegar} usuario={usuario} stats={stats} onLogout={logout} isAdmin={isAdmin} />
 
       <main className="flex-1 overflow-auto">
         {showDocs ? (
@@ -820,6 +824,10 @@ export default function App() {
           <OrdensCompra token={token} usuario={usuario}
             novaOC={novaOCPayload}
             onNovaOCProcessada={() => setNovaOCPayload(null)} />
+        ) : pagina === "requisicoes" ? (
+          <Analista token={token} usuario={usuario} />
+        ) : pagina === "chamados" && isAdmin ? (
+          <ChamadosAdmin token={token} usuario={usuario} />
         ) : (
           <div className="mx-auto max-w-5xl px-8 py-9">
 
