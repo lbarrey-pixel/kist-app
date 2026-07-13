@@ -1,10 +1,19 @@
 import { useState, useEffect, useCallback } from "react";
 import {
   brl, btnPrimary, btnGhost, Eyebrow, PageHeader, PoChip, CopyPo,
-  IconSearch, IconBoard, IconList, IconDownload, IconX, IconLink, IconTrash, IconCheck, IconCopy,
+  IconSearch, IconBoard, IconList, IconDownload, IconX, IconLink, IconTrash, IconCheck, IconCopy, IconGoogle,
 } from "./kist-ui.jsx";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+
+// Marketplaces para pesquisa rápida por item (mesmo conjunto da tela de proposta).
+const MARKETPLACES = [
+  { nome: "Mercado Livre", label: "ML",  bg: "#FFE600", fg: "#2D3277", url: (q) => `https://lista.mercadolivre.com.br/${encodeURIComponent(q)}` },
+  { nome: "Amazon",        label: "a",   bg: "#232F3E", fg: "#FF9900", url: (q) => `https://www.amazon.com.br/s?k=${encodeURIComponent(q)}` },
+  { nome: "AliExpress",    label: "Ali", bg: "#E62E04", fg: "#FFFFFF", url: (q) => `https://www.aliexpress.com/wholesale?SearchText=${encodeURIComponent(q)}` },
+  { nome: "Shopee",        label: "S",   bg: "#EE4D2D", fg: "#FFFFFF", url: (q) => `https://shopee.com.br/search?keyword=${encodeURIComponent(q)}` },
+  { nome: "eBay",          label: "eb",  bg: "#E53238", fg: "#FFFFFF", url: (q) => `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(q)}` },
+];
 
 const LANES = [
   { key: "aguardando", label: "Aguardando compra",  tint: "#1F6FEB", drop: "confirmada",            status: ["rascunho", "confirmada"] },
@@ -821,6 +830,26 @@ function OCDetalhe({ oc, token, onClose, onChanged, onDeleted }) {
                           × excluir
                         </button>
                       </div>
+                    </div>
+
+                    {/* Pesquisa rápida por marketplace */}
+                    <div className="mt-2 flex items-center gap-1">
+                      <span className="mr-0.5 text-[10px] text-faint">buscar:</span>
+                      <a href={`https://www.google.com/search?q=${encodeURIComponent(it.descricao || "")}`}
+                        target="_blank" rel="noopener noreferrer" title="Buscar no Google"
+                        className="flex-shrink-0 rounded-md p-1 text-faint/60 transition-colors hover:bg-paper hover:text-ink">
+                        <IconGoogle size={14} />
+                      </a>
+                      {MARKETPLACES.map((mp) => (
+                        <a key={mp.nome}
+                          href={mp.url(it.descricao || "")}
+                          target="_blank" rel="noopener noreferrer"
+                          title={`Buscar em ${mp.nome}`}
+                          className="flex h-[18px] min-w-[18px] flex-shrink-0 items-center justify-center rounded-[5px] px-[3px] text-[9px] font-bold leading-none transition-opacity hover:opacity-80"
+                          style={{ background: mp.bg, color: mp.fg }}>
+                          {mp.label}
+                        </a>
+                      ))}
                     </div>
 
                     {/* Linha 2 — números: qtd | custo | venda | frete | lucro */}
