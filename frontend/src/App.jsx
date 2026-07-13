@@ -23,7 +23,26 @@ const USUARIOS_PERMITIDOS = new Set(
 );
 const emailAutorizado = (e) => USUARIOS_PERMITIDOS.has((e || "").trim().toLowerCase());
 
+// Decodifica o payload de um JWT tratando UTF-8 corretamente.
+// atob() puro devolve bytes crus e corrompe acentos (ex.: "Fábio" -> "FÃ¡bio").
+function decodeJwtPayload(jwt) {
+  const b64 = jwt.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(b64);
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  return JSON.parse(new TextDecoder("utf-8").decode(bytes));
+}
+
 const isLink = (s) => typeof s === "string" && /^https?:\/\//i.test(s.trim());
+
+// Marketplaces para pesquisa rápida por item (chip na cor da marca).
+// Cada url() recebe a descrição do item e monta a busca já preenchida.
+const MARKETPLACES = [
+  { nome: "Mercado Livre", label: "ML",  bg: "#FFE600", fg: "#2D3277", url: (q) => `https://lista.mercadolivre.com.br/${encodeURIComponent(q)}` },
+  { nome: "Amazon",        label: "a",   bg: "#232F3E", fg: "#FF9900", url: (q) => `https://www.amazon.com.br/s?k=${encodeURIComponent(q)}` },
+  { nome: "AliExpress",    label: "Ali", bg: "#E62E04", fg: "#FFFFFF", url: (q) => `https://www.aliexpress.com/wholesale?SearchText=${encodeURIComponent(q)}` },
+  { nome: "Shopee",        label: "S",   bg: "#EE4D2D", fg: "#FFFFFF", url: (q) => `https://shopee.com.br/search?keyword=${encodeURIComponent(q)}` },
+  { nome: "eBay",          label: "eb",  bg: "#E53238", fg: "#FFFFFF", url: (q) => `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(q)}` },
+];
 
 // ── Linha de item da revisão ───────────────────────────────────────────────
 function ItemRow({ item, index, onChange, token, apiUrl }) {
@@ -164,6 +183,18 @@ function ItemRow({ item, index, onChange, token, apiUrl }) {
               onClick={(e) => e.stopPropagation()}>
               <IconGoogle size={15} />
             </a>
+            {/* Pesquisa rápida por marketplace */}
+            {MARKETPLACES.map((mp) => (
+              <a key={mp.nome}
+                href={mp.url(item.descricao_final)}
+                target="_blank" rel="noopener noreferrer"
+                title={`Buscar em ${mp.nome}`}
+                className="flex h-[18px] min-w-[18px] flex-shrink-0 items-center justify-center rounded-[5px] px-[3px] text-[9px] font-bold leading-none transition-opacity hover:opacity-80"
+                style={{ background: mp.bg, color: mp.fg }}
+                onClick={(e) => e.stopPropagation()}>
+                {mp.label}
+              </a>
+            ))}
             {/* Alerta do produto */}
             <button
               onClick={() => setMostrarAlerta((v) => !v)}
@@ -451,7 +482,7 @@ export default function App() {
     try {
       const cred = sessionStorage.getItem("kist_token");
       if (!cred) return null;
-      const p = JSON.parse(atob(cred.split(".")[1]));
+      const p = decodeJwtPayload(cred);
       if (p.exp * 1000 < Date.now()) { sessionStorage.removeItem("kist_token"); return null; }
       // Defesa em profundidade: token de e-mail não autorizado não restaura sessão.
       if (!emailAutorizado(p.email)) {
@@ -531,7 +562,7 @@ export default function App() {
 
   function handleGoogleResponse(response) {
     const credential = response.credential;
-    const payload = JSON.parse(atob(credential.split(".")[1]));
+    const payload = decodeJwtPayload(credential);
     // ── Trava de acesso: só e-mails autorizados entram ──────────────────────
     if (!emailAutorizado(payload.email)) {
       try { if (window.google) window.google.accounts.id.disableAutoSelect(); } catch (e) {}
