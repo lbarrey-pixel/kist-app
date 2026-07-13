@@ -201,7 +201,7 @@ def ping():
     return {"pong": True}
 
 @app.get("/proxima-proposta")
-def proxima_proposta():
+def proxima_proposta(usuario: str = Depends(verificar_token)):
     """Retorna o próximo número de proposta disponível.
     Fonte primária: propostas.numero_proposta (mais confiável).
     Fallback: produtos.proposta_tiny (banco de preços).
@@ -243,7 +243,7 @@ def proxima_proposta():
     return {"proximo": ""}
 
 @app.get("/banco/stats")
-def banco_stats():
+def banco_stats(usuario: str = Depends(verificar_token)):
     sb = get_supabase()
     try:
         total = sb.table('produtos').select('id', count='exact').execute()

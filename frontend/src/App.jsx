@@ -14,6 +14,15 @@ import {
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 
+// E-mails autorizados — mesma lista/default do backend (USUARIOS_PERMITIDOS).
+// Esta é a trava de UX no front; a barreira REAL é o backend (403 em rota protegida).
+const USUARIOS_PERMITIDOS = new Set(
+  (import.meta.env.VITE_USUARIOS_PERMITIDOS ||
+    "leonardobarrey@gmail.com,thiagokist@gmail.com,fabiokist@gmail.com")
+    .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)
+);
+const emailAutorizado = (e) => USUARIOS_PERMITIDOS.has((e || "").trim().toLowerCase());
+
 const isLink = (s) => typeof s === "string" && /^https?:\/\//i.test(s.trim());
 
 // ── Linha de item da revisão ───────────────────────────────────────────────
@@ -442,15 +451,25 @@ export default function App() {
     try {
       const cred = sessionStorage.getItem("kist_token");
       if (!cred) return null;
-      const exp = JSON.parse(atob(cred.split(".")[1])).exp;
-      if (exp * 1000 < Date.now()) { sessionStorage.removeItem("kist_token"); return null; }
+      const p = JSON.parse(atob(cred.split(".")[1]));
+      if (p.exp * 1000 < Date.now()) { sessionStorage.removeItem("kist_token"); return null; }
+      // Defesa em profundidade: token de e-mail não autorizado não restaura sessão.
+      if (!emailAutorizado(p.email)) {
+        sessionStorage.removeItem("kist_token"); sessionStorage.removeItem("kist_user"); return null;
+      }
       return cred;
     } catch { return null; }
   });
   const [usuario, setUsuario] = useState(() => {
-    try { const u = sessionStorage.getItem("kist_user"); return u ? JSON.parse(u) : null; }
-    catch { return null; }
+    try {
+      const u = sessionStorage.getItem("kist_user");
+      if (!u) return null;
+      const parsed = JSON.parse(u);
+      if (!emailAutorizado(parsed?.email)) { sessionStorage.removeItem("kist_user"); return null; }
+      return parsed;
+    } catch { return null; }
   });
+  const [authErro, setAuthErro] = useState("");
   const [showDocs, setShowDocs] = useState(false);
   const [pagina, setPagina] = useState("nova"); // nova | propostas | ordens
   const [novaOCPayload, setNovaOCPayload] = useState(null);
@@ -484,7 +503,7 @@ export default function App() {
     if (!token) return;
     fetch(`${API}/banco/stats`, { headers: { Authorization: `Bearer ${token}` } })
       .then((r) => r.json()).then(setStats).catch(() => {});
-    fetch(`${API}/proxima-proposta`)
+    fetch(`${API}/proxima-proposta`, { headers: { Authorization: `Bearer ${token}` } })
       .then((r) => r.json()).then((d) => { if (d.proximo) setNumeroProposta(d.proximo); }).catch(() => {});
     const ka = setInterval(() => fetch(`${API}/ping`).catch(() => {}), 9 * 60 * 1000);
     return () => clearInterval(ka);
@@ -513,6 +532,15 @@ export default function App() {
   function handleGoogleResponse(response) {
     const credential = response.credential;
     const payload = JSON.parse(atob(credential.split(".")[1]));
+    // ── Trava de acesso: só e-mails autorizados entram ──────────────────────
+    if (!emailAutorizado(payload.email)) {
+      try { if (window.google) window.google.accounts.id.disableAutoSelect(); } catch (e) {}
+      try { sessionStorage.removeItem("kist_token"); sessionStorage.removeItem("kist_user"); } catch (e) {}
+      setToken(null); setUsuario(null);
+      setAuthErro(`Acesso negado para ${payload.email || "esta conta"}. Este sistema é restrito à equipe Kist.`);
+      return;
+    }
+    setAuthErro("");
     const user = { nome: payload.name, email: payload.email, foto: payload.picture };
     setToken(credential);
     setUsuario(user);
@@ -779,7 +807,7 @@ export default function App() {
     setPropostaId(null); setSalvando(false); setUltimoSalvo(null);
     modificadoRef.current = false;
     if (autoSaveRef.current) clearTimeout(autoSaveRef.current);
-    fetch(`${API}/proxima-proposta`).then((r) => r.json())
+    fetch(`${API}/proxima-proposta`, { headers: authHeaders() }).then((r) => r.json())
       .then((d) => { if (d.proximo) setNumeroProposta(d.proximo); }).catch(() => {});
   }
 
@@ -801,6 +829,11 @@ export default function App() {
           </div>
           <h1 className="text-[18px] font-semibold tracking-tight text-ink">Kist · Cabine</h1>
           <p className="mb-8 mt-1 text-[13px] text-sub">Entre com sua conta Google para acessar.</p>
+          {authErro && (
+            <div className="mb-4 rounded-lg border border-rose/40 bg-rose/10 px-3 py-2 text-left text-[12.5px] leading-snug text-rose">
+              {authErro}
+            </div>
+          )}
           <div ref={(el) => { if (el) { if (window.google) renderBotaoGoogle(el); else { const t = setInterval(() => { if (window.google) { clearInterval(t); renderBotaoGoogle(el); } }, 100); setTimeout(() => clearInterval(t), 5000); } } }}
             className="mb-3 flex min-h-[44px] items-center justify-center"></div>
           <p className="text-[11.5px] text-faint">Acesso restrito à equipe Kist</p>
