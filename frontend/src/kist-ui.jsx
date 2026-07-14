@@ -167,7 +167,7 @@ export function CertaintyStrip({ itens }) {
 }
 
 // ── Sidebar navy (substitui a navegação horizontal) ────────────────────────
-export function Sidebar({ active, onNavigate, usuario, stats, onLogout, isAdmin }) {
+export function Sidebar({ active, onNavigate, usuario, stats, onLogout, isAdmin, alertas = 0 }) {
   const nav = [
     { k: "nova",        label: "Nova proposta",     Icon: IconNova },
     { k: "propostas",   label: "Propostas",         Icon: IconList },
@@ -199,6 +199,11 @@ export function Sidebar({ active, onNavigate, usuario, stats, onLogout, isAdmin 
               {on && <span className="absolute left-0 top-1/2 h-5 w-[3px] -translate-y-1/2 rounded-full bg-kist" />}
               <Icon size={17} className={on ? "text-white" : "text-inkmut group-hover:text-white"} />
               {label}
+              {k === "requisicoes" && alertas > 0 && (
+                <span className="ml-auto flex h-5 min-w-[20px] items-center justify-center rounded-full bg-rose px-1.5 text-[10.5px] font-semibold text-white">
+                  {alertas > 9 ? "9+" : alertas}
+                </span>
+              )}
             </button>
           );
         })}

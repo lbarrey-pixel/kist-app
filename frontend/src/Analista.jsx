@@ -178,7 +178,7 @@ function ChatAnalista({ token, usuario, onAberto }) {
 }
 
 // ── Meus chamados (acompanhamento + aviso de "no ar") ──────────────────────
-function MeusChamados({ token }) {
+function MeusChamados({ token, onVisto }) {
   const authHeaders = () => ({ Authorization: `Bearer ${token}` });
   const [lista, setLista] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -196,6 +196,7 @@ function MeusChamados({ token }) {
   async function marcarVisto(id) {
     setLista((prev) => prev.map((c) => (c.id === id ? { ...c, avisar_operador: false } : c)));
     try { await fetch(`${API}/chamados/${id}/visto`, { method: "POST", headers: authHeaders() }); } catch (e) {}
+    onVisto?.();
   }
 
   if (loading) return <div className="py-10 text-center text-[13px] text-faint">Carregando…</div>;
@@ -239,7 +240,7 @@ function MeusChamados({ token }) {
 }
 
 // ── Página ─────────────────────────────────────────────────────────────────
-export default function Analista({ token, usuario }) {
+export default function Analista({ token, usuario, onAlertasChange }) {
   const [aba, setAba] = useState("chat");
   const [reloadKey, setReloadKey] = useState(0);
   return (
@@ -259,7 +260,7 @@ export default function Analista({ token, usuario }) {
       <div className="mt-5">
         {aba === "chat"
           ? <ChatAnalista token={token} usuario={usuario} onAberto={() => setReloadKey((k) => k + 1)} />
-          : <MeusChamados token={token} key={reloadKey} />}
+          : <MeusChamados token={token} key={reloadKey} onVisto={onAlertasChange} />}
       </div>
     </div>
   );

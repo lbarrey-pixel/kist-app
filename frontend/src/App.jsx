@@ -503,6 +503,8 @@ export default function App() {
   const [authErro, setAuthErro] = useState("");
   const [showDocs, setShowDocs] = useState(false);
   const [pagina, setPagina] = useState("nova"); // nova | propostas | ordens
+  const [alertasChamados, setAlertasChamados] = useState(0);
+  const [bannerDispensado, setBannerDispensado] = useState(false);
   const [novaOCPayload, setNovaOCPayload] = useState(null);
   const [step, setStep] = useState("input");
   const [loading, setLoading] = useState(false);
@@ -539,6 +541,29 @@ export default function App() {
     const ka = setInterval(() => fetch(`${API}/ping`).catch(() => {}), 9 * 60 * 1000);
     return () => clearInterval(ka);
   }, [token]);
+
+  // Alertas de chamados resolvidos (badge + banner): conta os PRÓPRIOS com avisar_operador.
+  const carregarAlertas = useCallback(() => {
+    if (!token || !usuario?.email) return;
+    const email = usuario.email.toLowerCase();
+    fetch(`${API}/chamados`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => r.json())
+      .then((d) => {
+        const n = (d.chamados || []).filter(
+          (c) => c.avisar_operador && (c.operador_email || "").toLowerCase() === email
+        ).length;
+        setAlertasChamados(n);
+      })
+      .catch(() => {});
+  }, [token, usuario]);
+
+  useEffect(() => {
+    carregarAlertas();
+    // Recarrega quando o operador volta pra aba (pega chamados resolvidos enquanto estava fora).
+    const onVisible = () => { if (document.visibilityState === "visible") carregarAlertas(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [carregarAlertas]);
 
   // Capturar Ctrl+V de imagens
   useEffect(() => {
@@ -876,9 +901,29 @@ export default function App() {
   // ── APP PRINCIPAL ──────────────────────────────────────────────────────────
   return (
     <div className="flex h-screen bg-paper font-sans text-ink antialiased">
-      <Sidebar active={activeNav} onNavigate={navegar} usuario={usuario} stats={stats} onLogout={logout} isAdmin={isAdmin} />
+      <Sidebar active={activeNav} onNavigate={navegar} usuario={usuario} stats={stats} onLogout={logout} isAdmin={isAdmin} alertas={alertasChamados} />
 
       <main className="flex-1 overflow-auto">
+        {alertasChamados > 0 && !bannerDispensado && pagina !== "requisicoes" && !showDocs && (
+          <div className="flex items-center gap-3 border-b border-signal/20 bg-signalbg px-8 py-2.5">
+            <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-signal text-white">
+              <IconCheck size={13} />
+            </span>
+            <span className="text-[13px] text-ink">
+              {alertasChamados === 1
+                ? "1 chamado seu foi resolvido e está no ar."
+                : `${alertasChamados} chamados seus foram resolvidos e estão no ar.`}
+            </span>
+            <button onClick={() => navegar("requisicoes")}
+              className="rounded-md bg-signal/10 px-2.5 py-1 text-[12.5px] font-medium text-signal transition-colors hover:bg-signal/20">
+              Ver
+            </button>
+            <button onClick={() => setBannerDispensado(true)} title="Dispensar"
+              className="ml-auto rounded-md p-1 text-faint transition-colors hover:bg-white/60 hover:text-ink">
+              <IconX size={15} />
+            </button>
+          </div>
+        )}
         {showDocs ? (
           <div className="mx-auto max-w-5xl px-8 py-9"><Docs /></div>
         ) : pagina === "propostas" ? (
@@ -889,7 +934,7 @@ export default function App() {
             novaOC={novaOCPayload}
             onNovaOCProcessada={() => setNovaOCPayload(null)} />
         ) : pagina === "requisicoes" ? (
-          <Analista token={token} usuario={usuario} />
+          <Analista token={token} usuario={usuario} onAlertasChange={carregarAlertas} />
         ) : pagina === "chamados" && isAdmin ? (
           <ChamadosAdmin token={token} usuario={usuario} />
         ) : (
