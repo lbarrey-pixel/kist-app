@@ -255,7 +255,7 @@ def banco_stats(usuario: str = Depends(verificar_token)):
     except Exception as e:
         return {"erro": str(e)}
 
-def _fazer_matching(itens_raw: list, claude, sb) -> list:
+def _fazer_matching(itens_raw: list, claude, sb, preservar_cliente: bool = False) -> list:
     """Faz matching dos itens extraídos com o banco de preços via Claude Haiku.
     Reutilizável pelo endpoint /extrair para cada proposta individualmente."""
     import json as _jm
@@ -313,8 +313,6 @@ Lembre: fabricante diferente = null. Categoria diferente = null. Seja rigoroso."
         if k and k not in _banco_por_desc:
             _banco_por_desc[k] = c
 
-    _preservar_cliente = str(preservar_cliente).strip().lower() in ("1", "true", "on", "yes", "sim")
-
     itens_com_preco = []
     for i, item in enumerate(itens_raw):
         desc = item.get("descricao", "")
@@ -344,8 +342,10 @@ Lembre: fabricante diferente = null. Categoria diferente = null. Seja rigoroso."
         # Modo "preservar 100% a descrição do cliente": nunca substitui a descrição;
         # o match do banco (preço) só entra se for EXATO (alta). Em media/baixa/nenhuma
         # o item fica com a descrição do cliente e sem preço sugerido (cotação manual).
-        if _preservar_cliente:
-            desc_final = desc_original
+        if preservar_cliente:
+            # Preserva a descrição do cliente; fallback pra descricao curta se a
+            # original vier vazia/em branco — nunca deixa o campo vazio.
+            desc_final = (desc_original or "").strip() or desc
             if confianca == "alta" and match.get("banco_descricao"):
                 preco_un = float(match.get("banco_preco") or 0)
                 proposta_ref = match.get("banco_proposta", "")
@@ -756,8 +756,9 @@ async def extrair_email(
 
         # Matching com o banco de preços
         sb = get_supabase()
+        _preservar = str(preservar_cliente).strip().lower() in ("1", "true", "on", "yes", "sim")
         try:
-            itens_enriquecidos = _fazer_matching(itens_brutos, claude, sb)
+            itens_enriquecidos = _fazer_matching(itens_brutos, claude, sb, preservar_cliente=_preservar)
         except Exception:
             itens_enriquecidos = itens_brutos
 
