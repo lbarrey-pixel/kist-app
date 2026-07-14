@@ -220,20 +220,21 @@ function ItemRow({ item, index, onChange, token, apiUrl }) {
                 <IconBolt size={11} /> {loadingPn ? "buscando…" : "Sugerir PN"}
               </button>
             )}
-            {item.specs_complementares && (
-              <button onClick={() => setMostrarSpecs((v) => !v)} className="text-[11px] text-faint hover:text-sub">
-                {mostrarSpecs ? "− specs originais" : "+ specs originais"}
-              </button>
-            )}
+            <button onClick={() => setMostrarSpecs((v) => !v)} className="text-[11px] text-faint hover:text-sub">
+              {mostrarSpecs ? "− descrição complementar" : "+ descrição complementar"}
+            </button>
             <button onClick={() => setMostrarOrigem((v) => !v)}
               className={`text-[11px] hover:text-sub ${temOrigem ? "text-kist" : "text-faint"}`}>
               {mostrarOrigem ? "− origem do preço" : temOrigem ? "✓ origem do preço" : "+ origem do preço"}
             </button>
           </div>
-          {mostrarSpecs && item.specs_complementares && (
-            <div className="mt-1.5 whitespace-pre-wrap rounded-md border border-line bg-paper p-2 font-mono text-[11px] text-sub">
-              {item.specs_complementares}
-            </div>
+          {mostrarSpecs && (
+            <textarea
+              value={item.specs_complementares || ""}
+              onChange={(e) => onChange(index, "specs_complementares", e.target.value)}
+              rows={2}
+              placeholder="PN, código, specs técnicas… (vai para 'Descrição complementar' no Tiny)"
+              className="mt-1.5 w-full resize-none rounded-md border border-line bg-paper p-2 font-mono text-[11px] text-ink outline-none placeholder:text-faint" />
           )}
         </td>
         <td className="py-2 pr-3">
@@ -505,6 +506,8 @@ export default function App() {
   const [pagina, setPagina] = useState("nova"); // nova | propostas | ordens
   const [alertasChamados, setAlertasChamados] = useState(0);
   const [bannerDispensado, setBannerDispensado] = useState(false);
+  const [preservarCliente, setPreservarCliente] = useState(false);
+  const preservarInitRef = useRef(false);
   const [novaOCPayload, setNovaOCPayload] = useState(null);
   const [step, setStep] = useState("input");
   const [loading, setLoading] = useState(false);
@@ -564,6 +567,15 @@ export default function App() {
     document.addEventListener("visibilitychange", onVisible);
     return () => document.removeEventListener("visibilitychange", onVisible);
   }, [carregarAlertas]);
+
+  // Default do checkbox "preservar 100% descrição do cliente": ON pro Fábio, OFF pros demais.
+  // Setado uma única vez quando o usuário fica conhecido; depois é livre pro operador alternar.
+  useEffect(() => {
+    if (usuario?.email && !preservarInitRef.current) {
+      preservarInitRef.current = true;
+      setPreservarCliente(usuario.email.toLowerCase() === "fabiokist@gmail.com");
+    }
+  }, [usuario]);
 
   // Capturar Ctrl+V de imagens
   useEffect(() => {
@@ -685,6 +697,7 @@ export default function App() {
     try {
       const form = new FormData();
       form.append("numero_proposta", numeroProposta);
+      form.append("preservar_cliente", preservarCliente ? "1" : "0");
       arquivos.forEach((f) => form.append("arquivos", f));
       if (texto) form.append("texto", texto);
       imagens.forEach((img) => form.append("imagens", img));
@@ -719,7 +732,7 @@ export default function App() {
 
   function atualizarItem(index, campo, valor) {
     setPropostas((prev) => prev.map((p, pi) =>
-      pi !== propostaIdx ? p : { ...p, itens: p.itens.map((item, i) => i === index ? { ...item, [campo]: valor } : item) }
+      pi !== propostaIdx ? p : { ...p, itens: p.itens.map((item, i) => i === index ? { ...item, [campo]: valor, _alterado: true } : item) }
     ));
     _dispararAutoSave();
   }
@@ -1032,6 +1045,14 @@ export default function App() {
                     onChange={(e) => setTexto(e.target.value)} />
 
                   {erro && <div className="rounded-lg border border-rose/30 bg-rosebg px-4 py-3 text-[13px] text-rose">{erro}</div>}
+
+                  <label className="flex cursor-pointer items-center gap-2 text-[12.5px] text-sub">
+                    <input type="checkbox" checked={preservarCliente}
+                      onChange={(e) => setPreservarCliente(e.target.checked)}
+                      className="h-3.5 w-3.5 rounded border-line2 text-kist focus:ring-kist" />
+                    Preservar 100% a descrição do cliente
+                    <span className="text-[11px] text-faint">— match do banco só entra se for exato</span>
+                  </label>
 
                   <button onClick={processar} disabled={loading} className={`${btnPrimary} w-full justify-center py-2.5`}>
                     {loading

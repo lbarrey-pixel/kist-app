@@ -313,6 +313,8 @@ Lembre: fabricante diferente = null. Categoria diferente = null. Seja rigoroso."
         if k and k not in _banco_por_desc:
             _banco_por_desc[k] = c
 
+    _preservar_cliente = str(preservar_cliente).strip().lower() in ("1", "true", "on", "yes", "sim")
+
     itens_com_preco = []
     for i, item in enumerate(itens_raw):
         desc = item.get("descricao", "")
@@ -338,6 +340,19 @@ Lembre: fabricante diferente = null. Categoria diferente = null. Seja rigoroso."
             desc_final = desc
             preco_un = float(match.get("banco_preco") or 0)
             obs_item = f"⚠ CONFIRA — candidato no banco: {match['banco_descricao']} | motivo: {match.get('motivo','')}"
+
+        # Modo "preservar 100% a descrição do cliente": nunca substitui a descrição;
+        # o match do banco (preço) só entra se for EXATO (alta). Em media/baixa/nenhuma
+        # o item fica com a descrição do cliente e sem preço sugerido (cotação manual).
+        if _preservar_cliente:
+            desc_final = desc_original
+            if confianca == "alta" and match.get("banco_descricao"):
+                preco_un = float(match.get("banco_preco") or 0)
+                proposta_ref = match.get("banco_proposta", "")
+                obs_item = f"✓ ref {proposta_ref}" if proposta_ref else ""
+            else:
+                preco_un = 0.0
+                obs_item = "SEM PREÇO"
 
         # SÓ em 'alta' puxa custo/origem do banco — direto da linha, nunca da IA.
         # Em media/baixa/nenhuma fica em branco (regra: na dúvida, não arrasta custo do item errado).
@@ -492,6 +507,7 @@ async def extrair_email(
     arquivos: list[UploadFile] = File(default=[]),   # múltiplos arquivos (email + Excels + PDFs)
     imagens: list[UploadFile] = File(default=[]),
     numero_proposta: str = Form(...),
+    preservar_cliente: str = Form("0"),
     token_form: str = Form(None),
     request: Request = None,
     usuario: str = Depends(verificar_token)
@@ -785,9 +801,13 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
             origem["sku_fornecedor"] = item["sku_fornecedor"].strip()
 
         try:
-            res = sb.table("produtos").select("id,preco_un")\
+            # Se o operador ALTEROU o item, ele entende que é um item diferente (ou
+            # está ajustando a descrição pro cliente): grava como registro NOVO, sem
+            # sobrescrever o do banco. Item intocado segue a regra normal (achou = atualiza).
+            _alterado = bool(item.get("_alterado"))
+            res = None if _alterado else sb.table("produtos").select("id,preco_un")\
                 .ilike("descricao", desc).limit(1).execute()
-            if res.data:
+            if res and res.data:
                 sb.table("produtos").update({
                     "preco_un": float(preco), "data_ref": hoje,
                     "proposta_tiny": proposta, "cliente": cliente,
