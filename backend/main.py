@@ -1,7 +1,7 @@
 import os, csv, io, re, time, base64 as _b64
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional
@@ -14,6 +14,21 @@ from google.auth.transport import requests as google_requests
 
 app = FastAPI(title="Kist Cotações API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.exception_handler(Exception)
+async def _erro_nao_tratado(request: Request, exc: Exception):
+    """Erro não tratado precisa voltar COM cabeçalho CORS.
+
+    Sem isso, o 500 sai sem os headers do CORSMiddleware, o navegador bloqueia a
+    resposta e o operador vê só "Failed to fetch" — escondendo a mensagem real.
+    O traceback continua indo pro log do Render normalmente.
+    """
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"{type(exc).__name__}: {exc}"},
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "822792475898-4l9ctl5jc1urpi2tvbuaut2tpelgevfo.apps.googleusercontent.com")
@@ -254,6 +269,21 @@ def banco_stats(usuario: str = Depends(verificar_token)):
         return {"total_produtos": total.count, "desatualizados_90d": desatual.count}
     except Exception as e:
         return {"erro": str(e)}
+
+def _media_type_img(b: bytes) -> str:
+    """Detecta o tipo REAL da imagem pelos bytes (magic numbers).
+
+    O Outlook nomeia toda imagem inline de 'image.png' independente do formato
+    real, e a API da Anthropic rejeita (400) quando o media_type declarado não
+    bate com o conteúdo. Nunca confiar na extensão do arquivo.
+    """
+    b = b or b""
+    if b[:8] == b"\x89PNG\r\n\x1a\n":            return "image/png"
+    if b[:3] == b"\xff\xd8\xff":                 return "image/jpeg"
+    if b[:6] in (b"GIF87a", b"GIF89a"):          return "image/gif"
+    if b[:4] == b"RIFF" and b[8:12] == b"WEBP":  return "image/webp"
+    return "image/png"
+
 
 def _fazer_matching(itens_raw: list, claude, sb, preservar_cliente: bool = False) -> list:
     """Faz matching dos itens extraídos com o banco de preços via Claude Haiku.
@@ -683,13 +713,11 @@ async def extrair_email(
             msg_content.append({"type": "text", "text": f"Analise também {len(imgs_inline)} imagem(ns):"})
             for _, img_bytes in (imgs_inline or [])[:4]:
                 msg_content.append({"type": "image", "source": {"type": "base64",
-                    "media_type": "image/png", "data": _b64.standard_b64encode(img_bytes).decode()}})
+                    "media_type": _media_type_img(img_bytes), "data": _b64.standard_b64encode(img_bytes).decode()}})
         if imgs_upload:
             for img in (imgs_upload or [])[:4]:
                 ib = await img.read()
-                flo2 = (img.filename or "").lower()
-                mt = "image/jpeg" if flo2.endswith((".jpg", ".jpeg")) else "image/png"
-                msg_content.append({"type": "image", "source": {"type": "base64", "media_type": mt,
+                msg_content.append({"type": "image", "source": {"type": "base64", "media_type": _media_type_img(ib),
                     "data": _b64.standard_b64encode(ib).decode()}})
         if not msg_content:
             return []
@@ -1013,8 +1041,9 @@ Sugira 3 opções de PN/modelos específicos. JSON puro sem markdown:
     raw = resp.content[0].text.strip()
     raw = re.sub(r'^```(?:json)?\s*', '', raw)
     raw = re.sub(r'\s*```$', '', raw.strip())
+    import json as _json_pn
     try:
-        return json.loads(raw)
+        return _json_pn.loads(raw)
     except Exception as e:
         raise HTTPException(500, f"Erro ao parsear sugestões: {str(e)} | {raw[:200]}")
 
