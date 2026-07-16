@@ -339,10 +339,15 @@ function ChatAnalista({ token, usuario, onAberto }) {
         <textarea
           value={texto} onChange={(e) => setTexto(e.target.value)}
           onPaste={(e) => { const f = e.clipboardData?.files; if (f && f.length) { e.preventDefault(); escolher(f); } }}
-          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); enviar(); } }}
-          rows={6} placeholder="Escreva sua sugestão ou problema — pode se estender à vontade.&#10;Ctrl+V cola print · arraste arquivos aqui · Enter envia, Shift+Enter pula linha"
+          onKeyDown={(e) => {
+            // Caixa de 6 linhas convida a escrever parágrafo: Enter TEM que pular
+            // linha. Antes, cada quebra disparava a mensagem no meio da frase.
+            if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); enviar(); }
+          }}
+          rows={6} placeholder="Escreva sua sugestão ou problema — pode se estender à vontade.&#10;Ctrl+V cola print · arraste arquivos aqui · Ctrl+Enter envia"
           className="min-h-[132px] max-h-[60vh] flex-1 resize-y rounded-lg border border-line2 bg-paper px-3 py-2 text-[13px] leading-relaxed text-ink outline-none placeholder:text-faint" />
-        <button onClick={enviar} disabled={!podeEnviar} className={btnPrimary}>
+        <button onClick={enviar} disabled={!podeEnviar} className={btnPrimary}
+          title="Ctrl+Enter">
           {subindo ? "Lendo anexo…" : <>Enviar <IconArrow size={15} /></>}
         </button>
       </div>
