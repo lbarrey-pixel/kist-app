@@ -2559,6 +2559,35 @@ def _now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+FERRAMENTA_FICHA = {
+    "name": "propor_chamado",
+    "description": (
+        "Chame ESTA ferramenta quando tiver informação suficiente para propor o chamado. "
+        "Enquanto faltar informação, NÃO chame — apenas responda em texto com a próxima pergunta. "
+        "Chamar a ferramenta não registra nada: o chamado só nasce depois que o operador "
+        "confirmar na tela."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "tipo":  {"type": "string", "enum": ["bug", "melhoria", "duvida"],
+                      "description": "bug = deveria funcionar e não funciona; melhoria = algo novo; duvida = não sabe como fazer"},
+            "titulo": {"type": "string", "description": "título curto e claro"},
+            "solicitacao": {"type": "string", "description": "o que está sendo pedido, em 1-2 frases"},
+            "dor": {"type": "string", "description": "a dor/problema que isso resolve"},
+            "comportamento_esperado": {"type": "string", "description": "como o sistema deve se comportar depois"},
+            "area": {"type": "string",
+                     "enum": ["proposta", "banco", "oc", "receber_po", "extracao", "login", "outro"]},
+            "ja_suportado": {"type": "boolean",
+                             "description": "true se o sistema JÁ faz isso — explique onde no parecer"},
+            "parecer": {"type": "string", "description": "seu parecer técnico curto"},
+            "prioridade": {"type": "string", "enum": ["baixa", "media", "alta"]},
+        },
+        "required": ["tipo", "titulo", "solicitacao", "dor", "comportamento_esperado"],
+    },
+}
+
+
 SYSTEM_ANALISTA = """Você é o Analista de Negócios interno do sistema "Kist Cabine de Compras",
 usado pelos 3 operadores da Kist. Seu papel: receber sugestões de melhoria, bugs e dúvidas,
 entender a fundo o que resolvem, e registrar chamados bem estruturados para o Leonardo (dono/dev) priorizar.
@@ -2581,30 +2610,19 @@ SEU MÉTODO, nesta ordem:
    como faz hoje (contorno), quem se beneficia.
 5. ENTENDA A DOR, não só o pedido. Às vezes o que a pessoa pede não é o que melhor resolve — aponte com cuidado.
 
-QUANDO TIVER INFORMAÇÃO SUFICIENTE, monte a FICHA e proponha abrir o chamado. NÃO abra sozinho: o
-chamado só é registrado depois que o operador confirmar na tela. Enquanto faltar informação, "ficha" fica null.
+QUANDO TIVER INFORMAÇÃO SUFICIENTE, chame a ferramenta `propor_chamado` para montar a FICHA.
+NÃO abra sozinho: o chamado só é registrado depois que o operador confirmar na tela.
 
-FORMATO DE RESPOSTA — responda SEMPRE com um JSON válido puro. Sem markdown, sem crases, nada antes ou depois:
-{"reply": "sua mensagem em PT-BR para o operador", "ficha": null}
+FORMATO DE RESPOSTA:
+- Responda SEMPRE em texto normal, em PT-BR. Escreva à vontade: parágrafos, listas, o que precisar.
+  Não existe limite de formato e você NÃO deve responder em JSON.
+- Enquanto faltar informação: só texto, com a próxima pergunta. Não chame a ferramenta.
+- Quando tiver o suficiente: escreva um resumo curto pedindo pra conferir E chame a ferramenta
+  `propor_chamado` na mesma resposta.
 
-OU, quando estiver pronto para propor o chamado:
-{"reply": "resumo curto + peça pra conferir e confirmar", "ficha": {
-  "tipo": "bug|melhoria|duvida",
-  "titulo": "título curto e claro",
-  "solicitacao": "o que está sendo pedido, em 1-2 frases",
-  "dor": "a dor/problema que isso resolve",
-  "comportamento_esperado": "como o sistema deve se comportar depois da melhoria/correção",
-  "area": "proposta|banco|oc|receber_po|extracao|login|outro",
-  "ja_suportado": false,
-  "parecer": "seu parecer técnico curto; se ja_suportado=true, diga onde/como já se faz",
-  "prioridade": "baixa|media|alta"
-}}
-
-REGRAS DO JSON:
-- Responda só o objeto JSON. Nada fora dele.
-- "ficha" só deixa de ser null quando você tem tipo, titulo, solicitacao, dor e comportamento_esperado.
-- Se for "já suportado", ainda assim monte a ficha com ja_suportado=true e explique no parecer onde se faz
-  — registrar isso ajuda a mapear o que está difícil de achar no sistema.
+REGRAS:
+- Se for "já suportado", ainda assim chame a ferramenta com ja_suportado=true e explique no parecer
+  onde/como já se faz — registrar isso ajuda a mapear o que está difícil de achar no sistema.
 - Nunca prometa prazo nem diga que "vai fazer". Você só registra; quem prioriza e resolve é o Leonardo.
 """
 
@@ -2677,19 +2695,46 @@ async def analista_chat(payload: AnalistaChatIn, usuario: str = Depends(verifica
 
     try:
         resp = claude.messages.create(
-            model="claude-sonnet-4-6", max_tokens=1500,
-            system=system, messages=msgs, temperature=0.2, timeout=40.0,
+            model="claude-sonnet-4-6", max_tokens=4000,
+            system=system, messages=msgs, temperature=0.2, timeout=90.0,
+            tools=[FERRAMENTA_FICHA],
         )
-        raw = resp.content[0].text.strip()
-        raw = re.sub(r'^```(?:json)?\s*', '', raw)
-        raw = re.sub(r'\s*```$', '', raw.strip())
-        data = _json_an.loads(raw)
-        ficha = data.get("ficha")
-        if not isinstance(ficha, dict):
-            ficha = None
-        return {"reply": data.get("reply") or "", "ficha": ficha}
+        # A prosa vem em bloco(s) de texto; a ficha vem estruturada pela ferramenta.
+        # Nada de json.loads em cima da fala do modelo — era daí que vinha o
+        # "Tive um problema pra processar": a resposta longa estourava max_tokens,
+        # o JSON truncava no meio e o parse quebrava JUSTO quando a ficha ficava
+        # pronta (a hora em que a resposta é maior).
+        reply = "".join(b.text for b in resp.content
+                        if getattr(b, "type", "") == "text").strip()
+        ficha = None
+        for b in resp.content:
+            if getattr(b, "type", "") == "tool_use" and getattr(b, "name", "") == "propor_chamado":
+                ficha = dict(b.input or {})
+        if ficha and not reply:
+            reply = "Montei a ficha com o que você me passou. Confere aí e me confirma."
+        return {"reply": reply or "…", "ficha": ficha}
     except Exception as e:
-        return {"reply": "Tive um problema pra processar agora. Pode repetir do seu jeito?", "ficha": None, "erro": str(e)}
+        # Falha do sistema: o operador não pode achar que foi ele que escreveu errado.
+        num = _abrir_chamado_automatico(
+            sb, usuario, f"analista:chat:{type(e).__name__}",
+            titulo="Analista de Negócios falhou ao responder",
+            solicitacao=("O operador estava conversando com o analista e a resposta não veio. "
+                         "A conversa fica travada: ele repete a mensagem e toma o mesmo erro."),
+            dor=("O operador não consegue registrar o chamado. Ele reescreve tudo, toma o erro de "
+                 "novo e desiste — e a demanda se perde."),
+            esperado="O analista responde. Se falhar, o operador vê o motivo real, não uma desculpa.",
+            detalhe=f"{type(e).__name__}: {e}"[:400],
+            area="outro",
+        )
+        aviso = (f" Registrei o chamado #{str(num).zfill(4)} e o Leonardo foi avisado."
+                 if num else " Não consegui nem registrar o chamado — avise o Leonardo.")
+        return {
+            "reply": "Falhei aqui do meu lado — não foi nada que você escreveu, e o texto não se "
+                     "perdeu." + aviso + " Pode tentar enviar de novo.",
+            "ficha": None,
+            "erro": f"{type(e).__name__}: {e}"[:400],
+            "chamado": num,
+        }
 
 
 class ChamadoIn(BaseModel):
