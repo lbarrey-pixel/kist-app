@@ -513,6 +513,9 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [salvandoBanco, setSalvandoBanco] = useState(false);
   const [erro, setErro] = useState("");
+  // Avisos do backend quando a BUSCA FALHOU (≠ produto ausente no banco).
+  // Cada um traz o número do chamado que o sistema abriu sozinho.
+  const [avisosSistema, setAvisosSistema] = useState([]);
   const [texto, setTexto] = useState("");
   const [arquivos, setArquivos] = useState([]);   // múltiplos arquivos (email + Excel + PDF)
   const [imagens, setImagens] = useState([]);
@@ -719,6 +722,9 @@ export default function App() {
         throw new Error(err.detail || "Erro no servidor");
       }
       const data = await res.json();
+      // Falha do sistema != produto ausente no banco. Sem isto, o operador
+      // precifica 20 itens na mão achando que o banco está pobre.
+      setAvisosSistema(Array.isArray(data.avisos) ? data.avisos : []);
       // Normalizar: backend sempre retorna {propostas:[...]}, mas suportar legado {itens:[...]}
       const props = data.propostas || [data];
       setPropostas(props); setPropostaIdx(0); setDownloadados(new Set());
@@ -869,6 +875,7 @@ export default function App() {
   }
 
   function reiniciar() {
+    setAvisosSistema([]);
     setStep("input"); setPropostas([]); setPropostaIdx(0); setDownloadados(new Set()); setBancoInfo(null);
     setTexto(""); setArquivos([]); setImagens([]); setNumeroProposta(""); setErro("");
     setPropostaId(null); setSalvando(false); setUltimoSalvo(null);
@@ -1092,6 +1099,45 @@ export default function App() {
                         : <><IconDownload size={15} /> Confirmar e baixar CSV{propostas.length > 1 ? ` — Proposta ${propostaIdx + 1}` : ""}</>}
                     </button>
                   </>} />
+
+                {/* Falha do sistema != produto ausente no banco.
+                    Sem este aviso, os dois casos chegam idênticos na tela: itens
+                    sem preço. O operador precificaria na mão itens que o banco
+                    já tinha, sem nunca saber que o backend falhou. */}
+                {avisosSistema.length > 0 && (
+                  <div className="mt-4 space-y-2">
+                    {avisosSistema.map((av, i) => (
+                      <div key={i} className="rounded-xl border border-rose/40 bg-rosebg px-4 py-3">
+                        <div className="flex items-start gap-2.5">
+                          <span className="mt-0.5 flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full bg-rose text-[10px] font-bold text-white">!</span>
+                          <div className="min-w-0 flex-1">
+                            <div className="text-[13px] font-semibold text-rose">Falha do sistema — não é ausência no banco</div>
+                            <div className="mt-0.5 text-[12.5px] leading-relaxed text-sub">{av.mensagem}</div>
+                            {av.chamado ? (
+                              <div className="mt-1.5 text-[12px] text-sub">
+                                Registrei o chamado{" "}
+                                <span className="font-mono font-semibold text-ink">#{String(av.chamado).padStart(4, "0")}</span>
+                                {" "}e o Leonardo foi avisado. Você acompanha em <span className="font-medium">Requisições → Meus chamados</span>.
+                              </div>
+                            ) : (
+                              <div className="mt-1.5 text-[12px] text-sub">Não consegui nem registrar o chamado — avise o Leonardo direto.</div>
+                            )}
+                            {av.detalhe && (
+                              <details className="mt-1.5">
+                                <summary className="cursor-pointer text-[11px] text-faint hover:text-sub">detalhe técnico</summary>
+                                <div className="mt-1 whitespace-pre-wrap break-words rounded bg-surface/60 px-2 py-1 font-mono text-[10.5px] text-faint">{av.detalhe}</div>
+                              </details>
+                            )}
+                          </div>
+                          <button onClick={() => setAvisosSistema((p) => p.filter((_, j) => j !== i))}
+                            title="Dispensar" className="rounded p-0.5 text-rose/60 hover:bg-white/40 hover:text-rose">
+                            <IconX size={14} />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
 
                 {/* Tabs de proposta — visíveis só quando há múltiplas */}
                 {propostas.length > 1 && (

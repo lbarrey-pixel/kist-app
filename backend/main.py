@@ -192,19 +192,13 @@ def _alerta_do_candidato(banco_desc, todos_candidatos):
     return None
 
 
-def _prefiltro_candidatos(descricao: str, todos_candidatos: list) -> list:
-    """Filtra candidatos por palavras relevantes — máx 40 por item para não sobrecarregar o Claude"""
-    palavras = [p for p in descricao.upper().split() if len(p) > 3][:6]
-    if not palavras:
-        return todos_candidatos[:40]
-    scored = []
-    for row in todos_candidatos:
-        desc_banco = (row.get('descricao') or '').upper()
-        score = sum(1 for p in palavras if p in desc_banco)
-        if score > 0:
-            scored.append((score, row))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [r for _, r in scored[:40]]
+#  _prefiltro_candidatos foi REMOVIDO na v3.14.
+#  Ele filtrava por sobreposição de palavras DENTRO da janela de 500 linhas mais
+#  recentes carregada pelo _fazer_matching — e essa janela enxergava 0,8% do banco.
+#  Medição contra 636 pares reais (recall@40, banco inteiro):
+#      palavras  85,8%   ·   trigrama  95,1%   ·   híbrido dos dois  93,3%
+#  O trigrama contém as palavras: dos casos que ele acha, as palavras perdiam 14;
+#  o contrário só 1. Menos código e melhor resultado — hoje é candidatos_trgm_lote().
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/health")
@@ -285,63 +279,271 @@ def _media_type_img(b: bytes) -> str:
     return "image/png"
 
 
-def _fazer_matching(itens_raw: list, claude, sb, preservar_cliente: bool = False) -> list:
-    """Faz matching dos itens extraídos com o banco de preços via Claude Haiku.
-    Reutilizável pelo endpoint /extrair para cada proposta individualmente."""
+_PROD_COLS = ("id,descricao,preco_un,proposta_tiny,data_ref,alerta,"
+              "preco_custo,link_fornecedor,fornecedor,sku_fornecedor")
+
+
+def _norm_entrada(s: str) -> str:
+    """Normaliza o texto do cliente para a chave da memória de matching.
+
+    ATENÇÃO: esta regra tem que ser IDÊNTICA à função norm_entrada() do Postgres.
+    Se mudar aqui, mude lá — senão a memória grava com uma chave e busca com outra,
+    e o aprendizado some sem dar erro.
+    """
+    import unicodedata as _ud
+    t = _ud.normalize("NFD", (s or ""))
+    t = "".join(c for c in t if _ud.category(c) != "Mn")
+    t = re.sub(r"[^a-z0-9]+", " ", t.lower())
+    return re.sub(r"\s+", " ", t).strip()
+
+
+_TITULOS_FALHA = {
+    "candidatos_trgm_lote": "Busca no banco de preços falhou ao gerar proposta",
+    "memoria_match":        "Memória de matching indisponível",
+    "produtos_da_memoria":  "Memória reconheceu o item mas o produto não foi lido",
+    "ia_matching":          "IA de matching não respondeu",
+    "geral":                "Matching falhou por completo ao gerar proposta",
+}
+
+
+def _abrir_chamado_automatico(sb, usuario: str, assinatura: str, titulo: str,
+                              solicitacao: str, dor: str, esperado: str,
+                              detalhe: str, area: str = "proposta"):
+    """O sistema abre chamado contra si mesmo quando FALHA.
+
+    Falhar != não achar. Produto que não existe no banco é resultado legítimo e
+    não gera chamado nenhum. Isto aqui é só para quando a busca não pôde acontecer.
+
+    Dedup por assinatura: enquanto houver chamado aberto/em desenvolvimento com a
+    mesma assinatura, novas falhas só incrementam `ocorrencias`. Sem isso, uma
+    indisponibilidade de 10 min no Render viraria 30 chamados idênticos no kanban.
+    Depois de resolvido, uma falha nova abre chamado novo — o problema voltou.
+
+    NUNCA levanta exceção: se o Supabase está fora, gravar o chamado também falha,
+    e isso não pode derrubar a proposta do operador junto.
+    """
+    if not assinatura:
+        return None
+    try:
+        r = sb.table("chamados").select("id,numero,ocorrencias")\
+            .eq("assinatura", assinatura).in_("status", ["aberto", "em_desenvolvimento"])\
+            .limit(1).execute()
+        if r.data:
+            sb.table("chamados").update({
+                "ocorrencias": int(r.data[0].get("ocorrencias") or 1) + 1,
+                "ultima_ocorrencia": _now_iso(),
+                "atualizado_em": _now_iso(),
+            }).eq("id", r.data[0]["id"]).execute()
+            return r.data[0].get("numero")
+
+        novo = sb.table("chamados").insert({
+            "operador_email": usuario,
+            "operador_nome": APELIDOS.get(usuario, ""),
+            "origem": "sistema",
+            "assinatura": assinatura,
+            "tipo": "bug", "area": area, "prioridade": "alta", "status": "aberto",
+            "titulo": titulo,
+            "solicitacao": solicitacao,
+            "dor": dor,
+            "comportamento_esperado": esperado,
+            "parecer_analista": detalhe,
+            "descricao_operador": "(aberto automaticamente pelo sistema ao falhar)",
+            "ocorrencias": 1, "ultima_ocorrencia": _now_iso(),
+        }).execute()
+        return ((novo.data or [{}])[0] or {}).get("numero")
+    except Exception as e:
+        # Corrida: dois operadores falharam junto e o índice único barrou o 2º.
+        if "23505" in str(e) or "duplicate key" in str(e).lower():
+            try:
+                r2 = sb.table("chamados").select("numero")\
+                    .eq("assinatura", assinatura).in_("status", ["aberto", "em_desenvolvimento"])\
+                    .limit(1).execute()
+                if r2.data:
+                    return r2.data[0].get("numero")
+            except Exception:
+                pass
+        return None
+
+
+def _itens_sem_match(itens_raw: list) -> list:
+    """Itens no formato COMPLETO que o frontend espera: descrição do cliente
+    preservada, tudo o mais em branco, confiança 'nenhuma'.
+
+    Usado quando o matching não pôde rodar. Antes, o /extrair devolvia
+    `itens_brutos` cru nesse caso — sem `descricao_final` — e a tela mostrava
+    item VAZIO em vez de item sem preço. Foi o sintoma do chamado #4 (um
+    NameError engolido pelo except). A causa foi corrigida; esta função desarma
+    a armadilha para qualquer exceção futura.
+
+    Item sem match aparece com o texto do cliente e preço em branco. Nunca some.
+    """
+    out = []
+    for item in (itens_raw or []):
+        desc = item.get("descricao", "") or ""
+        out.append({
+            "descricao_original":   item.get("descricao_original", desc) or desc,
+            "descricao_final":      desc,
+            "specs_complementares": item.get("specs_complementares") or "",
+            "quantidade":           item.get("quantidade", 1),
+            "unidade":              item.get("unidade", "UN"),
+            "preco_un":             0.0,
+            "preco_custo":          0.0,
+            "link_fornecedor":      "",
+            "fornecedor":           "",
+            "sku_fornecedor":       "",
+            "obs":                  "SEM PREÇO",
+            "confianca_match":      "nenhuma",
+            "banco_candidato":      None,
+            "banco_candidato_preco": None,
+            "motivo_incerto":       None,
+            "tem_preco":            False,
+            "sugerir_pn":           _validar_sugerir_pn(item.get("sugerir_pn", False), desc),
+            "alerta_produto":       None,
+        })
+    return out
+
+
+def _fazer_matching(itens_raw: list, claude, sb, preservar_cliente: bool = False,
+                    cliente: str = "", avisos: list = None) -> list:
+    """Matching em 3 camadas (v3.14):
+
+      [1] MEMÓRIA  — entrada já virou proposta antes? Cliente primeiro, depois
+                     global. Sem ambiguidade => confiança alta, ZERO IA.
+      [2] TRIGRAMA — candidatos do banco INTEIRO via índice GiST (recall@40 de
+                     95,1% medido contra 636 pares reais). Substituiu a janela
+                     de 500 linhas mais recentes, que enxergava 0,8% do banco.
+      [3] HAIKU    — escolhe entre os 40 candidatos (temperature=0).
+
+    O aprendizado ([4]) acontece no /upsert-precos, quando a proposta vira real.
+    """
     import json as _jm
+
+    avisos = avisos if avisos is not None else []
+
+    def _falhou(etapa, e, msg):
+        """Registra que a busca NÃO PÔDE acontecer — distinto de 'não achei'.
+
+        A `assinatura` é a chave de dedup do chamado automático: mesma etapa +
+        mesmo tipo de erro = mesmo chamado, com contador de ocorrências.
+        """
+        avisos.append({
+            "tipo": "busca_falhou", "etapa": etapa,
+            "assinatura": f"matching:{etapa}:{type(e).__name__}",
+            "mensagem": msg,
+            "detalhe": f"{type(e).__name__}: {e}"[:400],
+        })
 
     if not itens_raw:
         return []
 
-    # Buscar candidatos em lote
+    descricoes = [(item.get("descricao") or "") for item in itens_raw]
+
+    # ── [1] MEMÓRIA ──────────────────────────────────────────────────────
+    # Cada falha vira AVISO. Sem isso, "quebrei" e "não achei" chegam iguais na
+    # tela e o operador precifica na mão achando que o banco está pobre.
+    mem = {}
     try:
-        res_batch = sb.table("produtos")            .select("descricao,preco_un,proposta_tiny,data_ref,alerta,preco_custo,link_fornecedor,fornecedor,sku_fornecedor")            .order("data_ref", desc=True).limit(500).execute()
-        todos_candidatos = res_batch.data or []
-    except Exception:
-        todos_candidatos = []
+        rm = sb.rpc("memoria_match", {"entradas": descricoes, "cli": cliente or ""}).execute()
+        for m in (rm.data or []):
+            mem[m["entrada_norm"]] = m
+    except Exception as e:
+        mem = {}
+        _falhou("memoria_match", e,
+                "A memória de matching não respondeu: itens já validados antes "
+                "não foram reconhecidos e voltaram para a IA.")
 
-    itens_txt = ""
-    for i, item in enumerate(itens_raw):
-        itens_txt += f"\nItem {i}: {item.get('descricao', '')}"
+    prod_mem = {}
+    ids_mem = sorted({m["produto_id"] for m in mem.values()})
+    if ids_mem:
+        try:
+            rp = sb.table("produtos").select(_PROD_COLS).in_("id", ids_mem).execute()
+            prod_mem = {p["id"]: p for p in (rp.data or [])}
+        except Exception as e:
+            prod_mem = {}
+            _falhou("produtos_da_memoria", e,
+                    "A memória reconheceu os itens mas o banco não devolveu os produtos.")
 
-    candidatos_por_item = []
-    candidatos_txt = ""
-    for i, item in enumerate(itens_raw):
-        candidatos = _prefiltro_candidatos(item.get("descricao", ""), todos_candidatos)
-        candidatos_por_item.append(candidatos)
-        if candidatos:
-            candidatos_txt += f"\n\n--- Candidatos para Item {i} ({item.get('descricao','')[:60]}) ---\n"
-            for j, c in enumerate(candidatos[:20]):
+    resolvido = {}   # idx -> (linha_produto, origem)
+    for i, d in enumerate(descricoes):
+        m = mem.get(_norm_entrada(d))
+        if m and m.get("produto_id") in prod_mem:
+            resolvido[i] = (prod_mem[m["produto_id"]], m.get("origem", "global"))
+
+    # ── [2] TRIGRAMA (só para o que a memória não resolveu) ───────────────
+    pendentes = [i for i in range(len(itens_raw)) if i not in resolvido]
+    candidatos_por_item = {i: [] for i in range(len(itens_raw))}
+    if pendentes:
+        try:
+            rc = sb.rpc("candidatos_trgm_lote",
+                        {"termos": [descricoes[i] for i in pendentes], "n": 40}).execute()
+            for row in (rc.data or []):
+                pos = pendentes[int(row["idx"]) - 1]      # idx do WITH ORDINALITY é 1-based
+                candidatos_por_item[pos].append(row)
+        except Exception as e:
+            # A pior falha silenciosa: sem candidatos, NADA vai pro Haiku e a
+            # proposta inteira sai "sem match" como se o banco estivesse vazio.
+            _falhou("candidatos_trgm_lote", e,
+                    "Não consegui consultar o banco de preços. Os itens estão sem "
+                    "preço por FALHA DO SISTEMA — não porque o banco não tenha o "
+                    "produto. Confira antes de precificar na mão.")
+
+    # Lookup descrição -> linha completa (candidatos + resolvidos pela memória)
+    _banco_por_desc = {}
+    for lista in list(candidatos_por_item.values()) + [[r for r, _ in resolvido.values()]]:
+        for c in lista:
+            k = (c.get("descricao") or "").strip().lower()
+            if k and k not in _banco_por_desc:
+                _banco_por_desc[k] = c
+    todos_candidatos = list(_banco_por_desc.values())
+
+    # ── [3] HAIKU ────────────────────────────────────────────────────────
+    matches = {}
+    itens_ia = [i for i in pendentes if candidatos_por_item[i]]
+    if itens_ia:
+        itens_txt = "".join(f"\nItem {i}: {descricoes[i]}" for i in itens_ia)
+        candidatos_txt = ""
+        for i in itens_ia:
+            candidatos_txt += f"\n\n--- Candidatos para Item {i} ({descricoes[i][:60]}) ---\n"
+            for j, c in enumerate(candidatos_por_item[i][:40]):
                 candidatos_txt += f"  [{j}] {c.get('descricao','')} | R$ {c.get('preco_un',0)} | ref {c.get('proposta_tiny','')}\n"
 
-    prompt_matching = f"""Itens solicitados:{itens_txt}
+        prompt_matching = f"""Itens solicitados:{itens_txt}
 
 Candidatos do banco de preços:{candidatos_txt}
 
 Para cada item, identifique qual candidato é o mesmo produto ou retorne null se nenhum for adequado.
 Lembre: fabricante diferente = null. Categoria diferente = null. Seja rigoroso."""
 
-    try:
-        resp_match = claude.messages.create(
-            model="claude-haiku-4-5-20251001", max_tokens=3000,
-            system=SYSTEM_MATCHING,
-            messages=[{"role": "user", "content": prompt_matching}],
-            temperature=0.0, timeout=30.0
-        )
-        raw_match = resp_match.content[0].text.strip()
-        raw_match = re.sub(r'^```(?:json)?\s*', '', raw_match)
-        raw_match = re.sub(r'\s*```$', '', raw_match.strip())
-        matches = {m["indice"]: m for m in _jm.loads(raw_match).get("matches", [])}
-    except Exception:
-        matches = {}
+        try:
+            resp_match = claude.messages.create(
+                model="claude-haiku-4-5-20251001", max_tokens=3000,
+                system=SYSTEM_MATCHING,
+                messages=[{"role": "user", "content": prompt_matching}],
+                temperature=0.0, timeout=30.0
+            )
+            raw_match = resp_match.content[0].text.strip()
+            raw_match = re.sub(r'^```(?:json)?\s*', '', raw_match)
+            raw_match = re.sub(r'\s*```$', '', raw_match.strip())
+            matches = {m["indice"]: m for m in _jm.loads(raw_match).get("matches", [])}
+        except Exception as e:
+            matches = {}
+            _falhou("ia_matching", e,
+                    "A IA de matching não respondeu. Os candidatos do banco foram "
+                    "encontrados, mas ninguém escolheu entre eles.")
+            avisos.append(f"IA de matching falhou ({type(e).__name__}): os itens "
+                          f"vieram sem sugestão do banco. Os candidatos existiam.")
 
-    # Lookup descrição do banco -> linha completa (mais recente vence: lista já vem
-    # ordenada por data_ref desc, então só registra a primeira ocorrência).
-    _banco_por_desc = {}
-    for c in todos_candidatos:
-        k = (c.get("descricao") or "").strip().lower()
-        if k and k not in _banco_por_desc:
-            _banco_por_desc[k] = c
+    # A memória vence a IA: entra depois e sobrescreve.
+    for i, (row, origem) in resolvido.items():
+        matches[i] = {
+            "indice": i,
+            "confianca": "alta",
+            "banco_descricao": row.get("descricao") or "",
+            "banco_preco": row.get("preco_un") or 0,
+            "banco_proposta": row.get("proposta_tiny") or "",
+            "motivo": f"memória · {origem}",
+            "_memoria": origem,
+        }
 
     itens_com_preco = []
     for i, item in enumerate(itens_raw):
@@ -772,6 +974,7 @@ async def extrair_email(
 
     t0 = time.time()
     resultado_propostas = []
+    avisos_extracao = []
     for idx_p, prop_raw in enumerate(propostas_raw):
         num_prop = str(base_num + idx_p) if base_num is not None else (
             numero_proposta if idx_p == 0 else f"{numero_proposta}-{idx_p + 1}")
@@ -786,15 +989,60 @@ async def extrair_email(
         sb = get_supabase()
         _preservar = str(preservar_cliente).strip().lower() in ("1", "true", "on", "yes", "sim")
         try:
-            itens_enriquecidos = _fazer_matching(itens_brutos, claude, sb, preservar_cliente=_preservar)
-        except Exception:
-            itens_enriquecidos = itens_brutos
+            itens_enriquecidos = _fazer_matching(itens_brutos, claude, sb,
+                                                 preservar_cliente=_preservar,
+                                                 cliente=prop_raw.get("cliente") or "",
+                                                 avisos=avisos_extracao)
+        except Exception as e:
+            # Fallback com a FORMA correta: descrição do cliente, tudo em branco.
+            # (Devolver itens_brutos aqui produzia item vazio na tela.)
+            itens_enriquecidos = _itens_sem_match(itens_brutos)
+            avisos_extracao.append({
+                "tipo": "busca_falhou", "etapa": "geral",
+                "assinatura": f"matching:geral:{type(e).__name__}",
+                "mensagem": "O matching falhou por completo. Os itens vieram com a "
+                            "descrição do cliente e sem preço, por FALHA DO SISTEMA.",
+                "detalhe": f"{type(e).__name__}: {e}"[:400],
+            })
 
         resultado_propostas.append({**prop_raw, "itens": itens_enriquecidos})
 
     elapsed = time.time() - t0
 
-    return {"propostas": resultado_propostas, "elapsed": round(elapsed, 2)}
+    # ── Falha != ausência ────────────────────────────────────────────────
+    # Produto que o banco não tem é resultado legítimo: sai sem match, sem alarme.
+    # Busca que NÃO PÔDE acontecer abre chamado (deduplicado por assinatura) e
+    # volta pro operador com o número — ligado a ele, que é quem viu o problema.
+    avisos_saida, vistas = [], set()
+    if avisos_extracao:
+        _sb = get_supabase()
+        for a in avisos_extracao:
+            assin = a.get("assinatura") or ""
+            if not assin or assin in vistas:
+                continue
+            vistas.add(assin)
+            num = _abrir_chamado_automatico(
+                _sb, usuario, assin,
+                titulo=_TITULOS_FALHA.get(a.get("etapa"), "Falha no matching da proposta"),
+                solicitacao=("Ao gerar uma proposta, o sistema não conseguiu consultar o "
+                             "banco de preços. Os itens saíram com a descrição original do "
+                             "cliente e sem preço."),
+                dor=("O operador não distingue 'o banco não tem esse produto' de 'o sistema "
+                     "quebrou'. Ele precifica na mão itens que o banco já tinha — e ninguém "
+                     "descobre que houve falha."),
+                esperado=("A busca deve funcionar. Enquanto não funciona, o operador precisa "
+                          "ver na tela que é falha do sistema, não ausência no banco."),
+                detalhe=f"Etapa: {a.get('etapa')} · {a.get('detalhe')}",
+                area="proposta",
+            )
+            avisos_saida.append({
+                "tipo": a.get("tipo"), "etapa": a.get("etapa"),
+                "mensagem": a.get("mensagem"), "detalhe": a.get("detalhe"),
+                "chamado": num,
+            })
+
+    return {"propostas": resultado_propostas, "elapsed": round(elapsed, 2),
+            "avisos": avisos_saida}
 
 
 def _ilike_literal(s: str) -> str:
@@ -807,6 +1055,69 @@ def _ilike_literal(s: str) -> str:
     return (s or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _aprender_memoria(sb, pares: list, cliente: str) -> dict:
+    """[4] Grava o desfecho da proposta na memória de matching.
+
+    Premissa (definida pelo Leonardo): o OPERADOR é a hierarquia superior. O que
+    ele mandou pro Tiny é verdade — o sistema aprende com ele, não o audita.
+
+    - ACERTO: o par (entrada do cliente -> produto que a proposta virou) é FATO.
+      Grava sempre, inclusive quando o matching não sugeriu nada: item que hoje
+      sai com confianca='nenhuma' e o operador digita na mão vira treino.
+    - ERRO:   só quando a própria memória diria OUTRO produto para a mesma entrada.
+      Aí a sugestão dela foi contrariada pelo desfecho e ela é rebaixada.
+      Na dúvida não julga nada — mas o fato fica registrado de qualquer forma.
+    """
+    cli = _norm_entrada(cliente or "")
+    acertos, erros = 0, 0
+
+    # O que a memória diria HOJE para estas entradas (antes de aprender)
+    antes = {}
+    try:
+        r = sb.rpc("memoria_match", {"entradas": [p[0] for p in pares], "cli": cliente or ""}).execute()
+        for m in (r.data or []):
+            antes[m["entrada_norm"]] = m.get("produto_id")
+    except Exception:
+        antes = {}
+
+    for entrada, pid in pares:
+        # ACERTO — o desfecho
+        try:
+            ex = sb.table("match_memoria").select("id,acertos")\
+                .eq("entrada_norm", entrada).eq("cliente_norm", cli).eq("produto_id", pid)\
+                .limit(1).execute()
+            if ex.data:
+                sb.table("match_memoria").update({
+                    "acertos": int(ex.data[0].get("acertos") or 0) + 1,
+                    "ultima_vez": _now_iso(),
+                }).eq("id", ex.data[0]["id"]).execute()
+            else:
+                sb.table("match_memoria").insert({
+                    "entrada_norm": entrada, "cliente_norm": cli,
+                    "produto_id": pid, "acertos": 1,
+                }).execute()
+            acertos += 1
+        except Exception:
+            continue
+
+        # ERRO — a memória apontava para outro produto
+        sugerido = antes.get(entrada)
+        if sugerido and sugerido != pid:
+            try:
+                ex2 = sb.table("match_memoria").select("id,erros")\
+                    .eq("entrada_norm", entrada).eq("produto_id", sugerido).limit(1).execute()
+                if ex2.data:
+                    sb.table("match_memoria").update({
+                        "erros": int(ex2.data[0].get("erros") or 0) + 1,
+                        "ultima_vez": _now_iso(),
+                    }).eq("id", ex2.data[0]["id"]).execute()
+                    erros += 1
+            except Exception:
+                pass
+
+    return {"aprendidos": acertos, "rebaixados": erros}
+
+
 @app.post("/upsert-precos")
 async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
     sb = get_supabase()
@@ -815,6 +1126,7 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
     itens    = payload.get("itens", [])
     hoje     = date.today().isoformat()
     atualizados, inseridos, ignorados = 0, 0, 0
+    aprender = []   # [(entrada_norm, produto_id)] — desfechos pra memória de matching
 
     for item in itens:
         preco = item.get("preco_un", 0)
@@ -839,6 +1151,7 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
         if (item.get("sku_fornecedor") or "").strip():
             origem["sku_fornecedor"] = item["sku_fornecedor"].strip()
 
+        _pid = None
         try:
             # REGRA (v3.13): o banco tem UMA linha por descrição.
             #   achou   -> atualiza (o preço mais fresco sempre vence)
@@ -862,9 +1175,10 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
                     **origem,
                 }).eq("id", res.data[0]["id"]).execute()
                 atualizados += 1
+                _pid = res.data[0]["id"]
             else:
                 try:
-                    sb.table("produtos").insert({
+                    _ins = sb.table("produtos").insert({
                         "descricao": desc, "un": item.get("unidade", "UN"),
                         "preco_un": float(preco), "data_ref": hoje,
                         "proposta_tiny": proposta, "cliente": cliente,
@@ -872,6 +1186,7 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
                         **origem,
                     }).execute()
                     inseridos += 1
+                    _pid = ((_ins.data or [{}])[0] or {}).get("id")
                 except Exception as e_ins:
                     # Corrida entre operadores (ou índice único): alguém inseriu a mesma
                     # descrição entre o SELECT e o INSERT. Não perde o preço: vira update.
@@ -885,6 +1200,7 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
                                 **origem,
                             }).eq("id", r2.data[0]["id"]).execute()
                             atualizados += 1
+                            _pid = r2.data[0]["id"]
                         else:
                             ignorados += 1
                     else:
@@ -892,7 +1208,15 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
         except Exception:
             ignorados += 1
 
-    return {"atualizados": atualizados, "inseridos": inseridos, "ignorados": ignorados}
+        # [4] APRENDIZADO: o par (texto do cliente -> produto que a proposta virou)
+        # é FATO, não opinião. Grava sempre que houver os dois lados.
+        _entrada = _norm_entrada(item.get("descricao_original") or "")
+        if _pid and _entrada:
+            aprender.append((_entrada, _pid))
+
+    memoria = _aprender_memoria(sb, aprender, cliente) if aprender else {}
+    return {"atualizados": atualizados, "inseridos": inseridos,
+            "ignorados": ignorados, "memoria": memoria}
 
 
 def _cnpj_valido(cnpj: str) -> bool:

@@ -34,6 +34,12 @@ const ANX = {
   erro:     { label: "falhou",        fg: "#A82F2F", bg: "#FBE9E9" },
 };
 const EXT_OK = ".png,.jpg,.jpeg,.webp,.gif,.pdf,.msg,.eml,.xlsx,.xls,.xlsm,.csv,.tsv,.txt,.md,.log,.json,.docx,.zip";
+
+// Chamado que o próprio sistema abriu ao detectar que falhou. O operador vê
+// junto dos dele — ele foi quem sofreu a falha, então merece acompanhar.
+const ORIGEM = {
+  sistema: { label: "auto-detectado", bg: "#EEF2F7", fg: "#3D556E", dot: "#5B7A9C" },
+};
 const fmtTam = (b) => {
   const n = Number(b) || 0;
   if (n >= 1048576) return `${(n / 1048576).toFixed(1)} MB`;
@@ -55,6 +61,19 @@ function StatusBadge({ s }) {
 function TipoBadge({ t }) {
   const c = TIPO[t] || TIPO.melhoria;
   return <span className="rounded-md px-1.5 py-0.5 text-[10px] font-semibold eyebrow" style={{ background: c.bg, color: c.fg }}>{c.label}</span>;
+}
+
+function OrigemBadge({ ch }) {
+  const c = ORIGEM[ch.origem];
+  if (!c) return null;
+  const n = Number(ch.ocorrencias) || 1;
+  return (
+    <span className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-semibold eyebrow"
+      style={{ background: c.bg, color: c.fg }} title="O sistema detectou a falha sozinho e abriu este chamado">
+      <span className="h-1.5 w-1.5 rounded-full" style={{ background: c.dot }} />
+      {c.label}{n > 1 ? ` · ${n}×` : ""}
+    </span>
+  );
 }
 
 // ── Chip de anexo durante a conversa ───────────────────────────────────────
@@ -406,10 +425,16 @@ function MeusChamados({ token, onVisto }) {
             <div className="flex items-center gap-2">
               <span className="font-mono text-[12px] font-medium text-faint">#{String(c.numero).padStart(4, "0")}</span>
               <TipoBadge t={c.tipo} />
+              <OrigemBadge ch={c} />
               <span className="ml-auto"><StatusBadge s={c.status} /></span>
             </div>
             <div className="mt-1.5 text-[13.5px] font-medium text-ink">{c.titulo || c.solicitacao}</div>
             {c.solicitacao && c.titulo && <div className="mt-0.5 text-[12.5px] text-sub">{c.solicitacao}</div>}
+            {c.origem === "sistema" && (
+              <div className="mt-1.5 text-[12px] text-faint">
+                Você não precisou abrir este — o sistema percebeu a falha sozinho enquanto você trabalhava.
+              </div>
+            )}
             <AnexosDoChamado token={token} chamadoId={c.id} />
             {noAr && (
               <div className="mt-3 flex items-center justify-between rounded-lg border border-signal/30 px-3 py-2" style={{ background: "#EAF5E5" }}>

@@ -17,6 +17,13 @@ const TIPO = {
   melhoria: { label: "Melhoria", bg: "#E8F0FE", fg: "#175FD3" },
   duvida:   { label: "Dúvida",   bg: "#FBF1DD", fg: "#8A5A12" },
 };
+// Fonte de detecção do chamado. "auto-detectado" = ninguém reportou, o próprio
+// backend percebeu que falhou e abriu. É informação sobre a saúde do sistema:
+// bug auto-detectado = a telemetria funcionou; bug reportado = ela falhou antes.
+const ORIGEM = {
+  sistema: { label: "auto-detectado", bg: "#EEF2F7", fg: "#3D556E", dot: "#5B7A9C" },
+};
+
 const PRIO = {
   alta:  { label: "Alta",  dot: "#D14343" },
   media: { label: "Média", dot: "#B7791F" },
@@ -26,6 +33,20 @@ const PRIO = {
 function TipoBadge({ t }) {
   const c = TIPO[t] || TIPO.melhoria;
   return <span className="rounded-md px-1.5 py-0.5 text-[10px] font-semibold eyebrow" style={{ background: c.bg, color: c.fg }}>{c.label}</span>;
+}
+
+function OrigemBadge({ ch }) {
+  const c = ORIGEM[ch.origem];
+  if (!c) return null;
+  const n = Number(ch.ocorrencias) || 1;
+  return (
+    <span className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-semibold eyebrow"
+      style={{ background: c.bg, color: c.fg }}
+      title={ch.assinatura ? `assinatura: ${ch.assinatura}` : "aberto pelo próprio sistema ao falhar"}>
+      <span className="h-1.5 w-1.5 rounded-full" style={{ background: c.dot }} />
+      {c.label}{n > 1 ? ` · ${n}×` : ""}
+    </span>
+  );
 }
 
 // ── Modal de resolução (obrigatória ao ir pra produção/finalizado) ─────────
@@ -118,6 +139,7 @@ function Card({ ch, token, onMover, onAbrir, aberto, onAtualizar }) {
       <div className="flex items-center gap-1.5">
         <span className="font-mono text-[11px] font-medium text-faint">#{String(ch.numero).padStart(4, "0")}</span>
         <TipoBadge t={ch.tipo} />
+        <OrigemBadge ch={ch} />
         <span className="ml-auto flex items-center gap-1 text-[10.5px] text-faint" title={`Prioridade ${prio.label}`}>
           <span className="h-1.5 w-1.5 rounded-full" style={{ background: prio.dot }} /> {prio.label}
         </span>
@@ -151,6 +173,16 @@ function Card({ ch, token, onMover, onAbrir, aberto, onAtualizar }) {
               <div className="text-[12px] text-sub">{v}</div>
             </div>
           ) : null)}
+          {ch.origem === "sistema" && (
+            <div>
+              <div className="eyebrow text-[9px] font-semibold uppercase text-faint">Detecção automática</div>
+              <div className="text-[12px] text-sub">
+                {Number(ch.ocorrencias) || 1} ocorrência{(Number(ch.ocorrencias) || 1) > 1 ? "s" : ""}
+                {ch.ultima_ocorrencia ? ` · última em ${new Date(ch.ultima_ocorrencia).toLocaleString("pt-BR")}` : ""}
+              </div>
+              {ch.assinatura && <div className="mt-0.5 break-all font-mono text-[10.5px] text-faint">{ch.assinatura}</div>}
+            </div>
+          )}
           {aberto && <AnexosAdmin token={token} chamadoId={ch.id} />}
           <div className="flex items-center gap-2 pt-1">
             <label className="text-[11px] text-faint">Prioridade</label>
@@ -270,6 +302,7 @@ export default function ChamadosAdmin({ token, usuario }) {
                     <div key={c.id} className="flex items-center gap-2 rounded-lg border border-line bg-surface px-3 py-2">
                       <span className="font-mono text-[11px] text-faint">#{String(c.numero).padStart(4, "0")}</span>
                       <TipoBadge t={c.tipo} />
+                      <OrigemBadge ch={c} />
                       <span className="min-w-0 flex-1 truncate text-[12.5px] text-ink">{c.titulo || c.solicitacao}</span>
                       <span className="text-[11px] text-faint">{c.status === "ja_suportada" ? "já existia" : c.status === "duplicada" ? "duplicado" : "recusado"}</span>
                       <button onClick={() => patch(c, { status: "aberto" })} className="text-[11px] text-faint hover:text-kist" title="Reabrir no quadro">reabrir</button>
