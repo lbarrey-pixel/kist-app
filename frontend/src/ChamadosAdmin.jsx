@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import {
-  btnPrimary, btnGhost, Eyebrow, PageHeader, IconArrow, IconCheck,
+  btnPrimary, btnGhost, Eyebrow, PageHeader, IconArrow, IconCheck, IconDownload,
 } from "./kist-ui.jsx";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
@@ -55,7 +55,62 @@ function ResolucaoModal({ chamado, statusAlvo, onClose, onConfirmar }) {
   );
 }
 
-function Card({ ch, onMover, onAbrir, aberto, onAtualizar }) {
+const fmtTam = (b) => {
+  const n = Number(b) || 0;
+  if (n >= 1048576) return `${(n / 1048576).toFixed(1)} MB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+  return `${n} B`;
+};
+
+// ── Anexos do chamado (download + a leitura que o analista enxergou) ───────
+function AnexosAdmin({ token, chamadoId }) {
+  const [lista, setLista] = useState(null);
+  const [verLeitura, setVerLeitura] = useState(null);
+
+  useEffect(() => {
+    let vivo = true;
+    fetch(`${API}/chamados/${chamadoId}/anexos`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => r.json())
+      .then((d) => { if (vivo) setLista(d.anexos || []); })
+      .catch(() => { if (vivo) setLista([]); });
+    return () => { vivo = false; };
+  }, [chamadoId, token]);
+
+  if (lista === null) return <div className="text-[11px] text-faint">carregando anexos…</div>;
+  if (lista.length === 0) return null;
+  return (
+    <div>
+      <div className="eyebrow text-[9px] font-semibold uppercase text-faint">Anexos ({lista.length})</div>
+      <div className="mt-1 space-y-1">
+        {lista.map((a) => (
+          <div key={a.id}>
+            <div className="flex items-center gap-1.5">
+              <a href={a.url} target="_blank" rel="noreferrer"
+                className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md bg-paper px-2 py-1 text-[11.5px] text-sub transition-colors hover:text-kist">
+                <IconDownload size={12} />
+                <span className="min-w-0 flex-1 truncate">{a.nome}</span>
+                <span className="font-mono text-[10px] text-faint">{fmtTam(a.tamanho)}</span>
+              </a>
+              {a.leitura && (
+                <button onClick={() => setVerLeitura(verLeitura === a.id ? null : a.id)}
+                  className="text-[10.5px] text-faint hover:text-kist" title="O que o analista leu deste arquivo">
+                  {verLeitura === a.id ? "ocultar" : "leitura"}
+                </button>
+              )}
+            </div>
+            {verLeitura === a.id && (
+              <div className="mt-1 whitespace-pre-wrap rounded-md border border-line bg-surface px-2 py-1.5 text-[11px] leading-relaxed text-sub">
+                {a.leitura}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function Card({ ch, token, onMover, onAbrir, aberto, onAtualizar }) {
   const idx = PIPELINE.indexOf(ch.status);
   const prio = PRIO[ch.prioridade] || PRIO.media;
   return (
@@ -96,6 +151,7 @@ function Card({ ch, onMover, onAbrir, aberto, onAtualizar }) {
               <div className="text-[12px] text-sub">{v}</div>
             </div>
           ) : null)}
+          {aberto && <AnexosAdmin token={token} chamadoId={ch.id} />}
           <div className="flex items-center gap-2 pt-1">
             <label className="text-[11px] text-faint">Prioridade</label>
             <select value={ch.prioridade || "media"} onChange={(e) => onAtualizar(ch, { prioridade: e.target.value })}
@@ -191,7 +247,7 @@ export default function ChamadosAdmin({ token, usuario }) {
                   <div className="flex flex-col gap-2.5 rounded-xl bg-paper/50 p-2 min-h-[80px]">
                     {cards.length === 0 && <div className="px-2 py-6 text-center text-[11.5px] text-faint">—</div>}
                     {cards.map((c) => (
-                      <Card key={c.id} ch={c}
+                      <Card key={c.id} ch={c} token={token}
                         aberto={abertoId === c.id}
                         onAbrir={() => setAbertoId(abertoId === c.id ? null : c.id)}
                         onMover={mover}
