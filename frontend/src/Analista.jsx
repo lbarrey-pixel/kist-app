@@ -295,7 +295,7 @@ function ChatAnalista({ token, usuario, onAberto }) {
         </div>
       )}
 
-      <div className="max-h-[52vh] min-h-[280px] space-y-3 overflow-auto px-4 py-4">
+      <div className="max-h-[42vh] min-h-[220px] space-y-3 overflow-auto px-4 py-4">
         {msgs.map((m, i) => (
           <div key={i} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
             <div className={`max-w-[80%] whitespace-pre-wrap rounded-2xl px-3.5 py-2 text-[13px] leading-relaxed
@@ -326,19 +326,22 @@ function ChatAnalista({ token, usuario, onAberto }) {
         </div>
       )}
 
-      <div className={`flex items-end gap-2 p-3 ${anexos.length ? "" : "border-t border-line"}`}>
+      <div className={`flex items-start gap-2 p-3 ${anexos.length ? "" : "border-t border-line"}`}>
         <input ref={inputFileRef} type="file" multiple accept={EXT_OK} className="hidden"
           onChange={(e) => escolher(e.target.files)} />
         <button onClick={() => inputFileRef.current?.click()} className={btnGhost}
           title="Anexar arquivo (print, PDF, planilha, e-mail, zip)">
           <IconUpload size={15} />
         </button>
+        {/* Caixa alta por padrão (~3,3x a original) e arrastável pela alça.
+            O operador escreve regra de negócio aqui — 40px obrigava a rolar
+            dentro de um campo de uma linha pra reler o que tinha escrito. */}
         <textarea
           value={texto} onChange={(e) => setTexto(e.target.value)}
           onPaste={(e) => { const f = e.clipboardData?.files; if (f && f.length) { e.preventDefault(); escolher(f); } }}
           onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); enviar(); } }}
-          rows={1} placeholder="Escreva sua sugestão ou problema… (Ctrl+V cola print, ou arraste o arquivo aqui)"
-          className="max-h-32 min-h-[40px] flex-1 resize-none rounded-lg border border-line2 bg-paper px-3 py-2 text-[13px] text-ink outline-none placeholder:text-faint" />
+          rows={6} placeholder="Escreva sua sugestão ou problema — pode se estender à vontade.&#10;Ctrl+V cola print · arraste arquivos aqui · Enter envia, Shift+Enter pula linha"
+          className="min-h-[132px] max-h-[60vh] flex-1 resize-y rounded-lg border border-line2 bg-paper px-3 py-2 text-[13px] leading-relaxed text-ink outline-none placeholder:text-faint" />
         <button onClick={enviar} disabled={!podeEnviar} className={btnPrimary}>
           {subindo ? "Lendo anexo…" : <>Enviar <IconArrow size={15} /></>}
         </button>
