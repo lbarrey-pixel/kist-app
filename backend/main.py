@@ -797,6 +797,16 @@ async def extrair_email(
     return {"propostas": resultado_propostas, "elapsed": round(elapsed, 2)}
 
 
+def _ilike_literal(s: str) -> str:
+    """Neutraliza os curingas do LIKE para casar a descrição LITERALMENTE.
+
+    Sem isso, '%' e '_' viram curinga: 'LUVA VAQUETA 100% PETROLEIRA VT07' casa com
+    qualquer coisa entre '100' e ' PETROLEIRA VT07', e o update pode cair no produto
+    ERRADO. Há 43 descrições com % ou _ no banco.
+    """
+    return (s or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 @app.post("/upsert-precos")
 async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
     sb = get_supabase()
@@ -830,12 +840,21 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
             origem["sku_fornecedor"] = item["sku_fornecedor"].strip()
 
         try:
-            # Se o operador ALTEROU o item, ele entende que é um item diferente (ou
-            # está ajustando a descrição pro cliente): grava como registro NOVO, sem
-            # sobrescrever o do banco. Item intocado segue a regra normal (achou = atualiza).
-            _alterado = bool(item.get("_alterado"))
-            res = None if _alterado else sb.table("produtos").select("id,preco_un")\
-                .ilike("descricao", desc).limit(1).execute()
+            # REGRA (v3.13): o banco tem UMA linha por descrição.
+            #   achou   -> atualiza (o preço mais fresco sempre vence)
+            #   não achou -> insere (produto novo)
+            #
+            # O flag `_alterado` foi REMOVIDO. Ele partia da premissa de que "operador
+            # editou = item diferente", e isso é falso: editar a descrição não cria
+            # produto. Atributo técnico cria (cor, categoria, bitola, embalagem/unidade)
+            # — e quando o atributo muda, a descrição muda junto, o lookup não acha e o
+            # insert acontece sozinho, sem precisar de flag. Ruído de cliente
+            # ("conforme RC 60938") é a mesma mercadoria e não pode virar produto novo.
+            #
+            # Efeito colateral do flag: item com descrição IDÊNTICA e preço novo pulava
+            # o lookup e inseria linha gêmea a cada chamada — 15 a 21x por proposta.
+            res = sb.table("produtos").select("id,preco_un")\
+                .ilike("descricao", _ilike_literal(desc)).limit(1).execute()
             if res and res.data:
                 sb.table("produtos").update({
                     "preco_un": float(preco), "data_ref": hoje,
@@ -844,14 +863,32 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
                 }).eq("id", res.data[0]["id"]).execute()
                 atualizados += 1
             else:
-                sb.table("produtos").insert({
-                    "descricao": desc, "un": item.get("unidade", "UN"),
-                    "preco_un": float(preco), "data_ref": hoje,
-                    "proposta_tiny": proposta, "cliente": cliente,
-                    "obs": "inserido automaticamente via app",
-                    **origem,
-                }).execute()
-                inseridos += 1
+                try:
+                    sb.table("produtos").insert({
+                        "descricao": desc, "un": item.get("unidade", "UN"),
+                        "preco_un": float(preco), "data_ref": hoje,
+                        "proposta_tiny": proposta, "cliente": cliente,
+                        "obs": "inserido automaticamente via app",
+                        **origem,
+                    }).execute()
+                    inseridos += 1
+                except Exception as e_ins:
+                    # Corrida entre operadores (ou índice único): alguém inseriu a mesma
+                    # descrição entre o SELECT e o INSERT. Não perde o preço: vira update.
+                    if "23505" in str(e_ins) or "duplicate key" in str(e_ins).lower():
+                        r2 = sb.table("produtos").select("id")\
+                            .ilike("descricao", _ilike_literal(desc)).limit(1).execute()
+                        if r2.data:
+                            sb.table("produtos").update({
+                                "preco_un": float(preco), "data_ref": hoje,
+                                "proposta_tiny": proposta, "cliente": cliente,
+                                **origem,
+                            }).eq("id", r2.data[0]["id"]).execute()
+                            atualizados += 1
+                        else:
+                            ignorados += 1
+                    else:
+                        raise
         except Exception:
             ignorados += 1
 
@@ -2289,6 +2326,7 @@ def _conhecimento_agente(sb) -> str:
 class AnalistaChatIn(BaseModel):
     mensagens: list
     operador_nome: Optional[str] = ""
+    sessao_id: Optional[str] = ""
 
 
 @app.post("/analista/chat")
@@ -2298,7 +2336,11 @@ async def analista_chat(payload: AnalistaChatIn, usuario: str = Depends(verifica
     apelido = APELIDOS.get(usuario, "")
     saudacao = (f"\n\nVocê está conversando agora com {apelido}. Trate essa pessoa por esse nome/apelido, "
                 "de forma cordial e natural — sem exagerar, sem repetir a cada frase.") if apelido else ""
-    system = SYSTEM_ANALISTA + saudacao + "\n\n" + _conhecimento_agente(sb)
+    # Anexos: a leitura já foi feita no upload; aqui entra só o texto (barato).
+    lim = _anexo_limites(sb)
+    system = (SYSTEM_ANALISTA + saudacao + "\n\n" + _regras_anexos(sb)
+              + "\n\n" + _conhecimento_agente(sb)
+              + _anexos_contexto(sb, payload.sessao_id or "", usuario, lim))
 
     msgs = []
     for m in (payload.mensagens or [])[-40:]:
@@ -2340,6 +2382,7 @@ class ChamadoIn(BaseModel):
     prioridade: Optional[str] = "media"
     transcript: Optional[list] = None
     operador_nome: Optional[str] = ""
+    sessao_id: Optional[str] = ""
 
 
 @app.post("/chamados")
@@ -2368,7 +2411,19 @@ async def criar_chamado(payload: ChamadoIn, usuario: str = Depends(verificar_tok
     try:
         r = sb.table("chamados").insert(row).execute()
         novo = (r.data or [{}])[0]
-        return {"ok": True, "numero": novo.get("numero"), "id": novo.get("id"), "status": status}
+        # Amarra os anexos da conversa ao chamado recém-criado.
+        # (Nasceram na sessao_id, antes do chamado existir.)
+        anexos = 0
+        if (payload.sessao_id or "").strip() and novo.get("id"):
+            try:
+                ra = sb.table("chamado_anexos").update({"chamado_id": novo["id"]})\
+                    .eq("sessao_id", payload.sessao_id).eq("operador_email", usuario)\
+                    .is_("chamado_id", "null").execute()
+                anexos = len(ra.data or [])
+            except Exception:
+                anexos = 0
+        return {"ok": True, "numero": novo.get("numero"), "id": novo.get("id"),
+                "status": status, "anexos": anexos}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao registrar chamado: {str(e)}")
 
@@ -2439,3 +2494,607 @@ async def arquivar_concluidos(usuario: str = Depends(verificar_token)):
     r = sb.table("chamados").update({"arquivado": True})\
         .in_("status", ["em_producao", "finalizado"]).eq("arquivado", False).execute()
     return {"ok": True, "arquivados": len(r.data or [])}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ANEXOS DE CHAMADOS (v3.12)
+#
+# Desenho (importante pra quem for mexer depois):
+#   - O arquivo NÃO trafega no /analista/chat. O front sobe o arquivo pro
+#     Supabase Storage (bucket privado 'chamados'), o backend lê UMA vez e
+#     guarda o resumo da leitura em chamado_anexos.leitura.
+#   - Esse resumo (texto barato) é injetado no contexto do agente a cada turno.
+#     Sem isso, cada mensagem custaria uma chamada de visão.
+#   - O anexo nasce numa sessao_id (antes do chamado existir). Ao confirmar a
+#     ficha, /chamados amarra sessao_id -> chamado_id.
+#   - Guardar é barato e não tem teto de quantidade. LER é o que custa: os
+#     tetos de leitura estão em config_kist['anexos_limites'] (runtime).
+# ═══════════════════════════════════════════════════════════════════════════
+import uuid as _uuid_anx
+
+ANEXOS_BUCKET = os.environ.get("ANEXOS_BUCKET", "chamados")
+
+_ANEXO_LIMITES_PADRAO = {
+    "max_mb": 50,             # teto duro de upload (bate com o bucket)
+    "leitura_max_mb": 25,     # acima disso: guarda, não lê
+    "pdf_paginas": 40,        # páginas lidas por PDF
+    "imagens_sessao": 10,     # imagens lidas por conversa
+    "chars_por_anexo": 12000,
+    "chars_total": 60000,     # teto do bloco de anexos no contexto do agente
+    "zip_max_entradas": 60,
+    "zip_expansao_max_mb": 500,
+}
+
+_EXT_IMG = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+_EXT_TXT = {".txt", ".md", ".log", ".json", ".csv", ".tsv"}
+_EXT_XLS = {".xlsx", ".xls", ".xlsm"}
+_ANEXO_EXT_OK = _EXT_IMG | _EXT_TXT | _EXT_XLS | {".pdf", ".msg", ".eml", ".docx", ".zip"}
+
+
+def _anexo_limites(sb) -> dict:
+    lim = dict(_ANEXO_LIMITES_PADRAO)
+    try:
+        r = sb.table("config_kist").select("valor").eq("chave", "anexos_limites").limit(1).execute()
+        if r.data:
+            v = _json_an.loads(r.data[0].get("valor") or "{}")
+            if isinstance(v, dict):
+                for k in lim:
+                    if k in v:
+                        lim[k] = int(v[k])
+    except Exception:
+        pass
+    return lim
+
+
+def _ext_de(nome: str) -> str:
+    n = (nome or "").lower().strip()
+    p = n.rfind(".")
+    return n[p:] if p > 0 else ""
+
+
+def _nome_seguro(nome: str) -> str:
+    """Nunca confiar no nome que vem do navegador nem do zip: tira caminho,
+    tira '..', deixa só caractere previsível."""
+    base = re.split(r"[\\/]", (nome or "").strip())[-1]
+    base = base.replace("..", "_")
+    base = re.sub(r"[^A-Za-z0-9._\- ]+", "_", base).strip() or "arquivo"
+    return base[:120]
+
+
+# ── Storage (defensivo: nomes de chave mudam entre versões do storage3) ────
+def _anx_storage():
+    return get_supabase().storage.from_(ANEXOS_BUCKET)
+
+
+def _anx_url_absoluta(u: str) -> str:
+    if not u:
+        return ""
+    if u.startswith("http"):
+        return u
+    base = SUPABASE_URL.rstrip("/")
+    if u.startswith("/storage/v1"):
+        return base + u
+    return base + "/storage/v1" + (u if u.startswith("/") else "/" + u)
+
+
+def _anx_signed_upload(path: str):
+    try:
+        r = _anx_storage().create_signed_upload_url(path) or {}
+        if not isinstance(r, dict):
+            r = getattr(r, "__dict__", {}) or {}
+        u = r.get("signed_url") or r.get("signedURL") or r.get("signedUrl") or ""
+        return _anx_url_absoluta(u) or None
+    except Exception:
+        return None
+
+
+def _anx_signed_download(path: str, expira: int = 3600):
+    try:
+        r = _anx_storage().create_signed_url(path, expira) or {}
+        if not isinstance(r, dict):
+            r = getattr(r, "__dict__", {}) or {}
+        u = r.get("signedURL") or r.get("signedUrl") or r.get("signed_url") or ""
+        return _anx_url_absoluta(u) or None
+    except Exception:
+        return None
+
+
+def _anx_download(path: str) -> bytes:
+    return _anx_storage().download(path)
+
+
+def _anx_remove(path: str):
+    try:
+        _anx_storage().remove([path])
+    except Exception:
+        pass
+
+
+# ── Leitura ───────────────────────────────────────────────────────────────
+SYSTEM_LEITURA_ANEXO = """Você lê um anexo de um chamado de suporte interno (sistema "Kist Cabine de Compras").
+Descreva OBJETIVAMENTE, em PT-BR, o que o arquivo mostra — para que um analista entenda o problema sem abrir o arquivo.
+
+- Se for print de erro: TRANSCREVA a mensagem de erro literalmente e diga em que tela/contexto aparece.
+- Se for print de tela: diga qual tela é, o que está preenchido e o que parece errado.
+- Se for documento/planilha: diga o que é, de quem, e liste os dados que importam (itens, quantidades, valores, CNPJ, números).
+- Se estiver ilegível, cortado ou vazio: DIGA ISSO claramente e diga o que faltou aparecer.
+- Não invente. Não opine sobre a solução. Não use markdown. Máximo ~12 linhas."""
+
+
+def _leitura_ia_imagem(claude, data: bytes, nome: str) -> str:
+    resp = claude.messages.create(
+        model="claude-sonnet-4-6", max_tokens=700, system=SYSTEM_LEITURA_ANEXO,
+        temperature=0, timeout=45.0,
+        messages=[{"role": "user", "content": [
+            {"type": "text", "text": f"Arquivo: {nome}"},
+            {"type": "image", "source": {"type": "base64",
+                "media_type": _media_type_img(data),
+                "data": _b64.standard_b64encode(data).decode()}},
+        ]}],
+    )
+    return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+
+
+def _leitura_ia_pdf(claude, data: bytes, nome: str) -> str:
+    """Só para PDF sem texto extraível (digitalizado)."""
+    resp = claude.messages.create(
+        model="claude-sonnet-4-6", max_tokens=900, system=SYSTEM_LEITURA_ANEXO,
+        temperature=0, timeout=90.0,
+        messages=[{"role": "user", "content": [
+            {"type": "document", "source": {"type": "base64",
+                "media_type": "application/pdf",
+                "data": _b64.standard_b64encode(data).decode()}},
+            {"type": "text", "text": f"Arquivo: {nome}"},
+        ]}],
+    )
+    return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+
+
+def _anexo_pdf_texto(data: bytes, max_pag: int):
+    """Extrai texto do PDF parando em max_pag. Devolve (texto, lidas, total)."""
+    try:
+        import pdfplumber, io as _io
+        partes, lidas, total = [], 0, 0
+        with pdfplumber.open(_io.BytesIO(data)) as pdf:
+            total = len(pdf.pages)
+            for page in pdf.pages[: max(0, int(max_pag))]:
+                lidas += 1
+                t = (page.extract_text() or "").strip()
+                if t:
+                    partes.append(t)
+        return "\n\n".join(partes), lidas, total
+    except Exception:
+        return "", 0, 0
+
+
+def _anexo_excel_texto(data: bytes) -> str:
+    """Leitor de Excel próprio do bloco de anexos.
+    (O /extrair tem o dele, como closure — não dá pra reusar e não vamos tocar lá.)"""
+    try:
+        import openpyxl, io as _io
+        wb = openpyxl.load_workbook(_io.BytesIO(data), read_only=True, data_only=True)
+        partes = []
+        for sname in wb.sheetnames[:6]:
+            ws = wb[sname]
+            linhas = []
+            for row in ws.iter_rows(values_only=True):
+                vals = [str(c).strip() if c is not None else "" for c in row]
+                if any(v and v != "None" for v in vals):
+                    linhas.append(" | ".join(vals))
+                if len(linhas) >= 200:
+                    break
+            if linhas:
+                partes.append(f"[ABA: {sname}]\n" + "\n".join(linhas))
+        return "\n\n".join(partes)
+    except Exception:
+        return ""
+
+
+def _anexo_docx_texto(data: bytes) -> str:
+    """docx é um zip com word/document.xml — dá pra ler sem dependência nova."""
+    try:
+        import zipfile, io as _io
+        with zipfile.ZipFile(_io.BytesIO(data)) as z:
+            xml = z.read("word/document.xml").decode("utf-8", "ignore")
+        xml = re.sub(r"</w:p>", "\n", xml)
+        xml = re.sub(r"<[^>]+>", "", xml)
+        return re.sub(r"\n{3,}", "\n\n", xml).strip()
+    except Exception:
+        return ""
+
+
+def _anexo_eml_texto(data: bytes) -> str:
+    try:
+        import email
+        from email import policy
+        m = email.message_from_bytes(data, policy=policy.default)
+        corpo = ""
+        try:
+            p = m.get_body(preferencelist=("plain", "html"))
+            corpo = p.get_content() if p else ""
+        except Exception:
+            corpo = ""
+        if "<" in corpo and ">" in corpo:
+            corpo = re.sub(r"<[^>]+>", " ", corpo)
+        anexos = [a.get_filename() for a in m.iter_attachments() if a.get_filename()]
+        cab = f"De: {m.get('From','')}\nPara: {m.get('To','')}\nAssunto: {m.get('Subject','')}\n"
+        if anexos:
+            cab += f"Anexos do e-mail: {', '.join(anexos)}\n"
+        return (cab + "\nCorpo:\n" + (corpo or "").strip()).strip()
+    except Exception:
+        return ""
+
+
+def _ler_anexo(claude, data: bytes, nome: str, orc: dict, lim: dict, prof: int = 0) -> dict:
+    """Lê UM anexo. Devolve {'texto','status','paginas','img_lidas'}.
+
+    status: lido | parcial | nao_lido | erro
+    prof=0 → pode abrir container (.zip/.msg). prof>=1 → não abre (guarda profundidade 1).
+    orc é mutável: {'img': n} — o teto de imagens vale pra conversa inteira.
+    """
+    ext = _ext_de(nome)
+    teto_char = int(lim["chars_por_anexo"])
+
+    def _corta(t, status="lido"):
+        t = (t or "").strip()
+        if not t:
+            return {"texto": "", "status": "nao_lido", "paginas": 0, "img_lidas": 0}
+        if len(t) > teto_char:
+            return {"texto": t[:teto_char] + "\n[...conteúdo cortado no teto de leitura...]",
+                    "status": "parcial", "paginas": 0, "img_lidas": 0}
+        return {"texto": t, "status": status, "paginas": 0, "img_lidas": 0}
+
+    try:
+        if len(data) > int(lim["leitura_max_mb"]) * 1024 * 1024:
+            mb = len(data) // (1024 * 1024)
+            return {"texto": f"[arquivo de ~{mb} MB — guardado e disponível para download, "
+                             f"mas grande demais para leitura automática]",
+                    "status": "nao_lido", "paginas": 0, "img_lidas": 0}
+
+        # ── Imagem ────────────────────────────────────────────────────────
+        if ext in _EXT_IMG:
+            if orc.get("img", 0) <= 0:
+                return {"texto": "[imagem guardada — teto de imagens lidas nesta conversa já foi atingido]",
+                        "status": "parcial", "paginas": 0, "img_lidas": 0}
+            orc["img"] -= 1
+            t = _leitura_ia_imagem(claude, data, nome)
+            r = _corta(t)
+            r["img_lidas"] = 1
+            return r
+
+        # ── PDF ───────────────────────────────────────────────────────────
+        if ext == ".pdf":
+            if data[:5] != b"%PDF-":
+                return {"texto": "[arquivo com extensão .pdf mas conteúdo inválido — guardado, não lido]",
+                        "status": "erro", "paginas": 0, "img_lidas": 0}
+            max_pag = int(lim["pdf_paginas"])
+            txt, lidas, total = _anexo_pdf_texto(data, max_pag)
+            if len((txt or "").strip()) >= 40:
+                r = _corta(txt)
+                r["paginas"] = lidas
+                if total > lidas:
+                    r["texto"] += f"\n[PDF tem {total} páginas; li as {lidas} primeiras.]"
+                    r["status"] = "parcial"
+                return r
+            # Sem texto = digitalizado. Manda nativo pro Sonnet se couber.
+            # total==0 significa que o pdfplumber NÃO abriu o arquivo: é PDF
+            # quebrado, não digitalizado. Mandar pro Sonnet daria 400 e custo à toa.
+            if total == 0:
+                return {"texto": "[PDF ilegível — não foi possível abrir o arquivo. Guardado para download]",
+                        "status": "erro", "paginas": 0, "img_lidas": 0}
+            if len(data) <= 10 * 1024 * 1024 and total <= 100:
+                t = _leitura_ia_pdf(claude, data, nome)
+                r = _corta(t)
+                r["paginas"] = total
+                return r
+            return {"texto": f"[PDF digitalizado com {total} páginas — guardado, mas grande demais "
+                             f"para leitura automática de imagem]",
+                    "status": "nao_lido", "paginas": 0, "img_lidas": 0}
+
+        # ── Excel / texto / docx / eml ─────────────────────────────────────
+        if ext in _EXT_XLS:
+            return _corta(_anexo_excel_texto(data))
+        if ext in _EXT_TXT:
+            return _corta(data.decode("utf-8", "ignore"))
+        if ext == ".docx":
+            return _corta(_anexo_docx_texto(data))
+        if ext == ".eml":
+            return _corta(_anexo_eml_texto(data))
+
+        # ── .msg (e-mail do Outlook) ──────────────────────────────────────
+        if ext == ".msg":
+            if prof >= 1:
+                return {"texto": "[e-mail dentro de container — não aberto]", "status": "nao_lido",
+                        "paginas": 0, "img_lidas": 0}
+            # INVARIANTE: copiar os bytes pra /tmp antes do extract_msg
+            # (o mount read-only dá I/O error em acesso aleatório).
+            tmp = f"/tmp/anx_{_uuid_anx.uuid4().hex[:8]}.msg"
+            with open(tmp, "wb") as _f:
+                _f.write(data)
+            partes, pag, imgs = [], 0, 0
+            try:
+                m = extract_msg.openMsg(tmp)
+                partes.append(f"Assunto: {m.subject}\nDe: {m.sender}\n\nCorpo:\n{(m.body or '').strip()}")
+                for att in (m.attachments or []):
+                    afn = _nome_seguro(att.longFilename or att.shortFilename or "anexo")
+                    if not att.data:
+                        continue
+                    sub = _ler_anexo(claude, att.data, afn, orc, lim, prof=1)
+                    pag += sub.get("paginas", 0)
+                    imgs += sub.get("img_lidas", 0)
+                    partes.append(f"--- anexo do e-mail: {afn} ({sub['status']}) ---\n{sub['texto']}")
+            finally:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+            r = _corta("\n\n".join(partes))
+            r["paginas"] = pag
+            r["img_lidas"] = imgs
+            return r
+
+        # ── .zip ──────────────────────────────────────────────────────────
+        if ext == ".zip":
+            if prof >= 1:
+                return {"texto": "[zip dentro de zip — não aberto por segurança]",
+                        "status": "parcial", "paginas": 0, "img_lidas": 0}
+            import zipfile, io as _io
+            teto_exp = int(lim["zip_expansao_max_mb"]) * 1024 * 1024
+            max_ent = int(lim["zip_max_entradas"])
+            partes, pag, imgs, expandido, avisos = [], 0, 0, 0, []
+            with zipfile.ZipFile(_io.BytesIO(data)) as z:
+                infos = [i for i in z.infolist() if not i.is_dir()]
+                # Zip bomb: aborta antes de descompactar
+                declarado = sum(i.file_size for i in infos)
+                if declarado > teto_exp or (len(data) and declarado > len(data) * 10 and declarado > 50 * 1024 * 1024):
+                    return {"texto": f"[zip recusado na leitura: descompactado daria ~{declarado // (1024*1024)} MB. "
+                                     f"O arquivo está guardado e pode ser baixado.]",
+                            "status": "nao_lido", "paginas": 0, "img_lidas": 0}
+                lista = [_nome_seguro(i.filename) for i in infos]
+                partes.append(f"[ZIP com {len(infos)} arquivo(s): {', '.join(lista[:40])}"
+                              + (" …" if len(lista) > 40 else "") + "]")
+                for i in infos[:max_ent]:
+                    fn = _nome_seguro(i.filename)
+                    if _ext_de(fn) not in _ANEXO_EXT_OK:
+                        avisos.append(f"{fn} (tipo não lido)")
+                        continue
+                    if expandido + i.file_size > teto_exp:
+                        avisos.append(f"{fn} (teto de expansão)")
+                        continue
+                    try:
+                        sub_bytes = z.read(i)
+                    except Exception:
+                        avisos.append(f"{fn} (falha ao extrair)")
+                        continue
+                    expandido += len(sub_bytes)
+                    sub = _ler_anexo(claude, sub_bytes, fn, orc, lim, prof=1)
+                    pag += sub.get("paginas", 0)
+                    imgs += sub.get("img_lidas", 0)
+                    partes.append(f"--- dentro do zip: {fn} ({sub['status']}) ---\n{sub['texto']}")
+                if len(infos) > max_ent:
+                    avisos.append(f"+{len(infos) - max_ent} arquivo(s) além do teto de entradas")
+            if avisos:
+                partes.append("[não lidos: " + "; ".join(avisos) + "]")
+            r = _corta("\n\n".join(partes))
+            r["paginas"] = pag
+            r["img_lidas"] = imgs
+            if avisos and r["status"] == "lido":
+                r["status"] = "parcial"
+            return r
+
+        return {"texto": "", "status": "nao_lido", "paginas": 0, "img_lidas": 0}
+
+    except Exception as e:
+        return {"texto": f"[falha ao ler: {type(e).__name__}: {e}]", "status": "erro",
+                "paginas": 0, "img_lidas": 0}
+
+
+# ── Contexto do agente ────────────────────────────────────────────────────
+_REGRAS_ANEXOS_PADRAO = """REGRAS SOBRE ANEXOS:
+- Os anexos desta conversa já foram lidos pelo sistema; o bloco ANEXOS DESTA CONVERSA é a leitura real do conteúdo. Trate como verdade e cite o que viu.
+- AVALIE SUFICIÊNCIA: se a leitura não fecha a história (print cortado, PDF sem a página que importa, planilha sem os itens, anexo nao_lido/parcial/erro), diga o que faltou e peça o arquivo/trecho específico. Enquanto faltar, "ficha" continua null.
+- Não peça anexo quando o texto já basta. Anexo é evidência, não burocracia.
+- Nunca invente conteúdo de anexo que não está na leitura abaixo."""
+
+
+def _regras_anexos(sb) -> str:
+    try:
+        r = sb.table("config_kist").select("valor").eq("chave", "analista_regras_anexos").limit(1).execute()
+        if r.data and (r.data[0].get("valor") or "").strip():
+            return r.data[0]["valor"]
+    except Exception:
+        pass
+    return _REGRAS_ANEXOS_PADRAO
+
+
+def _anexos_contexto(sb, sessao_id: str, usuario: str, lim: dict) -> str:
+    """Bloco de texto com a leitura dos anexos da sessão. Barato: já está lido."""
+    if not sessao_id:
+        return ""
+    try:
+        r = sb.table("chamado_anexos").select("nome,status,leitura")\
+            .eq("sessao_id", sessao_id).eq("operador_email", usuario)\
+            .order("id").execute()
+    except Exception:
+        return ""
+    linhas, usado, teto = [], 0, int(lim["chars_total"])
+    for a in (r.data or []):
+        if a.get("status") == "enviando":
+            continue
+        txt = (a.get("leitura") or "").strip() or "(sem conteúdo legível)"
+        bloco = f"[anexo: {a.get('nome')} · status={a.get('status')}]\n{txt}"
+        if usado + len(bloco) > teto:
+            linhas.append(f"[anexo: {a.get('nome')} · status={a.get('status')} · leitura omitida: "
+                          f"teto de contexto atingido]")
+            usado = teto
+            continue
+        linhas.append(bloco)
+        usado += len(bloco)
+    if not linhas:
+        return ""
+    return "\n\n=== ANEXOS DESTA CONVERSA (leitura real do conteúdo) ===\n" + "\n\n".join(linhas)
+
+
+def _orcamento_sessao(sb, sessao_id: str, lim: dict) -> dict:
+    """Quanto do teto de leitura a conversa já consumiu."""
+    usadas = 0
+    try:
+        r = sb.table("chamado_anexos").select("img_lidas").eq("sessao_id", sessao_id).execute()
+        usadas = sum(int(a.get("img_lidas") or 0) for a in (r.data or []))
+    except Exception:
+        usadas = 0
+    return {"img": max(0, int(lim["imagens_sessao"]) - usadas)}
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────
+class AnexoAssinarIn(BaseModel):
+    sessao_id: str
+    nome: str
+    tamanho: Optional[int] = 0
+    mime: Optional[str] = ""
+
+
+@app.post("/chamados/anexos/assinar")
+async def anexo_assinar(payload: AnexoAssinarIn, usuario: str = Depends(verificar_token)):
+    """Reserva a vaga do anexo e devolve como subir.
+    modo='signed' → o navegador sobe DIRETO pro Storage (o backend não segura os
+    bytes — o Render free não aguenta 50 MB atravessando a instância).
+    modo='proxy'  → fallback: sobe via backend."""
+    sb = get_supabase()
+    lim = _anexo_limites(sb)
+    nome = _nome_seguro(payload.nome)
+    ext = _ext_de(nome)
+    if ext not in _ANEXO_EXT_OK:
+        raise HTTPException(status_code=400, detail=f"Tipo de arquivo não aceito ({ext or 'sem extensão'}).")
+    tam = int(payload.tamanho or 0)
+    if tam > int(lim["max_mb"]) * 1024 * 1024:
+        raise HTTPException(status_code=400, detail=f"Arquivo maior que {lim['max_mb']} MB.")
+    if not (payload.sessao_id or "").strip():
+        raise HTTPException(status_code=400, detail="sessao_id ausente.")
+
+    path = f"sessao/{payload.sessao_id}/{_uuid_anx.uuid4().hex[:10]}-{nome}"
+    try:
+        r = sb.table("chamado_anexos").insert({
+            "sessao_id": payload.sessao_id, "operador_email": usuario, "nome": nome,
+            "path": path, "mime": payload.mime or "", "tamanho": tam, "status": "enviando",
+        }).execute()
+        anexo_id = (r.data or [{}])[0].get("id")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao registrar anexo: {e}")
+
+    url = _anx_signed_upload(path)
+    return {"ok": True, "anexo_id": anexo_id, "path": path,
+            "modo": "signed" if url else "proxy", "url": url or ""}
+
+
+@app.post("/chamados/anexos/{anexo_id}/upload")
+async def anexo_upload_proxy(anexo_id: int, arquivo: UploadFile = File(...),
+                             usuario: str = Depends(verificar_token)):
+    """Fallback: sobe via backend quando a signed URL não rolou."""
+    sb = get_supabase()
+    r = sb.table("chamado_anexos").select("*").eq("id", anexo_id).eq("operador_email", usuario).limit(1).execute()
+    if not r.data:
+        raise HTTPException(status_code=404, detail="Anexo não encontrado.")
+    row = r.data[0]
+    data = await arquivo.read()
+    lim = _anexo_limites(sb)
+    if len(data) > int(lim["max_mb"]) * 1024 * 1024:
+        raise HTTPException(status_code=400, detail=f"Arquivo maior que {lim['max_mb']} MB.")
+    try:
+        _anx_storage().upload(row["path"], data,
+                              {"content-type": row.get("mime") or "application/octet-stream",
+                               "upsert": "true"})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao subir arquivo: {e}")
+    sb.table("chamado_anexos").update({"tamanho": len(data)}).eq("id", anexo_id).execute()
+    return {"ok": True}
+
+
+@app.post("/chamados/anexos/{anexo_id}/ler")
+async def anexo_ler(anexo_id: int, usuario: str = Depends(verificar_token)):
+    """Lê o anexo UMA vez e guarda o resumo. Chamado logo depois do upload."""
+    sb = get_supabase()
+    r = sb.table("chamado_anexos").select("*").eq("id", anexo_id).eq("operador_email", usuario).limit(1).execute()
+    if not r.data:
+        raise HTTPException(status_code=404, detail="Anexo não encontrado.")
+    row = r.data[0]
+    lim = _anexo_limites(sb)
+    orc = _orcamento_sessao(sb, row["sessao_id"], lim)
+
+    try:
+        data = _anx_download(row["path"])
+    except Exception as e:
+        sb.table("chamado_anexos").update({
+            "status": "erro", "leitura": f"[arquivo não chegou no Storage: {e}]"}).eq("id", anexo_id).execute()
+        raise HTTPException(status_code=400, detail="O arquivo não chegou no Storage. Tenta subir de novo.")
+
+    res = _ler_anexo(get_claude(), data, row["nome"], orc, lim)
+    upd = {"status": res["status"], "leitura": res["texto"],
+           "paginas": res.get("paginas", 0), "img_lidas": res.get("img_lidas", 0),
+           "tamanho": len(data)}
+    sb.table("chamado_anexos").update(upd).eq("id", anexo_id).execute()
+    resumo = (res["texto"] or "").strip().split("\n")[0][:180]
+    return {"ok": True, "status": res["status"], "resumo": resumo, "leitura": res["texto"]}
+
+
+@app.get("/chamados/anexos")
+async def listar_anexos_sessao(sessao_id: str, usuario: str = Depends(verificar_token)):
+    sb = get_supabase()
+    r = sb.table("chamado_anexos").select("id,nome,status,tamanho,leitura")\
+        .eq("sessao_id", sessao_id).eq("operador_email", usuario).order("id").execute()
+    out = []
+    for a in (r.data or []):
+        out.append({"id": a["id"], "nome": a["nome"], "status": a["status"], "tamanho": a.get("tamanho") or 0,
+                    "resumo": (a.get("leitura") or "").strip().split("\n")[0][:180]})
+    return {"anexos": out}
+
+
+@app.delete("/chamados/anexos/{anexo_id}")
+async def remover_anexo(anexo_id: int, usuario: str = Depends(verificar_token)):
+    """O dono remove enquanto o chamado ainda não foi aberto."""
+    sb = get_supabase()
+    r = sb.table("chamado_anexos").select("*").eq("id", anexo_id).eq("operador_email", usuario).limit(1).execute()
+    if not r.data:
+        raise HTTPException(status_code=404, detail="Anexo não encontrado.")
+    row = r.data[0]
+    if row.get("chamado_id"):
+        raise HTTPException(status_code=400, detail="Esse anexo já faz parte de um chamado aberto.")
+    _anx_remove(row["path"])
+    sb.table("chamado_anexos").delete().eq("id", anexo_id).execute()
+    return {"ok": True}
+
+
+@app.get("/chamados/{chamado_id}/anexos")
+async def anexos_do_chamado(chamado_id: int, usuario: str = Depends(verificar_token)):
+    """Admin vê de todos; operador só dos próprios chamados. URL de download
+    assinada, válida por 1h (o bucket é privado)."""
+    sb = get_supabase()
+    c = sb.table("chamados").select("operador_email").eq("id", chamado_id).limit(1).execute()
+    if not c.data:
+        raise HTTPException(status_code=404, detail="Chamado não encontrado.")
+    if usuario not in ADMIN_EMAILS and c.data[0].get("operador_email") != usuario:
+        raise HTTPException(status_code=403, detail="Sem acesso a esse chamado.")
+    r = sb.table("chamado_anexos").select("id,nome,status,tamanho,leitura,path")\
+        .eq("chamado_id", chamado_id).order("id").execute()
+    out = []
+    for a in (r.data or []):
+        out.append({"id": a["id"], "nome": a["nome"], "status": a["status"],
+                    "tamanho": a.get("tamanho") or 0,
+                    "leitura": a.get("leitura") or "",
+                    "url": _anx_signed_download(a["path"], 3600) or ""})
+    return {"anexos": out}
+
+
+@app.post("/chamados/anexos/limpar-orfaos")
+async def limpar_anexos_orfaos(dias: int = 7, usuario: str = Depends(verificar_token)):
+    """Conversa abandonada deixa anexo sem chamado. Limpeza manual (admin)."""
+    if usuario not in ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="Só o admin.")
+    from datetime import datetime, timezone, timedelta
+    corte = (datetime.now(timezone.utc) - timedelta(days=max(1, int(dias)))).isoformat()
+    sb = get_supabase()
+    r = sb.table("chamado_anexos").select("id,path").is_("chamado_id", "null").lt("criado_em", corte).execute()
+    for a in (r.data or []):
+        _anx_remove(a["path"])
+        sb.table("chamado_anexos").delete().eq("id", a["id"]).execute()
+    return {"ok": True, "removidos": len(r.data or [])}

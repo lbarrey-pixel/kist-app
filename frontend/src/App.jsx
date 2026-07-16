@@ -756,15 +756,13 @@ export default function App() {
         status: "rascunho",
         usuario_nome: usuario?.nome || "",
       };
-      // Upsert banco de preços (itens com preço)
-      const comPreco = (prop.itens || []).filter(i => (i.preco_un || 0) > 0);
-      if (comPreco.length > 0) {
-        fetch(`${API}/upsert-precos`, {
-          method: "POST", headers: { "Content-Type": "application/json", ...authHeaders() },
-          body: JSON.stringify(prop),
-        }).catch(() => {});
-      }
-      // Upsert proposta
+      // REGRA: rascunho NÃO alimenta o banco de preços.
+      // O banco só recebe preço de proposta que virou CSV (baixarCSV) — aí o preço
+      // é real, foi pro cliente, e vale como referência. Preço em rascunho é palpite
+      // em andamento.
+      // Isto aqui chamava /upsert-precos a cada tick do auto-save (1,5s por edição):
+      // 15 a 21 linhas gravadas por proposta, 1.493 linhas-lixo em 3 dias.
+      // Upsert proposta (rascunho) — este sim, a cada auto-save, sobrescrevendo
       const r = await fetch(`${API}/salvar-proposta`, {
         method: "POST", headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify(payload),
