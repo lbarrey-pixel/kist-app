@@ -34,6 +34,72 @@ function decodeJwtPayload(jwt) {
 
 const isLink = (s) => typeof s === "string" && /^https?:\/\//i.test(s.trim());
 
+// O placeholder ensina o formato do canal escolhido — sem isso o operador
+// improvisa e o dado nasce torto ("WHATSAPP 19/06/2026 C/ ANDRIELI").
+const CANAL_LBL = { link: "link", whatsapp: "WhatsApp", email: "e-mail",
+                    telefone: "telefone", loja: "loja", outro: "" };
+
+// ── Contato acionável ───────────────────────────────────────────────────────
+// O contato só vale se levar a algum lugar. Nome + número numa tela é lembrete;
+// link que abre a conversa com o pedido escrito é recotação em um clique.
+
+/** Texto do pedido de cotação. NÃO leva nome nem CNPJ do cliente — o fornecedor
+ *  não precisa saber pra quem a Kist está vendendo. */
+function textoCotacao(item) {
+  const l = ["Olá! Preciso de cotação para:", ""];
+  l.push(item.descricao_final || item.descricao_original || "");
+  const sp = (item.specs_complementares || "").trim();
+  if (sp) l.push(sp);
+  const qtd = Number(item.quantidade) || 0;
+  if (qtd > 0) l.push(`Quantidade: ${qtd} ${item.unidade || "UN"}`);
+  const sku = (item.sku_fornecedor || "").trim();
+  if (sku) l.push(`Referência: ${sku}`);
+  l.push("", "Obrigado!");
+  return l.join("\n");
+}
+
+/** wa.me exige só dígitos e código do país. "48 99999-0000" -> 5548999990000.
+ *  Até 11 dígitos = número BR sem o 55 (11 = celular c/ DDD, 10 = fixo c/ DDD). */
+function linkWhatsapp(contato, texto) {
+  let d = String(contato || "").replace(/\D/g, "");
+  if (d.length < 8) return "";
+  if (d.length <= 11) d = "55" + d;
+  return `https://wa.me/${d}?text=${encodeURIComponent(texto)}`;
+}
+
+/** mailto abre o cliente padrão da máquina — no caso, o Outlook. */
+function linkEmail(contato, item) {
+  const e = String(contato || "").trim();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) return "";
+  const assunto = `Cotação — ${(item.descricao_final || item.descricao_original || "").slice(0, 60)}`;
+  return `mailto:${e}?subject=${encodeURIComponent(assunto)}&body=${encodeURIComponent(textoCotacao(item))}`;
+}
+
+function linkTelefone(contato) {
+  const d = String(contato || "").replace(/\D/g, "");
+  return d.length >= 8 ? `tel:+${d.length <= 11 ? "55" + d : d}` : "";
+}
+
+/** Devolve {href, rotulo} do contato — ou href vazio quando não dá pra acionar. */
+function contatoAcionavel(canal, contato, item) {
+  const c = String(contato || "").trim();
+  if (!c) return { href: "", rotulo: "" };
+  if (isLink(c)) return { href: c, rotulo: c };
+  if (canal === "whatsapp") return { href: linkWhatsapp(c, textoCotacao(item)), rotulo: c };
+  if (canal === "email")    return { href: linkEmail(c, item), rotulo: c };
+  if (canal === "telefone") return { href: linkTelefone(c), rotulo: c };
+  return { href: "", rotulo: c };
+}
+
+const CONTATO_PH = {
+  link:     "https://…",
+  whatsapp: "48 99999-0000",
+  email:    "vendas@fornecedor.com.br",
+  telefone: "48 3333-0000",
+  loja:     "endereço ou nome da loja",
+  outro:    "como se chega nele",
+};
+
 // Marketplaces para pesquisa rápida por item (chip na cor da marca).
 // Cada url() recebe a descrição do item e monta a busca já preenchida.
 const MARKETPLACES = [
@@ -177,7 +243,8 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto }) {
   const confianca = item.confianca_match || "nenhuma";
   const c = CONF[confianca];
   const semPreco = !(item.preco_un > 0);
-  const temOrigem = !!(item.link_fornecedor || item.fornecedor || item.sku_fornecedor || (item.preco_custo > 0));
+  const temOrigem = !!(item.link_fornecedor || item.fornecedor || item.fornecedor_contato
+                       || item.sku_fornecedor || (item.preco_custo > 0));
 
   return (
     <>
@@ -377,22 +444,40 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto }) {
                     <span className="text-ink">{item.banco.cliente || "—"}</span>
                     {item.banco.cnpj && <span className="ml-1.5 font-mono text-faint">{item.banco.cnpj}</span>}
                   </div>
+                  {/* Rastrear = quem vendeu + por onde se fala com ele.
+                      O link resolve os dois; o resto precisa dos dois campos. */}
                   <div>
                     <span className="text-faint">Origem </span>
-                    {/* O campo aceita URL OU texto livre ("DIGITALSAT", "IngramMicro e-mail").
-                        Sem o isLink, texto livre virava <a href="DIGITALSAT"> — link quebrado. */}
-                    {isLink(item.banco.link_fornecedor) ? (
-                      <a href={item.banco.link_fornecedor} target="_blank" rel="noreferrer"
-                        className="inline-flex items-center gap-1 text-kist hover:text-kist600">
-                        <IconLink size={10} />{item.banco.fornecedor || "abrir"}
-                      </a>
-                    ) : item.banco.link_fornecedor ? (
-                      <span className="text-ink">{item.banco.link_fornecedor}</span>
-                    ) : item.banco.fornecedor ? (
-                      <span className="text-ink">{item.banco.fornecedor}</span>
-                    ) : (
-                      <span className="text-amber">sem lastro</span>
-                    )}
+                    {(() => {
+                      const quem  = item.banco.fornecedor || "";
+                      const canal = item.banco.fornecedor_canal || "";
+                      const cont  = item.banco.fornecedor_contato || "";
+                      const linkProd = isLink(item.banco.link_fornecedor) ? item.banco.link_fornecedor : "";
+                      // O contato leva a algum lugar? (wa.me com o pedido escrito,
+                      // mailto pro Outlook já preenchido, tel:, ou a URL do produto)
+                      const { href, rotulo } = contatoAcionavel(canal, cont, item);
+                      const alvo = href || linkProd;
+                      if (!quem && !cont && !linkProd) return <span className="text-amber">sem lastro</span>;
+                      return (
+                        <span>
+                          {alvo ? (
+                            <a href={alvo} target="_blank" rel="noreferrer"
+                              title={canal === "whatsapp" ? "Abrir conversa no WhatsApp com o pedido pronto"
+                                   : canal === "email" ? "Abrir e-mail com o pedido pronto"
+                                   : "Abrir"}
+                              className="inline-flex items-center gap-1 font-medium text-kist hover:text-kist600">
+                              <IconLink size={10} />{quem || rotulo || "abrir"}
+                            </a>
+                          ) : (
+                            <span className="text-ink">{quem || rotulo || item.banco.link_fornecedor}</span>
+                          )}
+                          {canal && canal !== "outro" && canal !== "link" && (
+                            <span className="text-faint"> · {CANAL_LBL[canal] || canal}</span>
+                          )}
+                          {cont && !isLink(cont) && <span className="ml-1 font-mono text-sub">{cont}</span>}
+                        </span>
+                      );
+                    })()}
                     {item.banco.sku_fornecedor && <span className="ml-1.5 font-mono text-faint">{item.banco.sku_fornecedor}</span>}
                   </div>
                   {/* criado_em é a criação; usuario_nome é quem atualizou POR ÚLTIMO.
@@ -436,26 +521,61 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto }) {
           <td /><td />
           <td colSpan={4} className="px-3 py-2.5">
             <div className="flex flex-wrap items-center gap-2">
-              <div className="flex min-w-[280px] flex-1 items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2.5 py-1.5">
-                {isLink(item.link_fornecedor)
-                  ? <IconLink size={13} className="flex-shrink-0 text-kist" />
-                  : <span className="eyebrow flex-shrink-0 text-[9px] font-bold uppercase text-faint">Origem</span>}
-                <input
-                  className="w-full bg-transparent text-[12px] text-ink outline-none"
-                  placeholder="link do fornecedor ou texto livre (ex: cotação WhatsApp 06/06)"
-                  value={item.link_fornecedor || ""}
-                  onChange={(e) => onChange(index, "link_fornecedor", e.target.value)}
-                />
-              </div>
+              {/* QUEM · POR ONDE · O CONTATO — três coisas, três campos.
+                  Antes disputavam dois, e o operador improvisava: "volt - wpp",
+                  "WPP DATALINK 115848", "DIGITALSAT" no campo de link. */}
               <div className="flex items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2.5 py-1.5">
-                <span className="text-[11px] text-faint">Fornecedor</span>
+                <span className="eyebrow text-[9px] font-bold uppercase text-faint">Quem</span>
                 <input
-                  className="w-36 bg-transparent text-[12px] text-ink outline-none"
-                  placeholder="nome"
+                  className="w-32 bg-transparent text-[12px] text-ink outline-none placeholder:text-faint"
+                  placeholder="DigitalSAT"
                   value={item.fornecedor || ""}
                   onChange={(e) => onChange(index, "fornecedor", e.target.value)}
                 />
               </div>
+              <div className="flex items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2 py-1.5">
+                <select
+                  className="cursor-pointer bg-transparent text-[12px] text-ink outline-none"
+                  value={item.fornecedor_canal || ""}
+                  onChange={(e) => onChange(index, "fornecedor_canal", e.target.value)}>
+                  <option value="">por onde…</option>
+                  <option value="link">link</option>
+                  <option value="whatsapp">WhatsApp</option>
+                  <option value="email">e-mail</option>
+                  <option value="telefone">telefone</option>
+                  <option value="loja">loja</option>
+                  <option value="outro">outro</option>
+                </select>
+              </div>
+              <div className="flex min-w-[240px] flex-1 items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2.5 py-1.5">
+                <span className="eyebrow flex-shrink-0 text-[9px] font-bold uppercase text-faint">Contato</span>
+                <input
+                  className="w-full bg-transparent text-[12px] text-ink outline-none placeholder:text-faint"
+                  placeholder={CONTATO_PH[item.fornecedor_canal] || "URL, WhatsApp, e-mail — como se chega nele"}
+                  value={item.fornecedor_contato || ""}
+                  onChange={(e) => onChange(index, "fornecedor_contato", e.target.value)}
+                />
+                {/* Abre o que ele acabou de digitar: confere o dado e já cota. */}
+                {(() => {
+                  const { href } = contatoAcionavel(item.fornecedor_canal, item.fornecedor_contato, item);
+                  if (!href) return null;
+                  return (
+                    <a href={href} target="_blank" rel="noreferrer"
+                      title={item.fornecedor_canal === "whatsapp" ? "Abrir conversa com o pedido pronto"
+                           : item.fornecedor_canal === "email" ? "Abrir e-mail com o pedido pronto" : "Abrir"}
+                      className="flex-shrink-0 rounded-md p-1 text-kist transition-colors hover:bg-paper">
+                      <IconLink size={13} />
+                    </a>
+                  );
+                })()}
+              </div>
+              {isLink(item.link_fornecedor) && (
+                <a href={item.link_fornecedor} target="_blank" rel="noreferrer"
+                  title="Abrir a página do produto no fornecedor"
+                  className="flex items-center gap-1 rounded-lg border border-line2 bg-surface px-2.5 py-1.5 text-[12px] font-medium text-kist hover:border-kist">
+                  <IconLink size={12} /> produto
+                </a>
+              )}
               <div className="flex items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2.5 py-1.5">
                 <span className="text-[11px] text-faint">SKU forn.</span>
                 <input
@@ -1024,6 +1144,8 @@ export default function App() {
         confianca_match:      it.confianca_match || "nenhuma",
         obs:                  it.obs_interna || "",
         fornecedor:           it.fornecedor || null,
+        fornecedor_canal:     it.fornecedor_canal || "",
+        fornecedor_contato:   it.fornecedor_contato || "",
         link_fornecedor:      it.link_fornecedor || null,
         sku_fornecedor:       it.sku_fornecedor || null,
         tem_preco:            Number(it.preco_venda) > 0,
@@ -1056,11 +1178,18 @@ export default function App() {
   // Um item vai pro banco quando tem preço. Se for sem custo e sem origem, ele vira
   // uma linha que daqui a meses aparece num match que ninguém consegue conferir.
   function itensSemLastro(prop) {
+    // Mesmo critério do backend (_rastreavel): rastrear é saber QUEM e COMO.
+    // Nome sem contato não é rastro — é lembrança.
     return (prop.itens || [])
       .map((it, i) => ({ ...it, _i: i }))
-      .filter((it) => it.preco_un > 0
-        && !(it.preco_custo > 0)
-        && !((it.link_fornecedor || "").trim() || (it.fornecedor || "").trim()));
+      .filter((it) => {
+        if (!(it.preco_un > 0)) return false;
+        const link = (it.link_fornecedor || "").trim();
+        const nome = (it.fornecedor || "").trim();
+        const cont = (it.fornecedor_contato || "").trim();
+        const temOrigem = !!(link || (nome && cont));
+        return !(temOrigem && it.preco_custo > 0);
+      });
   }
 
   async function baixarCSV(idx = propostaIdx, ignorarLastro = false) {
@@ -1380,13 +1509,32 @@ export default function App() {
                         value={propostas[semLastro.idx]?.itens?.[it._i]?.preco_custo || ""}
                         onChange={(e) => atualizarItem(it._i, "preco_custo", parseFloat(e.target.value) || 0)} />
                     </div>
-                    <div className="flex min-w-[240px] flex-1 items-center gap-1.5 rounded-md border border-line2 bg-surface px-2 py-1">
-                      <span className="eyebrow text-[9px] font-bold uppercase text-faint">Origem</span>
+                    <div className="flex items-center gap-1.5 rounded-md border border-line2 bg-surface px-2 py-1">
+                      <span className="eyebrow text-[9px] font-bold uppercase text-faint">Quem</span>
+                      <input placeholder="DigitalSAT"
+                        className="w-28 bg-transparent text-[12px] text-ink outline-none placeholder:text-faint"
+                        value={propostas[semLastro.idx]?.itens?.[it._i]?.fornecedor || ""}
+                        onChange={(e) => atualizarItem(it._i, "fornecedor", e.target.value)} />
+                    </div>
+                    <select
+                      className="cursor-pointer rounded-md border border-line2 bg-surface px-2 py-1 text-[12px] text-ink outline-none"
+                      value={propostas[semLastro.idx]?.itens?.[it._i]?.fornecedor_canal || ""}
+                      onChange={(e) => atualizarItem(it._i, "fornecedor_canal", e.target.value)}>
+                      <option value="">por onde…</option>
+                      <option value="link">link</option>
+                      <option value="whatsapp">WhatsApp</option>
+                      <option value="email">e-mail</option>
+                      <option value="telefone">telefone</option>
+                      <option value="loja">loja</option>
+                      <option value="outro">outro</option>
+                    </select>
+                    <div className="flex min-w-[200px] flex-1 items-center gap-1.5 rounded-md border border-line2 bg-surface px-2 py-1">
+                      <span className="eyebrow text-[9px] font-bold uppercase text-faint">Contato</span>
                       <input
-                        placeholder="link, ou de onde veio (ex: DigitalSAT WhatsApp · IngramMicro e-mail)"
+                        placeholder={CONTATO_PH[propostas[semLastro.idx]?.itens?.[it._i]?.fornecedor_canal] || "como se chega nele"}
                         className="w-full bg-transparent text-[12px] text-ink outline-none placeholder:text-faint"
-                        value={propostas[semLastro.idx]?.itens?.[it._i]?.link_fornecedor || ""}
-                        onChange={(e) => atualizarItem(it._i, "link_fornecedor", e.target.value)} />
+                        value={propostas[semLastro.idx]?.itens?.[it._i]?.fornecedor_contato || ""}
+                        onChange={(e) => atualizarItem(it._i, "fornecedor_contato", e.target.value)} />
                     </div>
                   </div>
                 </div>

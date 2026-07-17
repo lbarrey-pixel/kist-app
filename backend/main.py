@@ -324,7 +324,8 @@ def _media_type_img(b: bytes) -> str:
 
 
 _PROD_COLS = ("id,descricao,preco_un,proposta_tiny,data_ref,alerta,"
-              "preco_custo,link_fornecedor,fornecedor,sku_fornecedor,cliente,cnpj,"
+              "preco_custo,link_fornecedor,fornecedor,fornecedor_canal,"
+              "fornecedor_contato,sku_fornecedor,cliente,cnpj,"
               "usuario_nome,usuario_email,criado_em")
 
 
@@ -459,8 +460,15 @@ def _rastreavel(row: dict) -> bool:
     """
     if not row:
         return False
-    tem_origem = bool((row.get("link_fornecedor") or "").strip()
-                      or (row.get("fornecedor") or "").strip())
+    # Rastrear = saber QUEM vendeu e POR ONDE falar com ele. Um link resolve os
+    # dois de uma vez. Um nome sozinho ("DIGITALSAT") diz quem, mas não como —
+    # e o Fábio pediu rastreio de um clique, não um nome pra lembrar depois.
+    # Aceita nome + contato como equivalente ao link: WhatsApp é rastro tanto
+    # quanto URL, desde que o contato esteja lá.
+    _link = (row.get("link_fornecedor") or "").strip()
+    _nome = (row.get("fornecedor") or "").strip()
+    _cont = (row.get("fornecedor_contato") or "").strip()
+    tem_origem = bool(_link or (_nome and _cont))
     try:
         tem_custo = float(row.get("preco_custo") or 0) > 0
     except (TypeError, ValueError):
@@ -477,8 +485,12 @@ def _falta_lastro(row: dict) -> str:
     if not row:
         return "produto sem registro"
     faltas = []
-    if not ((row.get("link_fornecedor") or "").strip() or (row.get("fornecedor") or "").strip()):
-        faltas.append("origem")
+    _link = (row.get("link_fornecedor") or "").strip()
+    _nome = (row.get("fornecedor") or "").strip()
+    _cont = (row.get("fornecedor_contato") or "").strip()
+    if not _link and not (_nome and _cont):
+        # Diz o que falta de verdade — "origem" genérico não ajuda a preencher.
+        faltas.append("contato do " + _nome if _nome else "origem")
     try:
         if not float(row.get("preco_custo") or 0) > 0:
             faltas.append("custo")
@@ -682,6 +694,7 @@ diferente = null; spec divergente = não é o mesmo item, mesmo que a descriçã
         # Custo/origem: SÓ em 'alta'. Em media/baixa não herda — na dúvida, em branco,
         # pra não arrastar o custo de um item parecido mas diferente.
         preco_custo, link_fornecedor, fornecedor, sku_fornecedor = 0.0, "", "", ""
+        fornecedor_canal, fornecedor_contato = "", ""
         if confianca == "alta" and _row and not _sem_lastro:
             try:
                 preco_custo = float(_row.get("preco_custo") or 0)
@@ -689,6 +702,8 @@ diferente = null; spec divergente = não é o mesmo item, mesmo que a descriçã
                 preco_custo = 0.0
             link_fornecedor = _row.get("link_fornecedor") or ""
             fornecedor = _row.get("fornecedor") or ""
+            fornecedor_canal = _row.get("fornecedor_canal") or ""
+            fornecedor_contato = _row.get("fornecedor_contato") or ""
             sku_fornecedor = _row.get("sku_fornecedor") or ""
 
         if not tem_match:
@@ -712,6 +727,10 @@ diferente = null; spec divergente = não é o mesmo item, mesmo que a descriçã
                 "preco_custo":    float((_row or {}).get("preco_custo") or 0),
                 "fornecedor":     (_row or {}).get("fornecedor") or "",
                 "link_fornecedor": (_row or {}).get("link_fornecedor") or "",
+                # Quem, por onde, e o contato em si — as três coisas que o campo
+                # antigo tentava guardar sozinho ("volt - wpp", "WPP DATALINK 115848").
+                "fornecedor_canal":   (_row or {}).get("fornecedor_canal") or "",
+                "fornecedor_contato": (_row or {}).get("fornecedor_contato") or "",
                 "sku_fornecedor": (_row or {}).get("sku_fornecedor") or "",
                 "cliente":        (_row or {}).get("cliente") or "",
                 "cnpj":           (_row or {}).get("cnpj") or "",
@@ -744,6 +763,8 @@ diferente = null; spec divergente = não é o mesmo item, mesmo que a descriçã
             "preco_custo": preco_custo,
             "link_fornecedor": link_fornecedor,
             "fornecedor": fornecedor,
+            "fornecedor_canal": fornecedor_canal,
+            "fornecedor_contato": fornecedor_contato,
             "sku_fornecedor": sku_fornecedor,
             "obs": obs_item,
             "confianca_match": confianca,
@@ -1346,6 +1367,10 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
             origem["link_fornecedor"] = item["link_fornecedor"].strip()
         if (item.get("fornecedor") or "").strip():
             origem["fornecedor"] = item["fornecedor"].strip()
+        if (item.get("fornecedor_canal") or "").strip():
+            origem["fornecedor_canal"] = item["fornecedor_canal"].strip()
+        if (item.get("fornecedor_contato") or "").strip():
+            origem["fornecedor_contato"] = item["fornecedor_contato"].strip()
         if (item.get("sku_fornecedor") or "").strip():
             origem["sku_fornecedor"] = item["sku_fornecedor"].strip()
 
@@ -1824,6 +1849,8 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
             "specs_complementares": i.get("specs_complementares", ""),
             "fornecedor":           i.get("fornecedor", ""),
             "link_fornecedor":      i.get("link_fornecedor", ""),
+            "fornecedor_canal":     i.get("fornecedor_canal", ""),
+            "fornecedor_contato":   i.get("fornecedor_contato", ""),
             "sku_fornecedor":       i.get("sku_fornecedor", ""),
             "obs_interna":          i.get("obs_interna", ""),
         } for i in itens]
