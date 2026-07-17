@@ -45,8 +45,7 @@ const MARKETPLACES = [
 ];
 
 // ── Linha de item da revisão ───────────────────────────────────────────────
-function ItemRow({ item, index, onChange, token, apiUrl }) {
-  const [loadingPn, setLoadingPn] = useState(false);
+function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto }) {
   // ── Alerta ────────────────────────────────────────────────────────────
   const [mostrarAlerta, setMostrarAlerta] = useState(false);
   const [alertaTexto, setAlertaTexto] = useState(() => item.alerta_produto?.texto || "");
@@ -129,30 +128,51 @@ function ItemRow({ item, index, onChange, token, apiUrl }) {
     } catch (e) {}
     finally { setLoadingImagem(false); }
   }
-  const [sugestoes, setSugestoes] = useState(null);
-  const [mostrarSugestoes, setMostrarSugestoes] = useState(false);
+  // Consulta técnica do item: o operador pergunta, a IA responde (com busca web).
+  // É o que ele já fazia numa aba de chat, colando os textos na mão — só que aqui
+  // o item já vem carregado e a resposta volta clicável.
+  const [conferirAberto, setConferirAberto] = useState(false);
+  const [conversa, setConversa] = useState([]);
+  const [perguntando, setPerguntando] = useState(false);
+  const [rascunhoPergunta, setRascunhoPergunta] = useState("");
   const [mostrarSpecs, setMostrarSpecs] = useState(false);
+  // Ficha do banco: aberta por padrão quando o match NÃO é exato — é justamente onde
+  // o operador precisa comparar. Em match exato fica recolhida pra não poluir.
+  const [mostrarBanco, setMostrarBanco] = useState(
+    !!item.banco && (item.banco.confianca !== "alta" || item.banco.veredito !== "mesmo"
+      || item.banco.sem_lastro));
   const [mostrarOrigem, setMostrarOrigem] = useState(false);
 
-  async function buscarSugestoes() {
-    setLoadingPn(true); setSugestoes(null); setMostrarSugestoes(true);
+  async function perguntar(texto) {
+    const q = (texto || rascunhoPergunta).trim();
+    if (!q || perguntando) return;
+    setConferirAberto(true);
+    setRascunhoPergunta("");
+    const historico = conversa.map((m) => ({ role: m.role, content: m.content }));
+    setConversa((c) => [...c, { role: "user", content: q }]);
+    setPerguntando(true);
     try {
-      const res = await fetch(`${apiUrl}/sugerir-pn`, {
+      const res = await fetch(`${apiUrl}/conferir`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ descricao: item.descricao_final }),
+        body: JSON.stringify({ pergunta: q, item, fonte_texto: fonteTexto || "", historico }),
       });
-      const data = await res.json();
-      setSugestoes(data.sugestoes || []);
-    } catch (e) { setSugestoes([]); }
-    finally { setLoadingPn(false); }
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "falhou");
+      const d = await res.json();
+      setConversa((c) => [...c, { role: "assistant", content: d.resposta, buscas: d.buscas || [] }]);
+    } catch (e) {
+      setConversa((c) => [...c, { role: "assistant", content: `Não consegui responder agora (${e.message}). Tenta de novo.`, erro: true }]);
+    } finally { setPerguntando(false); }
   }
 
-  function aplicarSugestao(s) {
-    onChange(index, "descricao_final", `${s.fabricante} ${s.modelo} - ${s.specs}`);
-    if (s.preco_estimado > 0) onChange(index, "preco_un", s.preco_estimado);
-    setMostrarSugestoes(false); setSugestoes(null);
-  }
+  // Escritos a partir das perguntas que o Leonardo já faz fora do sistema.
+  const ATALHOS = [
+    { rotulo: "É o mesmo item?", q: "O que eu preenchi é o mesmo item que o cliente pediu? Se não for, me diga exatamente o que difere." },
+    { rotulo: "Que item é esse?", q: "Que item é esse que o cliente pediu? Identifique fabricante e modelo pelo código/descrição." },
+    { rotulo: "PN e fabricante?", q: "Qual o PN e o fabricante do item que o cliente pediu?" },
+    { rotulo: "Descrição comercial?", q: "Qual a descrição comercial correta desse item?" },
+    { rotulo: "Sugerir PN", q: "Sugira PNs específicos de fabricantes que atendam essa especificação, do mais em conta ao mais caro." },
+  ];
 
   const confianca = item.confianca_match || "nenhuma";
   const c = CONF[confianca];
@@ -209,17 +229,26 @@ function ItemRow({ item, index, onChange, token, apiUrl }) {
           </div>
           <div className="mt-0.5 flex flex-wrap items-center gap-2 pl-1.5">
             <StateLabel conf={confianca} />
-            {confianca === "baixa" && item.banco_candidato && (
-              <span className="text-[11px] text-sub">
-                ref. banco: <span className="text-faint">{item.banco_candidato}</span>
-              </span>
-            )}
-            {item.sugerir_pn && (
-              <button onClick={buscarSugestoes} disabled={loadingPn}
-                className="inline-flex items-center gap-1 text-[11px] font-medium text-kist hover:text-kist600 disabled:opacity-50">
-                <IconBolt size={11} /> {loadingPn ? "buscando…" : "Sugerir PN"}
+            {item.banco && (
+              <button onClick={() => setMostrarBanco((v) => !v)}
+                className={`inline-flex items-center gap-1 text-[11px] font-medium hover:opacity-80
+                  ${item.banco.veredito === "diferente" ? "text-rose"
+                    : (item.banco.veredito === "inconclusivo" || item.banco.sem_lastro) ? "text-amber"
+                    : "text-kist"}`}>
+                {mostrarBanco ? "− fechar comparação"
+                  : item.banco.veredito === "diferente" ? "⚠ não é o mesmo item"
+                  : item.banco.veredito === "inconclusivo" ? "⚠ falta informação"
+                  : item.banco.sem_lastro ? "⚠ preço sem lastro — recotar"
+                  : "↔ comparar com o banco"}
               </button>
             )}
+            {/* Sempre disponível: quem sabe se tem dúvida é o operador, não a
+                heurística. O destaque é só um empurrão quando não há PN/código. */}
+            <button onClick={() => setConferirAberto((v) => !v)}
+              className={`inline-flex items-center gap-1 text-[11px] font-medium hover:opacity-80
+                ${item.pede_atencao ? "text-kist" : "text-faint"}`}>
+              <IconBolt size={11} /> Conferir
+            </button>
             <button onClick={() => setMostrarSpecs((v) => !v)} className="text-[11px] text-faint hover:text-sub">
               {mostrarSpecs ? "− descrição complementar" : "+ descrição complementar"}
             </button>
@@ -263,6 +292,143 @@ function ItemRow({ item, index, onChange, token, apiUrl }) {
           </div>
         </td>
       </tr>
+
+      {/* ── FICHA DE PROCEDÊNCIA — linha própria, largura inteira ────────────
+          Os dois lados LADO A LADO, que é como o olho compara. Antes isto vivia
+          espremido dentro do <td> da descrição, junto com o input, o Google, os
+          marketplaces, o sino e quatro toggles — onze coisas numa célula.
+          Comparar spec exige ler em paralelo, não rolar pra cima e pra baixo. */}
+      {item.banco && mostrarBanco && (
+        <tr className="border-b border-line/70 bg-paper/60">
+          <td /><td />
+          <td colSpan={4} className="px-3 pb-3 pt-2">
+
+            {item.banco.veredito === "diferente" && (
+              <div className="mb-2.5 rounded-lg border border-rose/30 bg-rosebg px-3 py-2">
+                <div className="text-[12px] font-semibold text-rose">Não é o mesmo item</div>
+                {item.banco.diferencas?.length > 0 ? (
+                  <ul className="mt-1 space-y-0.5">
+                    {item.banco.diferencas.map((d, k) => (
+                      <li key={k} className="text-[12px] leading-relaxed text-sub">• {d}</li>
+                    ))}
+                  </ul>
+                ) : (
+                  <div className="mt-0.5 text-[12px] text-sub">{item.banco.defesa}</div>
+                )}
+              </div>
+            )}
+            {item.banco.veredito === "inconclusivo" && (
+              <div className="mb-2.5 rounded-lg border border-amber/30 bg-amberbg px-3 py-2">
+                <div className="text-[12px] font-semibold text-amber">Não dá pra decidir</div>
+                <div className="mt-0.5 text-[12px] leading-relaxed text-sub">
+                  {item.banco.falta || item.banco.defesa}
+                </div>
+              </div>
+            )}
+
+            <div className="grid gap-3 md:grid-cols-2">
+              {/* ── lado do cliente ── */}
+              <div className="rounded-lg border border-line2 bg-surface p-3">
+                <div className="eyebrow text-[9px] font-semibold uppercase text-faint">O cliente pediu</div>
+                <div className="mt-1 text-[13px] leading-snug text-ink">{item.descricao_original}</div>
+                {item.specs_complementares ? (
+                  <div className="mt-2 border-t border-line pt-2">
+                    <div className="eyebrow text-[9px] font-semibold uppercase text-faint">Specs</div>
+                    <div className="mt-0.5 whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-sub">
+                      {item.specs_complementares}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mt-2 border-t border-line pt-2 text-[11px] text-faint">
+                    Sem specs — o cliente não detalhou.
+                  </div>
+                )}
+              </div>
+
+              {/* ── lado do banco ── */}
+              <div className="rounded-lg border border-line2 bg-surface p-3">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="eyebrow text-[9px] font-semibold uppercase text-faint">O banco propõe</div>
+                  <button
+                    onClick={() => onChange(index, "descricao_final", item.banco.descricao)}
+                    title="Substituir a descrição do item por esta"
+                    className="-mt-0.5 flex-shrink-0 rounded-md border border-line2 px-2 py-0.5 text-[11px] font-medium text-sub hover:border-kist hover:text-kist">
+                    usar esta
+                  </button>
+                </div>
+                <div className="mt-1 text-[13px] font-medium leading-snug text-ink">{item.banco.descricao}</div>
+
+                <div className="mt-2.5 flex flex-wrap items-baseline gap-x-4 gap-y-1 border-t border-line pt-2 text-[12px]">
+                  <span><span className="text-faint">Venda </span><span className="font-mono text-ink">{brl(item.banco.preco_un)}</span></span>
+                  <span><span className="text-faint">Custo </span>
+                    <span className={`font-mono ${item.banco.preco_custo > 0 ? "text-ink" : "text-faint"}`}>
+                      {item.banco.preco_custo > 0 ? brl(item.banco.preco_custo) : "—"}
+                    </span></span>
+                  {item.banco.preco_custo > 0 && item.banco.preco_un > 0 && (
+                    <span className="font-mono text-signal">
+                      +{Math.round((item.banco.preco_un / item.banco.preco_custo - 1) * 100)}%
+                    </span>
+                  )}
+                </div>
+
+                <div className="mt-1.5 space-y-1 text-[11.5px]">
+                  <div>
+                    <span className="text-faint">Vendido para </span>
+                    <span className="text-ink">{item.banco.cliente || "—"}</span>
+                    {item.banco.cnpj && <span className="ml-1.5 font-mono text-faint">{item.banco.cnpj}</span>}
+                  </div>
+                  <div>
+                    <span className="text-faint">Origem </span>
+                    {/* O campo aceita URL OU texto livre ("DIGITALSAT", "IngramMicro e-mail").
+                        Sem o isLink, texto livre virava <a href="DIGITALSAT"> — link quebrado. */}
+                    {isLink(item.banco.link_fornecedor) ? (
+                      <a href={item.banco.link_fornecedor} target="_blank" rel="noreferrer"
+                        className="inline-flex items-center gap-1 text-kist hover:text-kist600">
+                        <IconLink size={10} />{item.banco.fornecedor || "abrir"}
+                      </a>
+                    ) : item.banco.link_fornecedor ? (
+                      <span className="text-ink">{item.banco.link_fornecedor}</span>
+                    ) : item.banco.fornecedor ? (
+                      <span className="text-ink">{item.banco.fornecedor}</span>
+                    ) : (
+                      <span className="text-amber">sem lastro</span>
+                    )}
+                    {item.banco.sku_fornecedor && <span className="ml-1.5 font-mono text-faint">{item.banco.sku_fornecedor}</span>}
+                  </div>
+                  {/* criado_em é a criação; usuario_nome é quem atualizou POR ÚLTIMO.
+                      Juntar os dois numa frase só ("cadastrado em X por Y") mente
+                      quando quem criou e quem atualizou são pessoas diferentes. */}
+                  <div className="text-faint">
+                    {item.banco.criado_em && <>Criado {new Date(item.banco.criado_em).toLocaleDateString("pt-BR")} · </>}
+                    Atualizado {item.banco.data_ref ? item.banco.data_ref.split("-").reverse().join("/") : "—"}
+                    {item.banco.usuario_nome ? ` por ${item.banco.usuario_nome}` : ""}
+                    {item.banco.proposta_tiny ? ` · proposta ${item.banco.proposta_tiny}` : ""}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {item.banco.veredito === "mesmo" && item.banco.defesa && (
+              <div className="mt-2 border-l-2 border-signal/40 pl-2 text-[11.5px] leading-relaxed text-sub">
+                {item.banco.defesa}
+              </div>
+            )}
+            {item.banco.sem_lastro ? (
+              <div className="mt-2.5 rounded-lg border border-amber/30 bg-amberbg px-3 py-2">
+                <div className="text-[12px] font-semibold text-amber">Preço não importado</div>
+                <div className="mt-0.5 text-[12px] leading-relaxed text-sub">
+                  Este produto está sem {item.banco.falta_lastro} no banco. Recote e preencha —
+                  o que você digitar corrige o cadastro pra todo mundo.
+                </div>
+              </div>
+            ) : !item.banco.herdou_custo && (
+              <div className="mt-2 text-[11px] text-faint">
+                Custo e origem não foram copiados pro item — o match não é exato.
+              </div>
+            )}
+          </td>
+        </tr>
+      )}
 
       {/* Origem do preço — link OU texto livre · viaja junto pra OC */}
       {mostrarOrigem && (
@@ -424,43 +590,89 @@ function ItemRow({ item, index, onChange, token, apiUrl }) {
         </tr>
       )}
 
-      {/* Sugestões de PN */}
-      {mostrarSugestoes && (
+      {/* ── CONFERIR — consulta técnica do item ─────────────────────────────
+          O operador já faz isto hoje numa aba de chat, colando descrição e specs
+          na mão. Aqui o item já vem carregado (inclusive o e-mail original do
+          cliente), a IA busca na web quando o código é específico, e a resposta
+          volta clicável. Fica fora do caminho crítico de propósito: o matching
+          precisa ser determinístico e rápido; isto é sob demanda. */}
+      {conferirAberto && (
         <tr className="border-b border-line/70 bg-paper/60">
           <td /><td />
-          <td colSpan={4} className="px-3 pb-3 pt-1">
-            <div className="rounded-xl border border-kist/20 bg-kist/[0.04] p-3">
-              <div className="mb-2 flex items-center justify-between">
-                <Eyebrow>Sugestões de PN / modelo</Eyebrow>
-                <button onClick={() => setMostrarSugestoes(false)} className="text-faint hover:text-rose"><IconX size={14} /></button>
+          <td colSpan={4} className="px-3 pb-3 pt-2">
+            <div className="rounded-lg border border-line2 bg-surface">
+              <div className="flex items-center justify-between border-b border-line px-3 py-2">
+                <div className="eyebrow text-[9px] font-semibold uppercase text-faint">
+                  Conferir item {String(index + 1).padStart(2, "0")}
+                </div>
+                <button onClick={() => setConferirAberto(false)} className="rounded p-0.5 text-faint hover:text-ink">
+                  <IconX size={14} />
+                </button>
               </div>
-              {loadingPn ? (
-                <div className="py-2 text-[12px] text-sub">Consultando…</div>
-              ) : sugestoes && sugestoes.length > 0 ? (
-                <div className="space-y-2">
-                  {sugestoes.map((s, i) => (
-                    <div key={i} className="flex items-start justify-between gap-3 rounded-lg border border-line bg-surface p-2.5">
-                      <div className="min-w-0 flex-1">
-                        <div className="mb-0.5 flex items-center gap-2">
-                          <span className="text-[12.5px] font-semibold text-ink">{s.fabricante} {s.modelo}</span>
-                          {s.atende_fabricante && (
-                            <span className="rounded-full bg-signalbg px-1.5 py-0.5 text-[10px] font-medium text-signal">fabricante ok</span>
-                          )}
-                        </div>
-                        <div className="mb-1 text-[12px] text-sub">{s.specs}</div>
-                        {s.preco_estimado > 0 && (
-                          <div className="text-[12px] text-sub">
-                            Estimado: <span className="font-mono font-medium text-ink">R$ {brl(s.preco_estimado)}</span>
-                          </div>
-                        )}
+
+              {conversa.length === 0 && (
+                <div className="px-3 pt-2.5 text-[11.5px] leading-relaxed text-sub">
+                  Pergunte o que quiser sobre este item. O que o cliente pediu, o e-mail
+                  original e o que você preencheu já estão carregados.
+                </div>
+              )}
+
+              <div className="flex flex-wrap gap-1.5 px-3 py-2.5">
+                {ATALHOS.map((a) => (
+                  <button key={a.rotulo} onClick={() => perguntar(a.q)} disabled={perguntando}
+                    className="rounded-full border border-line2 px-2.5 py-1 text-[11px] text-sub transition-colors hover:border-kist hover:text-kist disabled:opacity-40">
+                    {a.rotulo}
+                  </button>
+                ))}
+              </div>
+
+              {conversa.length > 0 && (
+                <div className="max-h-[380px] space-y-2.5 overflow-auto border-t border-line px-3 py-2.5">
+                  {conversa.map((m, k) => m.role === "user" ? (
+                    <div key={k} className="text-[11.5px] leading-relaxed text-faint">
+                      <span className="eyebrow mr-1.5 text-[9px] font-semibold uppercase">Você</span>
+                      {m.content}
+                    </div>
+                  ) : (
+                    <div key={k} className={`rounded-md border px-2.5 py-2 ${m.erro ? "border-rose/30 bg-rosebg" : "border-line2 bg-paper"}`}>
+                      <div className={`whitespace-pre-wrap text-[12px] leading-relaxed ${m.erro ? "text-rose" : "text-ink"}`}>
+                        {m.content}
                       </div>
-                      <button onClick={() => aplicarSugestao(s)} className={btnPrimary}>Usar</button>
+                      {m.buscas?.length > 0 && (
+                        <div className="mt-1.5 text-[10px] text-faint">buscou: {m.buscas.join(" · ")}</div>
+                      )}
+                      {!m.erro && (
+                        <div className="mt-2 flex gap-1.5 border-t border-line pt-1.5">
+                          <button onClick={() => onChange(index, "descricao_final", m.content.split("\n")[0].trim())}
+                            title="Usar a primeira linha como descrição do item"
+                            className="rounded border border-line2 px-1.5 py-0.5 text-[10px] text-sub hover:border-kist hover:text-kist">
+                            usar como descrição
+                          </button>
+                          <button onClick={() => onChange(index, "specs_complementares",
+                            ((item.specs_complementares || "") + "\n" + m.content).trim())}
+                            className="rounded border border-line2 px-1.5 py-0.5 text-[10px] text-sub hover:border-kist hover:text-kist">
+                            somar às specs
+                          </button>
+                        </div>
+                      )}
                     </div>
                   ))}
+                  {perguntando && <div className="text-[11.5px] text-faint">consultando…</div>}
                 </div>
-              ) : (
-                <div className="py-2 text-[12px] text-sub">Nenhuma sugestão encontrada.</div>
               )}
+
+              <div className="flex items-center gap-2 border-t border-line px-3 py-2">
+                <input
+                  value={rascunhoPergunta}
+                  onChange={(e) => setRascunhoPergunta(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); perguntar(); } }}
+                  placeholder="ex: SHURE SB900A e SB900B é a mesma coisa?"
+                  className="flex-1 bg-transparent text-[12px] text-ink outline-none placeholder:text-faint" />
+                <button onClick={() => perguntar()} disabled={perguntando || !rascunhoPergunta.trim()}
+                  className="rounded-md border border-line2 px-2 py-1 text-[11px] font-medium text-sub hover:border-kist hover:text-kist disabled:opacity-40">
+                  perguntar
+                </button>
+              </div>
             </div>
           </td>
         </tr>
@@ -506,8 +718,6 @@ export default function App() {
   const [pagina, setPagina] = useState("nova"); // nova | propostas | ordens
   const [alertasChamados, setAlertasChamados] = useState(0);
   const [bannerDispensado, setBannerDispensado] = useState(false);
-  const [preservarCliente, setPreservarCliente] = useState(false);
-  const preservarInitRef = useRef(false);
   const [novaOCPayload, setNovaOCPayload] = useState(null);
   const [step, setStep] = useState("input");
   const [loading, setLoading] = useState(false);
@@ -516,6 +726,17 @@ export default function App() {
   // Avisos do backend quando a BUSCA FALHOU (≠ produto ausente no banco).
   // Cada um traz o número do chamado que o sistema abriu sozinho.
   const [avisosSistema, setAvisosSistema] = useState([]);
+  // "Não importar preços sem rastreabilidade": ON pro Fábio por padrão, OFF pros demais.
+  // Ele pode desmarcar. Diferente do antigo checkbox de preservar descrição (que criava
+  // duas verdades no mesmo dado), este não muda o que o sistema SABE — só o que ele
+  // preenche sozinho. A ficha continua mostrando o match pros dois.
+  const [soRastreavel, setSoRastreavel] = useState(false);
+  const soRastreavelInitRef = useRef(false);
+  // Itens que vão pro banco sem lastro. Não bloqueia — mostra quais são e deixa
+  // resolver ali. Aviso genérico vira reflexo de clicar em "ignorar" numa semana;
+  // lista específica com o item na frente é preenchida, porque preencher fica mais
+  // barato que dispensar.
+  const [semLastro, setSemLastro] = useState(null);
   const [texto, setTexto] = useState("");
   const [arquivos, setArquivos] = useState([]);   // múltiplos arquivos (email + Excel + PDF)
   const [imagens, setImagens] = useState([]);
@@ -571,14 +792,17 @@ export default function App() {
     return () => document.removeEventListener("visibilitychange", onVisible);
   }, [carregarAlertas]);
 
-  // Default do checkbox "preservar 100% descrição do cliente": ON pro Fábio, OFF pros demais.
-  // Setado uma única vez quando o usuário fica conhecido; depois é livre pro operador alternar.
   useEffect(() => {
-    if (usuario?.email && !preservarInitRef.current) {
-      preservarInitRef.current = true;
-      setPreservarCliente(usuario.email.toLowerCase() === "fabiokist@gmail.com");
+    if (usuario?.email && !soRastreavelInitRef.current) {
+      soRastreavelInitRef.current = true;
+      setSoRastreavel(usuario.email.toLowerCase() === "fabiokist@gmail.com");
     }
   }, [usuario]);
+
+  // O default por operador do "preservar 100% descrição do cliente" saiu na v3.17
+  // junto com o checkbox: a descrição do cliente agora é SEMPRE preservada, e o que
+  // o banco propõe aparece na ficha ao lado, pro operador comparar e decidir.
+  // Duas verdades diferentes por operador era o próprio problema.
 
   // Capturar Ctrl+V de imagens
   useEffect(() => {
@@ -700,7 +924,7 @@ export default function App() {
     try {
       const form = new FormData();
       form.append("numero_proposta", numeroProposta);
-      form.append("preservar_cliente", preservarCliente ? "1" : "0");
+      form.append("so_rastreavel", soRastreavel ? "1" : "0");
       arquivos.forEach((f) => form.append("arquivos", f));
       if (texto) form.append("texto", texto);
       imagens.forEach((img) => form.append("imagens", img));
@@ -829,9 +1053,24 @@ export default function App() {
     } finally { setLoading(false); }
   }
 
-  async function baixarCSV(idx = propostaIdx) {
+  // Um item vai pro banco quando tem preço. Se for sem custo e sem origem, ele vira
+  // uma linha que daqui a meses aparece num match que ninguém consegue conferir.
+  function itensSemLastro(prop) {
+    return (prop.itens || [])
+      .map((it, i) => ({ ...it, _i: i }))
+      .filter((it) => it.preco_un > 0
+        && !(it.preco_custo > 0)
+        && !((it.link_fornecedor || "").trim() || (it.fornecedor || "").trim()));
+  }
+
+  async function baixarCSV(idx = propostaIdx, ignorarLastro = false) {
     const prop = propostas[idx];
     if (!prop) return;
+    if (!ignorarLastro) {
+      const faltando = itensSemLastro(prop);
+      if (faltando.length > 0) { setSemLastro({ idx, itens: faltando }); return; }
+    }
+    setSemLastro(null);
     setLoading(true); setSalvandoBanco(true); setBancoInfo(null);
     try {
       const payload = { ...prop, usuario_nome: usuario.nome };
@@ -1051,12 +1290,16 @@ export default function App() {
 
                   {erro && <div className="rounded-lg border border-rose/30 bg-rosebg px-4 py-3 text-[13px] text-rose">{erro}</div>}
 
-                  <label className="flex cursor-pointer items-center gap-2 text-[12.5px] text-sub">
-                    <input type="checkbox" checked={preservarCliente}
-                      onChange={(e) => setPreservarCliente(e.target.checked)}
-                      className="h-3.5 w-3.5 rounded border-line2 text-kist focus:ring-kist" />
-                    Preservar 100% a descrição do cliente
-                    <span className="text-[11px] text-faint">— match do banco só entra se for exato</span>
+                  <label className="flex cursor-pointer items-start gap-2 text-[12.5px] text-sub">
+                    <input type="checkbox" checked={soRastreavel}
+                      onChange={(e) => setSoRastreavel(e.target.checked)}
+                      className="mt-0.5 h-3.5 w-3.5 rounded border-line2 text-kist focus:ring-kist" />
+                    <span>
+                      Não importar preços sem rastreabilidade
+                      <span className="ml-1 text-[11px] text-faint">
+                        — o match aparece, mas o preço só entra se o produto tiver origem, custo e venda
+                      </span>
+                    </span>
                   </label>
 
                   <button onClick={processar} disabled={loading} className={`${btnPrimary} w-full justify-center py-2.5`}>
@@ -1100,7 +1343,75 @@ export default function App() {
                     </button>
                   </>} />
 
-                {/* Falha do sistema != produto ausente no banco.
+                {/* ── RASTREABILIDADE ANTES DO TINY ───────────────────────────────────
+          Estes itens vão virar linha no banco de preços. Sem custo e sem origem,
+          daqui a meses eles reaparecem num match que ninguém consegue conferir —
+          e aí o operador recota às cegas ou o item volta em RMA.
+          Não bloqueia: lista, deixa preencher ali, e segue se ele quiser. */}
+      {semLastro && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-navy/40 p-4"
+          onClick={() => setSemLastro(null)}>
+          <div className="max-h-[85vh] w-full max-w-2xl overflow-auto rounded-2xl border border-line2 bg-surface p-5 shadow-xl"
+            onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="text-[15px] font-semibold text-ink">
+                  {semLastro.itens.length} {semLastro.itens.length === 1 ? "item vai" : "itens vão"} pro banco sem lastro
+                </div>
+                <div className="mt-1 text-[12.5px] leading-relaxed text-sub">
+                  Sem custo e sem origem, esse preço reaparece daqui a meses num match que
+                  ninguém consegue conferir. Preencher agora custa menos que recotar depois.
+                </div>
+              </div>
+              <button onClick={() => setSemLastro(null)} className="rounded p-1 text-faint hover:text-ink">
+                <IconX size={16} />
+              </button>
+            </div>
+
+            <div className="mt-4 space-y-2.5">
+              {semLastro.itens.map((it) => (
+                <div key={it._i} className="rounded-lg border border-line2 bg-paper p-2.5">
+                  <div className="text-[12.5px] leading-snug text-ink">{it.descricao_final}</div>
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <div className="flex items-center gap-1.5 rounded-md border border-line2 bg-surface px-2 py-1">
+                      <span className="text-[11px] text-faint">Custo R$</span>
+                      <input type="number" step="0.001" placeholder="—"
+                        className="w-20 bg-transparent text-right font-mono text-[12px] text-ink outline-none"
+                        value={propostas[semLastro.idx]?.itens?.[it._i]?.preco_custo || ""}
+                        onChange={(e) => atualizarItem(it._i, "preco_custo", parseFloat(e.target.value) || 0)} />
+                    </div>
+                    <div className="flex min-w-[240px] flex-1 items-center gap-1.5 rounded-md border border-line2 bg-surface px-2 py-1">
+                      <span className="eyebrow text-[9px] font-bold uppercase text-faint">Origem</span>
+                      <input
+                        placeholder="link, ou de onde veio (ex: DigitalSAT WhatsApp · IngramMicro e-mail)"
+                        className="w-full bg-transparent text-[12px] text-ink outline-none placeholder:text-faint"
+                        value={propostas[semLastro.idx]?.itens?.[it._i]?.link_fornecedor || ""}
+                        onChange={(e) => atualizarItem(it._i, "link_fornecedor", e.target.value)} />
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="mt-4 flex items-center justify-end gap-2 border-t border-line pt-3">
+              <button onClick={() => baixarCSV(semLastro.idx, true)} className={btnGhost}>
+                Gerar assim mesmo
+              </button>
+              <button
+                onClick={() => {
+                  const restam = itensSemLastro(propostas[semLastro.idx]);
+                  if (restam.length === 0) baixarCSV(semLastro.idx, true);
+                  else setSemLastro({ idx: semLastro.idx, itens: restam });
+                }}
+                className={btnPrimary}>
+                Pronto, gerar CSV
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Falha do sistema != produto ausente no banco.
                     Sem este aviso, os dois casos chegam idênticos na tela: itens
                     sem preço. O operador precificaria na mão itens que o banco
                     já tinha, sem nunca saber que o backend falhou. */}
@@ -1203,7 +1514,7 @@ export default function App() {
                     </thead>
                     <tbody>
                       {(prop.itens || []).map((item, i) => (
-                        <ItemRow key={i} item={item} index={i} onChange={atualizarItem} token={token} apiUrl={API} />
+                        <ItemRow key={i} item={item} index={i} onChange={atualizarItem} token={token} apiUrl={API} fonteTexto={prop.fonte_texto} />
                       ))}
                     </tbody>
                   </table>

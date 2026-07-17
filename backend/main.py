@@ -115,6 +115,28 @@ REGRAS DE DESCRIÇÃO:
 - "sugerir_pn": true SÓ para itens de alto valor (notebook, servidor, switch gerenciável, UPS,
   câmera IP, storage) sem modelo específico definido. Commodities → sempre false
 
+REGRAS DE CNPJ (o campo mais negligenciado — leia com atenção):
+- O CNPJ do CLIENTE é OBRIGATÓRIO sempre que existir no material. Sem ele a proposta não pode
+  ser exportada nem alimentar o banco de preços. Procure ATIVAMENTE, nesta ordem:
+  1. Corpo do e-mail e ASSINATURA do remetente (é o lugar mais comum: bloco no rodapé com
+     razão social, CNPJ, IE, endereço e telefone)
+  2. Cabeçalho "De:" — o domínio do remetente identifica a empresa (ex.: @convergint.com).
+     O domínio NÃO é o CNPJ, mas confirma de quem é a demanda quando houver mais de uma empresa
+     no material.
+  3. RODAPÉ e CABEÇALHO de PDFs anexos (pedido de compra, RC, cotação): quase sempre trazem
+     o CNPJ do emissor
+  4. Planilhas: procure células com "CNPJ", "C.N.P.J.", "Cadastro Nacional"
+  5. Imagens e prints: leia rodapés e timbres
+- Formato: 14 dígitos. Devolva como "XX.XXX.XXX/XXXX-XX". Aceite variações na origem
+  (só números, com pontos, com espaços) e normalize.
+- CUIDADO — há SEMPRE dois CNPJs em jogo. O da KIST é 10.573.732/0003-96 (ou qualquer CNPJ
+  com raiz 10573732): esse é o NOSSO, é o fornecedor, e NUNCA deve ir no campo "cnpj".
+  O que você quer é o CNPJ de QUEM PEDIU a cotação.
+- Se houver mais de um CNPJ de cliente (matriz e filial), escolha o que emitiu a demanda —
+  normalmente o da assinatura de quem enviou, ou o do cabeçalho do pedido.
+- NUNCA invente, complete ou "conserte" um CNPJ. Se não encontrar, devolva null. CNPJ errado
+  é pior que CNPJ ausente: ele amarra o preço à empresa errada e ninguém percebe.
+
 REGRAS GERAIS:
 - Extraia TODOS os itens, inclusive de imagens/prints
 - quantidade = número, nunca string
@@ -124,7 +146,14 @@ REGRAS GERAIS:
 """
 
 SYSTEM_MATCHING = """Você é especialista em materiais elétricos, telecom, infraestrutura e TI.
-Sua tarefa é identificar, para cada item solicitado, qual produto do banco de preços é o mesmo item.
+Sua tarefa é decidir, para cada item solicitado, se algum produto do banco de preços é O MESMO ITEM
+— e explicar por quê, como um colega experiente explicaria pra outro antes de fechar a venda.
+
+O item solicitado tem DUAS partes e as duas valem:
+  - DESCRIÇÃO: o texto principal do cliente
+  - SPECS: as especificações complementares dele (bitola, dimensão, norma, modelo, acabamento…)
+É MUITO comum a descrição bater e a SPEC divergir. Quando isso acontece NÃO é o mesmo item —
+esse erro faz a Kist vender errado, comprar errado, entregar e o cliente devolver.
 
 RETORNE APENAS JSON VÁLIDO. Sem markdown. Só o objeto JSON puro.
 
@@ -133,14 +162,29 @@ Formato:
   "matches": [
     {
       "indice": 0,
-      "banco_descricao": "descrição exata do item do banco que corresponde, ou null se não encontrado",
+      "banco_descricao": "descrição exata do item do banco que corresponde, ou null se nenhum",
       "banco_preco": 0.00,
       "banco_proposta": "número da proposta de referência ou null",
       "confianca": "alta/media/baixa/nenhuma",
-      "motivo": "breve explicação da decisão"
+      "veredito": "mesmo | diferente | inconclusivo",
+      "motivo": "uma frase: por que é ou por que não é",
+      "diferencas": ["atributo que diverge: o cliente pede X, o banco tem Y"],
+      "falta": "qual especificação está faltando pra decidir, ou null"
     }
   ]
 }
+
+COMO PREENCHER veredito / diferencas / falta:
+- "mesmo": é o mesmo item. diferencas = [], falta = null.
+- "diferente": encontrei um candidato PARECIDO mas NÃO é o mesmo. Liste em "diferencas" cada
+  atributo que diverge, sempre no formato "o cliente pede X, o banco tem Y". Seja concreto:
+  "cliente pede 2,5mm², o banco tem 4mm²" — não "bitola diferente".
+  Devolva o candidato mesmo assim (o operador quer ver de onde veio a dúvida), com confianca baixa.
+- "inconclusivo": falta informação pra decidir. Diga em "falta" EXATAMENTE qual especificação
+  resolveria — ex.: "o cliente não informou a bitola" ou "o banco não diz o comprimento".
+  Isso é acionável: o operador vai perguntar. Não chute.
+- Se não houver candidato nenhum que preste: banco_descricao = null, confianca = "nenhuma",
+  veredito = "diferente", e explique em "motivo" o que o banco tem de mais próximo.
 
 REGRAS DE MATCHING — seja rigoroso:
 - "alta": mesmo produto, mesma especificação, mesmo fabricante (quando mencionado)
@@ -158,22 +202,22 @@ ATENÇÃO especial:
 """
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def _validar_sugerir_pn(sugerido: bool, descricao: str) -> bool:
-    if not sugerido:
-        return False
-    d = descricao.upper()
+def _pede_atencao(descricao: str, specs: str) -> bool:
+    """Sinaliza item que provavelmente precisa de consulta técnica: sem PN/código
+    aparente em nenhum dos lados. É só um DESTAQUE — o botão Conferir existe em
+    todo item, porque quem sabe se tem dúvida é o operador, não a heurística.
+
+    Substitui o _validar_sugerir_pn, que VETAVA o botão por duas regras erradas:
+      1. lista de commodities por substring — 'SUPORTE' matava o botão no item que
+         voltou em RMA; 'CABO' matava em cabo de fabricante específico;
+      2. premissa de que item barato não merece consulta — nasceu de um veto de
+         custo que hoje é $1,37/mês no sistema inteiro.
+    """
+    txt = f"{descricao or ''} {specs or ''}".upper()
     pn_patterns = [r'\b[A-Z]{2,}\s*\d{3,}\b', r'\b\d{3,}[A-Z]{1,3}\b', r'\b[A-Z]+-\d+[A-Z]*\b',
-                   r'\bGEN\s*\d+\b', r'\b[A-Z]{4,}\d{2,}\b', r'\b\d{4,}\b']
-    for pat in pn_patterns:
-        if re.search(pat, d):
-            return False
-    commodities = ['CABO', 'MOUSE', 'TECLADO', 'PEN DRIVE', 'PENDRIVE', 'HEADSET',
-                   'WEBCAM', 'HUB USB', 'CARREGADOR', 'ADAPTADOR', 'SUPORTE',
-                   'ABRAÇADEIRA', 'PARAFUSO', 'LAMPADA']
-    for c in commodities:
-        if c in d:
-            return False
-    return True
+                   r'\b[A-Z]{4,}\d{2,}\b', r'\b\d{4,}\b']
+    return not any(re.search(pat, txt) for pat in pn_patterns)
+
 
 def _alerta_do_candidato(banco_desc, todos_candidatos):
     """Retorna dict do alerta do produto que casou, ou None."""
@@ -280,7 +324,8 @@ def _media_type_img(b: bytes) -> str:
 
 
 _PROD_COLS = ("id,descricao,preco_un,proposta_tiny,data_ref,alerta,"
-              "preco_custo,link_fornecedor,fornecedor,sku_fornecedor")
+              "preco_custo,link_fornecedor,fornecedor,sku_fornecedor,cliente,cnpj,"
+              "usuario_nome,usuario_email,criado_em")
 
 
 def _norm_entrada(s: str) -> str:
@@ -397,14 +442,58 @@ def _itens_sem_match(itens_raw: list) -> list:
             "banco_candidato_preco": None,
             "motivo_incerto":       None,
             "tem_preco":            False,
-            "sugerir_pn":           _validar_sugerir_pn(item.get("sugerir_pn", False), desc),
+            "pede_atencao":         _pede_atencao(desc, item.get("specs_complementares")),
             "alerta_produto":       None,
+            "banco":                None,
         })
     return out
 
 
-def _fazer_matching(itens_raw: list, claude, sb, preservar_cliente: bool = False,
-                    cliente: str = "", avisos: list = None) -> list:
+def _rastreavel(row: dict) -> bool:
+    """O produto tem lastro? Origem (link OU nome do fornecedor) E custo E venda.
+
+    Regra do Fábio: preço que não dá pra rastrear custa o tempo dele e não vira nada.
+    O gargalo medido é o CUSTO (5,5% do banco tem) — não a origem (11%).
+    Origem aceita texto livre: "DIGITALSAT", "IngramMicro e-mail" são rastreáveis
+    tanto quanto um link. Saber a quem perguntar já é lastro.
+    """
+    if not row:
+        return False
+    tem_origem = bool((row.get("link_fornecedor") or "").strip()
+                      or (row.get("fornecedor") or "").strip())
+    try:
+        tem_custo = float(row.get("preco_custo") or 0) > 0
+    except (TypeError, ValueError):
+        tem_custo = False
+    try:
+        tem_venda = float(row.get("preco_un") or 0) > 0
+    except (TypeError, ValueError):
+        tem_venda = False
+    return tem_origem and tem_custo and tem_venda
+
+
+def _falta_lastro(row: dict) -> str:
+    """O que exatamente falta pro produto ser rastreável — pro operador saber o que preencher."""
+    if not row:
+        return "produto sem registro"
+    faltas = []
+    if not ((row.get("link_fornecedor") or "").strip() or (row.get("fornecedor") or "").strip()):
+        faltas.append("origem")
+    try:
+        if not float(row.get("preco_custo") or 0) > 0:
+            faltas.append("custo")
+    except (TypeError, ValueError):
+        faltas.append("custo")
+    try:
+        if not float(row.get("preco_un") or 0) > 0:
+            faltas.append("preço de venda")
+    except (TypeError, ValueError):
+        faltas.append("preço de venda")
+    return " e ".join(faltas) if faltas else ""
+
+
+def _fazer_matching(itens_raw: list, claude, sb, cliente: str = "",
+                    avisos: list = None, so_rastreavel: bool = False) -> list:
     """Matching em 3 camadas (v3.14):
 
       [1] MEMÓRIA  — entrada já virou proposta antes? Cliente primeiro, depois
@@ -500,7 +589,17 @@ def _fazer_matching(itens_raw: list, claude, sb, preservar_cliente: bool = False
     matches = {}
     itens_ia = [i for i in pendentes if candidatos_por_item[i]]
     if itens_ia:
-        itens_txt = "".join(f"\nItem {i}: {descricoes[i]}" for i in itens_ia)
+        # As specs_complementares vão JUNTO. Elas estavam sendo descartadas — e é
+        # nelas que a divergência mora (69% dos itens têm specs preenchidas). O
+        # matcher casava "suporte 60cm" com "suporte 60cm" e dava alta, sem ver que
+        # o cliente pedia haste 600x50x50 e o nosso é base parede/teto. Vendeu,
+        # comprou, entregou, voltou em RMA.
+        itens_txt = ""
+        for i in itens_ia:
+            itens_txt += f"\nItem {i}\n  DESCRIÇÃO: {descricoes[i]}"
+            _sp = (itens_raw[i].get("specs_complementares") or "").strip()
+            itens_txt += f"\n  SPECS: {_sp}\n" if _sp else "\n  SPECS: (o cliente não informou)\n"
+
         candidatos_txt = ""
         for i in itens_ia:
             candidatos_txt += f"\n\n--- Candidatos para Item {i} ({descricoes[i][:60]}) ---\n"
@@ -511,15 +610,16 @@ def _fazer_matching(itens_raw: list, claude, sb, preservar_cliente: bool = False
 
 Candidatos do banco de preços:{candidatos_txt}
 
-Para cada item, identifique qual candidato é o mesmo produto ou retorne null se nenhum for adequado.
-Lembre: fabricante diferente = null. Categoria diferente = null. Seja rigoroso."""
+Para cada item, decida se algum candidato é O MESMO ITEM — comparando a DESCRIÇÃO **e** as SPECS.
+Preencha veredito, motivo, diferencas e falta. Lembre: fabricante diferente = null; categoria
+diferente = null; spec divergente = não é o mesmo item, mesmo que a descrição bata."""
 
         try:
             resp_match = claude.messages.create(
-                model="claude-haiku-4-5-20251001", max_tokens=3000,
+                model="claude-haiku-4-5-20251001", max_tokens=6000,
                 system=SYSTEM_MATCHING,
                 messages=[{"role": "user", "content": prompt_matching}],
-                temperature=0.0, timeout=30.0
+                temperature=0.0, timeout=45.0
             )
             raw_match = resp_match.content[0].text.strip()
             raw_match = re.sub(r'^```(?:json)?\s*', '', raw_match)
@@ -542,6 +642,9 @@ Lembre: fabricante diferente = null. Categoria diferente = null. Seja rigoroso."
             "banco_preco": row.get("preco_un") or 0,
             "banco_proposta": row.get("proposta_tiny") or "",
             "motivo": f"memória · {origem}",
+            "veredito": "mesmo",     # o operador já validou este par antes
+            "diferencas": [],
+            "falta": "",
             "_memoria": origem,
         }
 
@@ -552,52 +655,84 @@ Lembre: fabricante diferente = null. Categoria diferente = null. Seja rigoroso."
         specs_comp = item.get("specs_complementares") or ""
         match = matches.get(i, {})
         confianca = match.get("confianca", "nenhuma")
-        preco_un = 0.0
-        desc_final = desc
-        obs_item = "SEM PREÇO"
-        # Origem de compra (custo/link/fornecedor) — só herda em match IDÊNTICO (alta)
-        preco_custo = 0.0
-        link_fornecedor = ""
-        fornecedor = ""
-        sku_fornecedor = ""
+        banco_desc = (match.get("banco_descricao") or "").strip()
+        tem_match = bool(banco_desc) and confianca in ("alta", "media", "baixa")
 
-        if confianca in ("alta", "media") and match.get("banco_descricao"):
-            desc_final = match["banco_descricao"]
-            preco_un = float(match.get("banco_preco") or 0)
-            proposta_ref = match.get("banco_proposta", "")
-            obs_item = f"{'✓' if confianca == 'alta' else '~'} ref {proposta_ref}" if proposta_ref else ""
-        elif confianca == "baixa" and match.get("banco_descricao"):
-            desc_final = desc
-            preco_un = float(match.get("banco_preco") or 0)
-            obs_item = f"⚠ CONFIRA — candidato no banco: {match['banco_descricao']} | motivo: {match.get('motivo','')}"
+        # ── REGRA (v3.17): a descrição do cliente NUNCA é substituída ────────
+        # Antes, em alta/media o banco sobrescrevia o texto do cliente e o original
+        # sumia da tela; em baixa só aparecia como texto solto no campo obs; e no
+        # modo "preservar" o banco era jogado fora. Nos três casos o operador ficava
+        # sem os dois lados na mesma tela — e é a comparação que pega o item errado
+        # ANTES de vender (o caso do suporte de refletor que voltou em RMA).
+        # Agora: cliente sempre no item, banco sempre na ficha, operador compara.
+        desc_final = (desc_original or "").strip() or desc
+        _row = _banco_por_desc.get(banco_desc.lower()) if banco_desc else None
 
-        # Modo "preservar 100% a descrição do cliente": nunca substitui a descrição;
-        # o match do banco (preço) só entra se for EXATO (alta). Em media/baixa/nenhuma
-        # o item fica com a descrição do cliente e sem preço sugerido (cotação manual).
-        if preservar_cliente:
-            # Preserva a descrição do cliente; fallback pra descricao curta se a
-            # original vier vazia/em branco — nunca deixa o campo vazio.
-            desc_final = (desc_original or "").strip() or desc
-            if confianca == "alta" and match.get("banco_descricao"):
-                preco_un = float(match.get("banco_preco") or 0)
-                proposta_ref = match.get("banco_proposta", "")
-                obs_item = f"✓ ref {proposta_ref}" if proposta_ref else ""
-            else:
-                preco_un = 0.0
-                obs_item = "SEM PREÇO"
+        # ── FILTRO DE RASTREABILIDADE (v3.19) ────────────────────────────────
+        # Opção (B): o match CONTINUA aparecendo na ficha — o operador vê o que
+        # existe, de onde veio, quando e por quem — mas NENHUM valor é importado.
+        # Ele recota e, ao preencher, o produto ganha o lastro que faltava.
+        # Esconder o match (opção A) seria pior: o operador não validaria nada e a
+        # memória registraria erro contra um par que ele nunca viu.
+        _sem_lastro = so_rastreavel and tem_match and not _rastreavel(_row)
 
-        # SÓ em 'alta' puxa custo/origem do banco — direto da linha, nunca da IA.
-        # Em media/baixa/nenhuma fica em branco (regra: na dúvida, não arrasta custo do item errado).
-        if confianca == "alta" and match.get("banco_descricao"):
-            _row = _banco_por_desc.get(match["banco_descricao"].strip().lower())
-            if _row:
-                try:
-                    preco_custo = float(_row.get("preco_custo") or 0)
-                except (TypeError, ValueError):
-                    preco_custo = 0.0
-                link_fornecedor = _row.get("link_fornecedor") or ""
-                fornecedor = _row.get("fornecedor") or ""
-                sku_fornecedor = _row.get("sku_fornecedor") or ""
+        # Preço: sugerido em QUALQUER match. O aceite não é item a item — é o CSV.
+        preco_un = 0.0 if _sem_lastro else (float(match.get("banco_preco") or 0) if tem_match else 0.0)
+
+        # Custo/origem: SÓ em 'alta'. Em media/baixa não herda — na dúvida, em branco,
+        # pra não arrastar o custo de um item parecido mas diferente.
+        preco_custo, link_fornecedor, fornecedor, sku_fornecedor = 0.0, "", "", ""
+        if confianca == "alta" and _row and not _sem_lastro:
+            try:
+                preco_custo = float(_row.get("preco_custo") or 0)
+            except (TypeError, ValueError):
+                preco_custo = 0.0
+            link_fornecedor = _row.get("link_fornecedor") or ""
+            fornecedor = _row.get("fornecedor") or ""
+            sku_fornecedor = _row.get("sku_fornecedor") or ""
+
+        if not tem_match:
+            obs_item = "SEM PREÇO"
+        elif _sem_lastro:
+            obs_item = "⚠ SEM LASTRO — recotar"
+        elif confianca == "alta":
+            _ref = match.get("banco_proposta", "")
+            obs_item = f"✓ ref {_ref}" if _ref else "✓"
+        else:
+            obs_item = "⚠ CONFIRA"
+
+        # ── FICHA DE PROCEDÊNCIA ─────────────────────────────────────────────
+        # Tudo que o operador precisa pra bater o que o cliente pediu contra o que
+        # o banco propõe, sem sair da tela.
+        ficha = None
+        if tem_match:
+            ficha = {
+                "descricao":      banco_desc,
+                "preco_un":       float(match.get("banco_preco") or 0),
+                "preco_custo":    float((_row or {}).get("preco_custo") or 0),
+                "fornecedor":     (_row or {}).get("fornecedor") or "",
+                "link_fornecedor": (_row or {}).get("link_fornecedor") or "",
+                "sku_fornecedor": (_row or {}).get("sku_fornecedor") or "",
+                "cliente":        (_row or {}).get("cliente") or "",
+                "cnpj":           (_row or {}).get("cnpj") or "",
+                "data_ref":       str((_row or {}).get("data_ref") or ""),
+                "proposta_tiny":  match.get("banco_proposta") or "",
+                "confianca":      confianca,
+                "defesa":         _defesa_do_match(match, _row),
+                "herdou_custo":   confianca == "alta" and not _sem_lastro,
+                # Sem lastro: a ficha mostra tudo, mas nenhum valor entrou no item.
+                "sem_lastro":     _sem_lastro,
+                "falta_lastro":   _falta_lastro(_row) if _sem_lastro else "",
+                # É o mesmo item, e por quê — o que o operador hoje faz na mão,
+                # colando as duas descrições numa aba de chat e perguntando.
+                "veredito":       match.get("veredito") or "",
+                "diferencas":     [d for d in (match.get("diferencas") or []) if str(d).strip()],
+                "falta":          (match.get("falta") or "") or "",
+                # Procedência do cadastro: quando, por quem, pra quem.
+                "criado_em":      str((_row or {}).get("criado_em") or ""),
+                "usuario_nome":   (_row or {}).get("usuario_nome") or "",
+                "usuario_email":  (_row or {}).get("usuario_email") or "",
+            }
 
         itens_com_preco.append({
             "descricao_original": desc_original,
@@ -612,15 +747,38 @@ Lembre: fabricante diferente = null. Categoria diferente = null. Seja rigoroso."
             "sku_fornecedor": sku_fornecedor,
             "obs": obs_item,
             "confianca_match": confianca,
-            "banco_candidato": match.get("banco_descricao") if confianca == "baixa" else None,
+            "banco": ficha,
+            # Mantidos pra não quebrar tela/consumidor antigo enquanto o front migra
+            "banco_candidato": banco_desc if confianca == "baixa" else None,
             "banco_candidato_preco": float(match.get("banco_preco") or 0) if confianca == "baixa" else None,
             "motivo_incerto": match.get("motivo", "") if confianca == "baixa" else None,
             "tem_preco": preco_un > 0,
-            "sugerir_pn": _validar_sugerir_pn(item.get("sugerir_pn", False), desc),
-            "alerta_produto": _alerta_do_candidato(match.get("banco_descricao"), todos_candidatos),
+            "pede_atencao": _pede_atencao(desc, item.get("specs_complementares")),
+            "alerta_produto": _alerta_do_candidato(banco_desc, todos_candidatos),
         })
 
     return itens_com_preco
+
+
+def _defesa_do_match(match: dict, row: dict) -> str:
+    """Por que o sistema casou este item — em português, pro operador julgar.
+
+    Serve a dois fins: o operador entende o raciocínio e decide mais rápido; e ele
+    aprende como o sistema lê, o que melhora a forma dele lançar descrição.
+    """
+    origem = match.get("_memoria")
+    if origem == "cliente":
+        return ("Você já validou esta mesma descrição para este cliente em uma proposta "
+                "anterior — e ela virou este produto.")
+    if origem == "global":
+        return ("Esta mesma descrição já foi validada antes (por outro cliente) e virou "
+                "este produto.")
+    motivo = (match.get("motivo") or "").strip()
+    conf = match.get("confianca")
+    base = {"alta":  "A IA considerou o mesmo produto.",
+            "media": "A IA achou parecido, mas não idêntico.",
+            "baixa": "A IA ficou em dúvida — confira antes de usar."}.get(conf, "")
+    return (base + (" " + motivo if motivo else "")).strip()
 
 
 def _parsear_excel_estruturado(data: bytes):
@@ -739,7 +897,7 @@ async def extrair_email(
     arquivos: list[UploadFile] = File(default=[]),   # múltiplos arquivos (email + Excels + PDFs)
     imagens: list[UploadFile] = File(default=[]),
     numero_proposta: str = Form(...),
-    preservar_cliente: str = Form("0"),
+    so_rastreavel: str = Form("0"),
     token_form: str = Form(None),
     request: Request = None,
     usuario: str = Depends(verificar_token)
@@ -832,7 +990,16 @@ async def extrair_email(
                 _f.write(dados)
             _msg = extract_msg.openMsg("/tmp/ext_upload.msg")
             corpo = (_msg.body or "").strip()
-            contexto_email += f"Assunto: {_msg.subject}\n\nCorpo:\n{corpo}\n\n"
+            # O remetente identifica de quem é a demanda (o domínio é o sinal mais
+            # confiável quando há várias empresas no material) e a assinatura dele é
+            # onde o CNPJ costuma estar. O /casar-po já mandava isso; aqui era
+            # descartado — e era uma das causas de proposta sem CNPJ.
+            _de = (getattr(_msg, "sender", "") or "").strip()
+            _para = (getattr(_msg, "to", "") or "").strip()
+            contexto_email += (f"Assunto: {_msg.subject}\n"
+                               f"De: {_de}\n"
+                               + (f"Para: {_para}\n" if _para else "")
+                               + f"\nCorpo:\n{corpo}\n\n")
 
             for att in _msg.attachments:
                 afn = (att.longFilename or att.shortFilename or "").lower()
@@ -845,9 +1012,15 @@ async def extrair_email(
                         # Enriquecer com contexto do email (CNPJ pode estar no body)
                         for _p in _props_det:
                             if not _p.get("cnpj"):
-                                _m = re.search(r'(\d{2}\.?\d{3}\.?\d{3}[/]?\d{4}-?\d{2})', contexto_email)
-                                if _m and len(re.sub(r'\D', '', _m.group(1))) == 14:
-                                    _p["cnpj"] = _m.group(1)
+                                # Pegar o PRIMEIRO CNPJ do texto era errado: o corpo quase
+                                # sempre traz dois (o do cliente e o nosso, da assinatura ou
+                                # do encadeamento). Percorre todos e fica com o primeiro que
+                                # seja válido E não seja da Kist.
+                                for _cand in re.findall(r'(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})', contexto_email):
+                                    _ok = _cnpj_do_cliente(_cand)
+                                    if _ok:
+                                        _p["cnpj"] = _ok
+                                        break
                             if not _p.get("cliente") and contexto_email:
                                 _mc = re.search(r'(?:empresa|cliente|razão social)[:\s]+([^\n\|]{3,60})', contexto_email, re.I)
                                 if _mc:
@@ -871,9 +1044,13 @@ async def extrair_email(
             if _props_det:
                 for _p in _props_det:
                     if not _p.get("cnpj") and contexto_email:
-                        _m = re.search(r'(\d{2}\.?\d{3}\.?\d{3}[/]?\d{4}-?\d{2})', contexto_email)
-                        if _m and len(re.sub(r'\D', '', _m.group(1))) == 14:
-                            _p["cnpj"] = _m.group(1)
+                        # Mesmo bug do caminho do .msg: pegar o PRIMEIRO CNPJ do corpo
+                        # pega o da Kist quando ele vem antes (assinatura, encadeamento).
+                        for _cand in re.findall(r'(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})', contexto_email):
+                            _ok = _cnpj_do_cliente(_cand)
+                            if _ok:
+                                _p["cnpj"] = _ok
+                                break
                 propostas_raw.extend(_props_det)
             else:
                 xl = _extrair_excel_bytes(dados, fname)
@@ -975,10 +1152,23 @@ async def extrair_email(
     t0 = time.time()
     resultado_propostas = []
     avisos_extracao = []
+
+    # Tudo que a IA viu: corpo do e-mail, anexos convertidos e o texto colado.
+    _fonte = "\n\n".join(x for x in [
+        contexto_email.strip(),
+        "\n\n".join(f"--- {n} ---\n{c}" for n, c in conteudo_files),
+        (texto or "").strip(),
+    ] if x).strip()
     for idx_p, prop_raw in enumerate(propostas_raw):
         num_prop = str(base_num + idx_p) if base_num is not None else (
             numero_proposta if idx_p == 0 else f"{numero_proposta}-{idx_p + 1}")
         prop_raw["proposta"] = num_prop
+        # A fonte que a IA leu viaja junto: é a spec ORIGINAL do cliente, e é contra
+        # ela que o /conferir compara. Sem isso, comparamos contra o nosso resumo.
+        prop_raw["fonte_texto"] = _fonte[:60000]
+        # Conferir o CNPJ ANTES de ele viajar. Inválido ou nosso vira None em vez de
+        # seguir até o CSV e até o banco de preços.
+        prop_raw["cnpj"] = _cnpj_do_cliente(prop_raw.get("cnpj"))
 
         itens_brutos = prop_raw.get("itens", []) or []
         if not itens_brutos:
@@ -987,12 +1177,12 @@ async def extrair_email(
 
         # Matching com o banco de preços
         sb = get_supabase()
-        _preservar = str(preservar_cliente).strip().lower() in ("1", "true", "on", "yes", "sim")
+        _so_rastreavel = str(so_rastreavel).strip().lower() in ("1", "true", "on", "yes", "sim")
         try:
             itens_enriquecidos = _fazer_matching(itens_brutos, claude, sb,
-                                                 preservar_cliente=_preservar,
                                                  cliente=prop_raw.get("cliente") or "",
-                                                 avisos=avisos_extracao)
+                                                 avisos=avisos_extracao,
+                                                 so_rastreavel=_so_rastreavel)
         except Exception as e:
             # Fallback com a FORMA correta: descrição do cliente, tudo em branco.
             # (Devolver itens_brutos aqui produzia item vazio na tela.)
@@ -1123,6 +1313,14 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
     sb = get_supabase()
     proposta = payload.get("proposta", "")
     cliente  = payload.get("cliente", "")
+    # O CNPJ já vinha no payload (o front manda a proposta inteira) e ninguém lia.
+    # É ele que diz PRA QUEM o preço foi oferecido — matriz e filial têm o mesmo
+    # nome. Grava a cada CSV, como o custo: a coluna enche sozinha com o uso.
+    cnpj     = _cnpj_do_cliente(payload.get("cnpj"))
+    # Quem gravou este preço. A ficha mostra "por quem foi inserido" — sem isto,
+    # o operador vê um preço órfão e não sabe a quem perguntar.
+    quem     = {"usuario_email": usuario,
+                "usuario_nome": APELIDOS.get(usuario, "") or (usuario or "").split("@")[0]}
     itens    = payload.get("itens", [])
     hoje     = date.today().isoformat()
     atualizados, inseridos, ignorados = 0, 0, 0
@@ -1173,6 +1371,7 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
                     "preco_un": float(preco), "data_ref": hoje,
                     "proposta_tiny": proposta, "cliente": cliente,
                     **origem,
+                    **({"cnpj": cnpj} if cnpj else {}), **quem,
                 }).eq("id", res.data[0]["id"]).execute()
                 atualizados += 1
                 _pid = res.data[0]["id"]
@@ -1184,6 +1383,7 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
                         "proposta_tiny": proposta, "cliente": cliente,
                         "obs": "inserido automaticamente via app",
                         **origem,
+                        **({"cnpj": cnpj} if cnpj else {}), **quem,
                     }).execute()
                     inseridos += 1
                     _pid = ((_ins.data or [{}])[0] or {}).get("id")
@@ -1198,6 +1398,7 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
                                 "preco_un": float(preco), "data_ref": hoje,
                                 "proposta_tiny": proposta, "cliente": cliente,
                                 **origem,
+                                **({"cnpj": cnpj} if cnpj else {}), **quem,
                             }).eq("id", r2.data[0]["id"]).execute()
                             atualizados += 1
                             _pid = r2.data[0]["id"]
@@ -1217,6 +1418,29 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
     memoria = _aprender_memoria(sb, aprender, cliente) if aprender else {}
     return {"atualizados": atualizados, "inseridos": inseridos,
             "ignorados": ignorados, "memoria": memoria}
+
+
+KIST_CNPJ_RAIZ = "10573732"   # raiz do CNPJ da Kist — pega qualquer filial nossa
+
+
+def _cnpj_do_cliente(bruto) -> Optional[str]:
+    """Devolve o CNPJ do CLIENTE formatado, ou None. Nunca propaga lixo.
+
+    Descarta dois casos:
+      1. Dígito verificador inválido — a IA alucinou ou leu errado. CNPJ errado é PIOR que
+         CNPJ ausente: ele amarra o preço à empresa errada com cara de dado bom.
+      2. Qualquer CNPJ da própria Kist (raiz 10573732). O material do cliente quase sempre
+         traz os dois (pedido de compra tem emissor e fornecedor); o nosso é o fornecedor.
+
+    Antes da v3.16 o /extrair aceitava o que a IA devolvesse, sem conferir. A validação só
+    existia lá no /gerar-csv, no criar_oc e no atualizar_oc.
+    """
+    dig = re.sub(r"\D", "", str(bruto or ""))
+    if not dig or not _cnpj_valido(dig):
+        return None
+    if dig.startswith(KIST_CNPJ_RAIZ):
+        return None
+    return _cnpj_formatado(dig)
 
 
 def _cnpj_valido(cnpj: str) -> bool:
@@ -1362,51 +1586,136 @@ async def gerar_csv(payload: dict, usuario: str = Depends(verificar_token)):
         headers={"Content-Disposition": f"attachment; filename={nome}"})
 
 
-@app.post("/sugerir-pn")
-async def sugerir_pn(payload: dict, usuario: str = Depends(verificar_token)):
-    descricao = payload.get("descricao", "")
-    if not descricao:
-        raise HTTPException(400, "Descrição obrigatória")
+SYSTEM_CONFERIR = """Você é o consultor técnico da Kist Soluções em Telecom e Energia — materiais
+elétricos, telecom, infraestrutura, áudio/vídeo e TI.
 
-    sb = get_supabase()
-    historico = []
-    try:
-        palavras = [p for p in descricao.upper().split() if len(p) > 4][:3]
-        query = sb.table("produtos").select("descricao,preco_un,proposta_tiny,cliente")
-        for p in palavras:
-            query = query.ilike("descricao", f"%{p}%")
-        res = query.order("data_ref", desc=True).limit(5).execute()
-        historico = res.data or []
-    except Exception:
-        pass
+Um operador está montando uma proposta comercial e travou num item: o código não resolve, a
+descrição do cliente é vaga, ou o que ele achou no fornecedor não parece bater com o pedido.
+Ele te chama exatamente como chamaria um colega que conhece part numbers de cor.
 
-    historico_txt = ""
-    if historico:
-        historico_txt = "\n\nHistórico similar no banco:\n"
-        for h in historico:
-            historico_txt += f"- {h.get('descricao','')} | R$ {h.get('preco_un',0):.2f}\n"
+Tipos de pergunta que ele faz (são reais):
+- "SHURE SB900A e SB900B é a mesma coisa?" → equivalência entre PNs
+- "os PNs Neutrik NA3FM e NC3FXX são os mesmos?" → equivalência entre famílias
+- "qual a diferença entre SDSQXAA-128G-AN6MA e SDSQXAA-128G-GN6MA?" → o sufixo muda o quê
+- "tem diferença entre SWATEMSCN2/2ME1/4K e /1ME1/4K ou é erro de digitação?" → variante ou typo
+- "que item é esse: 88037BNM?" / "estilete 481863?" → identificação por código
+- "essa placa é de qual item Samsung? BN94-18201Q" → peça → produto pai
+- "qual a descrição comercial do PN 02.07.056 da Resideo?" → PN → nome comercial
+- "p10 Santo Ângelo ST ninja, qual o nome comercial?" → apelido de mercado → nome real
+- "qual PN do switch mais em conta de 48p giga e 4 SFP?" → spec → PN sugerido
 
-    prompt = f"""Especialista em TI e infraestrutura. Cliente solicitou:
+COMO RESPONDER:
+- Responda a pergunta primeiro, em uma ou duas frases. O operador está no meio do trabalho.
+- Depois o porquê, curto. Ele decide, você informa.
+- Quando comparar dois itens, seja CONCRETO no que difere: "o AN6MA é A2 (app performance),
+  o GN6MA é A1" — não "são versões diferentes".
+- Quando for erro de digitação, diga: ele quer saber se pede 1 ou 2 do item.
 
-{descricao}
-{historico_txt}
+BUSQUE NA WEB quando o código for específico (PN de fabricante, SKU, código de peça) ou quando
+você não tiver certeza. Datasheet do fabricante e distribuidor oficial valem mais que
+marketplace. É melhor buscar e confirmar do que responder de memória e errar um PN.
 
-Sugira 3 opções de PN/modelos específicos. JSON puro sem markdown:
-{{"sugestoes": [{{"fabricante": "Dell", "modelo": "OptiPlex 7020 SFF", "pn": "7020-SFF", "specs": "Core i5-14ª, 16GB DDR5, 512GB NVMe", "preco_estimado": 4500.00, "atende_fabricante": true}}]}}"""
+QUANDO NÃO DER PRA RESPONDER:
+- Descrição genérica demais pra identificar item ("cabo 2x1,5mm" existe de 50 fabricantes):
+  diga isso, e diga EXATAMENTE qual informação resolveria. Ele vai perguntar ao cliente.
+- Não achou o código em lugar nenhum: diga que não achou. NÃO invente PN, fabricante ou spec.
+  PN errado faz a Kist comprar errado, entregar errado e o cliente devolver — o silêncio custa
+  um e-mail, o chute custa um RMA.
+- Nunca preencha lacuna com o que "provavelmente é".
+
+Português do Brasil, direto, sem preâmbulo. Nada de "ótima pergunta" ou "claro!". Vai direto.
+"""
+
+
+@app.post("/conferir")
+async def conferir(payload: dict, usuario: str = Depends(verificar_token)):
+    """Consulta técnica sobre UM item, com o contexto já carregado.
+
+    Substitui o /sugerir-pn, que nasceu com a intenção certa (usar IA pra resolver
+    item que não está claro) e morreu por dois motivos: um veto de custo que hoje
+    não existe mais (~$1,37/mês o sistema inteiro), e uma lista de commodities que
+    vetava por substring — 'SUPORTE' cegava o botão justamente no item que voltou
+    em RMA.
+
+    O operador já faz isto hoje, numa aba de chat, colando os textos na mão:
+      "SHURE SB900A e SB900B é a mesma coisa?"
+      "qual a diferença entre SDSQXAA-128G-AN6MA e GN6MA?"
+      "que item é esse: 88037BNM?"
+      "qual a descrição comercial do PN 02.07.056 da Resideo?"
+      "qual PN do switch mais em conta de 48p giga e 4 SFP?"
+    A diferença é que aqui o item já vem carregado, a resposta volta clicável, e a
+    busca web é do sistema — não da aba dele.
+
+    Fica FORA do caminho crítico de propósito: o matching precisa ser determinístico
+    (temperature=0) e rápido; busca web é nem uma coisa nem outra. Aqui o operador
+    pediu e está esperando — 3s é o que ele já gasta hoje.
+    """
+    pergunta = (payload.get("pergunta") or "").strip()
+    if not pergunta:
+        raise HTTPException(400, "Pergunta obrigatória")
+
+    item     = payload.get("item") or {}
+    fonte    = (payload.get("fonte_texto") or "").strip()
+    historico_msgs = payload.get("historico") or []
+
+    # ── Contexto: tudo que o sistema sabe deste item ────────────────────────
+    ctx = ["### O QUE O CLIENTE PEDIU"]
+    ctx.append(f"Descrição: {item.get('descricao_original') or '(vazio)'}")
+    _sp = (item.get("specs_complementares") or "").strip()
+    ctx.append(f"Specs complementares: {_sp}" if _sp else "Specs complementares: (o cliente não informou)")
+    if item.get("quantidade"):
+        ctx.append(f"Quantidade: {item.get('quantidade')} {item.get('unidade') or 'UN'}")
+
+    ctx.append("\n### O QUE A KIST ESTÁ OFERTANDO")
+    _df = (item.get("descricao_final") or "").strip()
+    ctx.append(f"Descrição preenchida: {_df or '(ainda não preenchida)'}")
+    for rot, campo in (("Fornecedor", "fornecedor"), ("Link/origem", "link_fornecedor"),
+                       ("SKU do fornecedor", "sku_fornecedor")):
+        if (item.get(campo) or "").strip():
+            ctx.append(f"{rot}: {item[campo]}")
+
+    banco = item.get("banco") or {}
+    if banco.get("descricao"):
+        ctx.append("\n### O QUE O BANCO DE PREÇOS PROPÔS")
+        ctx.append(f"Produto: {banco['descricao']}")
+        if banco.get("fornecedor"):
+            ctx.append(f"Fornecedor: {banco['fornecedor']}")
+
+    if fonte:
+        # A spec completa costuma estar no e-mail/PDF, não nos campos destilados.
+        ctx.append("\n### E-MAIL / ANEXOS ORIGINAIS DO CLIENTE (fonte da cotação)")
+        ctx.append(fonte[:14000])
+
+    contexto = "\n".join(ctx)
+
+    msgs = []
+    for m in historico_msgs[-6:]:
+        papel = "assistant" if m.get("role") == "assistant" else "user"
+        if (m.get("content") or "").strip():
+            msgs.append({"role": papel, "content": m["content"][:4000]})
+    msgs.append({"role": "user", "content": f"{contexto}\n\n### PERGUNTA\n{pergunta}"})
 
     claude = get_claude()
-    resp = claude.messages.create(
-        model="claude-haiku-4-5-20251001", max_tokens=1500,
-        messages=[{"role": "user", "content": prompt}], timeout=20.0
-    )
-    raw = resp.content[0].text.strip()
-    raw = re.sub(r'^```(?:json)?\s*', '', raw)
-    raw = re.sub(r'\s*```$', '', raw.strip())
-    import json as _json_pn
     try:
-        return _json_pn.loads(raw)
+        resp = claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1500,
+            system=SYSTEM_CONFERIR,
+            messages=msgs,
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}],
+            timeout=90.0,
+        )
     except Exception as e:
-        raise HTTPException(500, f"Erro ao parsear sugestões: {str(e)} | {raw[:200]}")
+        raise HTTPException(502, f"Não consegui consultar agora: {type(e).__name__}")
+
+    # A resposta mistura texto e blocos de busca — junta só o texto.
+    texto = "\n".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+    buscas = [b.input.get("query", "") for b in resp.content
+              if getattr(b, "type", "") == "server_tool_use" and getattr(b, "input", None)]
+    if not texto:
+        texto = "Não consegui formular uma resposta. Tenta reformular a pergunta."
+
+    return {"resposta": texto, "buscas": [q for q in buscas if q]}
 
 
 # ── PROPOSTAS ─────────────────────────────────────────────────────────────────
@@ -1484,6 +1793,10 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
         "frete_recebimento":    float(payload.get("frete") or payload.get("frete_recebimento") or 0),
         "prazo_entrega":        payload.get("prazo_entrega") or None,
         "status":               status,
+        # Texto que a IA leu na extração. Só grava quando vier — reabrir uma proposta
+        # e salvar de novo não pode apagar a fonte com string vazia.
+        **({"fonte_texto": str(payload["fonte_texto"])[:60000]}
+           if (payload.get("fonte_texto") or "").strip() else {}),
     }
 
     # Upsert: buscar pelo numero_proposta
