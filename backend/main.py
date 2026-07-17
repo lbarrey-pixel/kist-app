@@ -12,7 +12,13 @@ import extract_msg
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 
-app = FastAPI(title="Kist Cotações API")
+# Versão do backend. O núcleo do Analista guarda a versão que ele descreve; se as
+# duas divergirem, o agente é avisado de que o conhecimento dele está atrasado.
+# Conhecimento velho não avisa que é velho — ele responde com a mesma confiança
+# e erra. Este número é a única coisa que impede isso.
+VERSAO_BACKEND = "3.20"
+
+app = FastAPI(title="Kist Cotações API", version=VERSAO_BACKEND)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -2967,6 +2973,61 @@ REGRAS:
 """
 
 
+def _estado_real(sb) -> str:
+    """Os fatos, medidos AGORA. Não vem do núcleo escrito à mão — vem do banco.
+
+    Por que isto existe: o núcleo é narrativa (o que o sistema SABE FAZER) e
+    envelhece só quando há deploy. Já o estado dos dados muda a cada proposta, e
+    era escrito à mão dentro do núcleo — ou seja, nascia velho. O erro que isso
+    causa é o mais caro do agente: responder "já suportado, o campo existe"
+    quando o campo está vazio em 95% dos casos.
+
+    Uma query, ~10ms, custo zero. Nunca mais desatualiza.
+    """
+    try:
+        r = sb.rpc("estado_real_kist", {}).execute()
+        linhas = r.data or []
+    except Exception:
+        return ("\n\n=== ESTADO REAL DOS DADOS ===\n"
+                "(não consegui medir agora — NÃO afirme nada sobre volume ou preenchimento "
+                "de campos nesta conversa; pergunte ao operador.)")
+    if not linhas:
+        return ""
+    out = ["\n\n=== ESTADO REAL DOS DADOS (medido agora, não é estimativa) ===",
+           "Capacidade é o que o sistema SABE FAZER. Isto é o que ele TEM. São coisas",
+           "diferentes: o campo pode existir e estar vazio em 95% dos casos.", ""]
+    for l in linhas:
+        pct = f" ({l['pct']})" if l.get("pct") else ""
+        out.append(f"- {l['item']}: {l['valor']}{pct}")
+    return "\n".join(out)
+
+
+def _inventario_tecnico() -> str:
+    """Endpoints e tabelas lidos do PRÓPRIO CÓDIGO, por AST. Sem IA, sem alucinação.
+
+    O agente costumava saber isso por uma lista escrita à mão, que ninguém atualizava.
+    Aqui o backend lê a si mesmo: o que está no arquivo é o que ele reporta.
+    """
+    import ast as _ast
+    try:
+        with open(__file__, encoding="utf-8") as f:
+            txt = f.read()
+        eps = []
+        for no in _ast.walk(_ast.parse(txt)):
+            if isinstance(no, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                for d in no.decorator_list:
+                    if (isinstance(d, _ast.Call) and isinstance(d.func, _ast.Attribute)
+                            and isinstance(d.func.value, _ast.Name) and d.func.value.id == "app"
+                            and d.args and isinstance(d.args[0], _ast.Constant)):
+                        eps.append(f"{d.func.attr.upper()} {d.args[0].value}")
+        if not eps:
+            return ""
+        return ("\n\n=== ENDPOINTS QUE EXISTEM DE VERDADE (lidos do código agora) ===\n"
+                + "\n".join("- " + e for e in sorted(set(eps), key=lambda x: x.split(" ", 1)[1])))
+    except Exception:
+        return ""
+
+
 def _conhecimento_agente(sb) -> str:
     """Monta o conhecimento do agente em 3 camadas: núcleo + entregas + abertos."""
     nucleo = ""
@@ -2997,7 +3058,21 @@ def _conhecimento_agente(sb) -> str:
     except Exception:
         pass
 
-    partes = ["=== O QUE O SISTEMA JÁ FAZ (núcleo) ===", nucleo or "(indisponível)"]
+    # A narrativa descreve uma versão. Se o código já andou, o agente precisa saber
+    # que pode estar falando de um sistema que não existe mais.
+    aviso_versao = ""
+    m_v = re.search(r"Vers[ãa]o do n[úu]cleo:\s*v?([\d.]+)", nucleo or "")
+    if m_v and m_v.group(1) != VERSAO_BACKEND:
+        aviso_versao = (
+            f"\n\n!!! ATENÇÃO — SEU CONHECIMENTO PODE ESTAR ATRASADO !!!\n"
+            f"A narrativa abaixo descreve a v{m_v.group(1)}. O código em produção está na "
+            f"v{VERSAO_BACKEND}. Houve mudanças que ninguém escreveu aqui.\n"
+            f"REGRA: não afirme que algo NÃO existe. Se o operador descrever um comportamento "
+            f"que a narrativa não menciona, ACREDITE NELE e pergunte — não corrija. Confira a "
+            f"lista de endpoints reais abaixo antes de dizer que uma capacidade não existe.")
+
+    partes = ["=== O QUE O SISTEMA JÁ FAZ (núcleo) ===", nucleo or "(indisponível)", aviso_versao,
+              _inventario_tecnico(), _estado_real(sb)]
     if entregue:
         partes += ["", "=== ENTREGAS RECENTES (já no ar — considere suportado) ===", "\n".join(entregue)]
     if abertos:
