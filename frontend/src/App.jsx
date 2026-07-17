@@ -39,6 +39,62 @@ const isLink = (s) => typeof s === "string" && /^https?:\/\//i.test(s.trim());
 const CANAL_LBL = { link: "link", whatsapp: "WhatsApp", email: "e-mail",
                     telefone: "telefone", loja: "loja", outro: "" };
 
+// ── Leitor de contato: o operador cola, o sistema separa ────────────────────
+// Os operadores SEMPRE digitaram tudo num campo só: "WPP DATALINK 115848",
+// "volt - wpp", "e-mail leyard", e — o campeão — a URL inteira do Mercado Livre
+// dentro do campo de NOME. Isso não é desleixo, é o jeito natural: ele tem uma
+// coisa na mão e um campo na frente.
+// Em vez de exigir que ele separe, o sistema lê e separa. Ele cola no CONTATO;
+// QUEM e POR ONDE se preenchem sozinhos.
+export function lerContato(txt) {
+  const t = String(txt || "").trim();
+  if (!t) return null;
+
+  // [1] LINK — inclusive sem http:// ("tumelero.com.br/produto")
+  const pareceUrl = /^https?:\/\//i.test(t) || /^www\./i.test(t)
+    || /^[a-z0-9-]+(\.[a-z0-9-]+)*\.(com|com\.br|net|net\.br|org|org\.br|io|shop|store)(\/|\?|$)/i.test(t);
+  if (pareceUrl) {
+    const url = /^https?:\/\//i.test(t) ? t : "https://" + t.replace(/^www\./i, "www.");
+    let quem = "";
+    try {
+      // "www.mercadolivre.com.br" -> "mercadolivre". É o domínio que identifica
+      // o fornecedor; o resto do host é sufixo, não nome.
+      quem = new URL(url).hostname.replace(/^www\./i, "").split(".")[0];
+    } catch { quem = ""; }
+    return { canal: "link", contato: url, quem };
+  }
+
+  // [2] E-MAIL — o nome é o que sobra, ou o domínio do e-mail
+  const em = t.match(/[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+/);
+  if (em) {
+    const resto = t.replace(em[0], "").replace(/e-?mail/ig, "").replace(/[-–·|]/g, " ").trim();
+    const dom = em[0].split("@")[1].split(".")[0];
+    return { canal: "email", contato: em[0], quem: resto || dom };
+  }
+
+  // [3] TELEFONE / WHATSAPP — 10 a 13 dígitos é número BR (com ou sem DDI)
+  const dig = t.replace(/\D/g, "");
+  if (dig.length >= 10 && dig.length <= 13) {
+    // O que não é número nem rótulo de canal é o nome: "48 99999-0000 DigitalSAT"
+    const quem = t.replace(/[\d]/g, " ")
+      .replace(/\b(wpp|whats\w*|zap|tel\.?|telefone|fone|cel\.?|celular)\b/ig, " ")
+      .replace(/[()+\-–·|/]/g, " ").replace(/\s+/g, " ").trim();
+    const ehWpp = /\b(wpp|whats|zap)\b/i.test(t) || dig.length === 11 || dig.length === 13;
+    return { canal: ehWpp ? "whatsapp" : "telefone", contato: t.trim(), quem };
+  }
+
+  // [4] Texto solto com rótulo de canal grudado: "TRON WPP", "e-mail leyard"
+  const mCanal = t.match(/\b(wpp|whats\w*|zap|e-?mail|telefone|fone)\b/i);
+  if (mCanal) {
+    const quem = t.replace(mCanal[0], "").replace(/[-–·|]/g, " ").replace(/\s+/g, " ").trim();
+    const c = mCanal[0].toLowerCase();
+    return { canal: /wpp|whats|zap/.test(c) ? "whatsapp" : /mail/.test(c) ? "email" : "telefone",
+             contato: "", quem };
+  }
+
+  return null;   // não reconheceu — não chuta, deixa o operador decidir
+}
+
 // ── Contato acionável ───────────────────────────────────────────────────────
 // O contato só vale se levar a algum lugar. Nome + número numa tela é lembrete;
 // link que abre a conversa com o pedido escrito é recotação em um clique.
@@ -243,6 +299,19 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto }) {
   const confianca = item.confianca_match || "nenhuma";
   const c = CONF[confianca];
   const semPreco = !(item.preco_un > 0);
+  // Lê o que ele colou e preenche o que está vazio. NUNCA sobrescreve o que o
+  // operador digitou — ele é a hierarquia superior, inclusive contra o parser.
+  function aplicarLeitura(idx, txt, it) {
+    const r = lerContato(txt);
+    if (!r) return;
+    if (r.contato && r.contato !== txt.trim()) onChange(idx, "fornecedor_contato", r.contato);
+    if (r.canal && !it.fornecedor_canal) onChange(idx, "fornecedor_canal", r.canal);
+    if (r.quem && !(it.fornecedor || "").trim()) onChange(idx, "fornecedor", r.quem);
+    // Link do produto: se colou uma URL, ela também é o link de compra.
+    if (r.canal === "link" && !(it.link_fornecedor || "").trim())
+      onChange(idx, "link_fornecedor", r.contato);
+  }
+
   const temOrigem = !!(item.link_fornecedor || item.fornecedor || item.fornecedor_contato
                        || item.sku_fornecedor || (item.preco_custo > 0));
 
@@ -551,9 +620,15 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto }) {
                 <span className="eyebrow flex-shrink-0 text-[9px] font-bold uppercase text-faint">Contato</span>
                 <input
                   className="w-full bg-transparent text-[12px] text-ink outline-none placeholder:text-faint"
-                  placeholder={CONTATO_PH[item.fornecedor_canal] || "URL, WhatsApp, e-mail — como se chega nele"}
+                  placeholder={CONTATO_PH[item.fornecedor_canal] || "cole o link, o WhatsApp ou o e-mail"}
                   value={item.fornecedor_contato || ""}
                   onChange={(e) => onChange(index, "fornecedor_contato", e.target.value)}
+                  onBlur={(e) => aplicarLeitura(index, e.target.value, item)}
+                  onPaste={(e) => {
+                    // Colar é o gesto mais comum aqui — resolve na hora, sem esperar o blur.
+                    const txt = e.clipboardData.getData("text");
+                    setTimeout(() => aplicarLeitura(index, txt, item), 0);
+                  }}
                 />
                 {/* Abre o que ele acabou de digitar: confere o dado e já cota. */}
                 {(() => {
@@ -1534,7 +1609,18 @@ export default function App() {
                         placeholder={CONTATO_PH[propostas[semLastro.idx]?.itens?.[it._i]?.fornecedor_canal] || "como se chega nele"}
                         className="w-full bg-transparent text-[12px] text-ink outline-none placeholder:text-faint"
                         value={propostas[semLastro.idx]?.itens?.[it._i]?.fornecedor_contato || ""}
-                        onChange={(e) => atualizarItem(it._i, "fornecedor_contato", e.target.value)} />
+                        onChange={(e) => atualizarItem(it._i, "fornecedor_contato", e.target.value)}
+                        onBlur={(e) => {
+                          const cur = propostas[semLastro.idx]?.itens?.[it._i] || {};
+                          const r = lerContato(e.target.value);
+                          if (!r) return;
+                          if (r.contato && r.contato !== e.target.value.trim())
+                            atualizarItem(it._i, "fornecedor_contato", r.contato);
+                          if (r.canal && !cur.fornecedor_canal) atualizarItem(it._i, "fornecedor_canal", r.canal);
+                          if (r.quem && !(cur.fornecedor || "").trim()) atualizarItem(it._i, "fornecedor", r.quem);
+                          if (r.canal === "link" && !(cur.link_fornecedor || "").trim())
+                            atualizarItem(it._i, "link_fornecedor", r.contato);
+                        }} />
                     </div>
                   </div>
                 </div>
