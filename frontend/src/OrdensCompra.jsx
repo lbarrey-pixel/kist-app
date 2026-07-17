@@ -1,8 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import {
   brl, btnPrimary, btnGhost, Eyebrow, PageHeader, PoChip, CopyPo,
-  IconSearch, IconBoard, IconList, IconDownload, IconX, IconLink, IconTrash, IconCheck, IconCopy, IconGoogle,
-} from "./kist-ui.jsx";
+  IconSearch, IconBoard, IconList, IconDownload, IconX, IconLink, IconTrash, IconCheck, IconCopy, IconGoogle, lerContato } from "./kist-ui.jsx";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
@@ -595,6 +594,64 @@ function OCDetalhe({ oc, token, onClose, onChanged, onDeleted }) {
   function mudarStatus(novo) {
     setStatus(novo); salvarOC({ status: novo });
   }
+  // Só muda a tela, sem gravar — pro parser preencher os campos enquanto ele digita.
+  function setCampoItem(itemId, campos) {
+    setItens((prev) => prev.map((i) => (i.id === itemId ? { ...i, ...campos } : i)));
+  }
+
+  // Mesma regra do backend (_rastreavel_oc): rastrear é saber QUEM e COMO.
+  // Item rastreável com custo alimenta o banco de preços quando a OC sai de rascunho.
+  function rastreavelOC(it) {
+    const link = (it.link_fornecedor || "").trim();
+    const nome = (it.nome_fornecedor || "").trim();
+    const cont = (it.fornecedor_contato || "").trim();
+    return !!(link || (nome && cont)) && Number(it.preco_custo) > 0 && Number(it.preco_venda) > 0;
+  }
+  function faltaOC(it) {
+    const f = [];
+    const nome = (it.nome_fornecedor || "").trim();
+    if (!(it.link_fornecedor || "").trim() && !(nome && (it.fornecedor_contato || "").trim()))
+      f.push(nome ? `falta o contato do ${nome}` : "falta a origem");
+    if (!(Number(it.preco_venda) > 0)) f.push("falta o preço de venda");
+    return f.join(" e ") || "falta lastro";
+  }
+
+  // O contato leva a algum lugar? wa.me com o pedido pronto, mailto, tel: ou a URL.
+  function acionavel(it) {
+    const c = (it.fornecedor_contato || "").trim();
+    const canal = it.fornecedor_canal || "";
+    if (!c) return (it.link_fornecedor || "").match(/^https?:\/\//i) ? it.link_fornecedor : "";
+    if (/^https?:\/\//i.test(c)) return c;
+    if (canal === "whatsapp") {
+      let d = c.replace(/\D/g, "");
+      if (d.length < 8) return "";
+      if (d.length <= 11) d = "55" + d;
+      const txt = ["Olá! Preciso de cotação para:", "", it.descricao || "",
+        Number(it.quantidade_comprar) > 0 ? `Quantidade: ${it.quantidade_comprar} ${it.unidade || "UN"}` : "",
+        (it.sku_fornecedor || "").trim() ? `Referência: ${it.sku_fornecedor}` : "",
+        "", "Obrigado!"].filter(Boolean).join("\n");
+      return `https://wa.me/${d}?text=${encodeURIComponent(txt)}`;
+    }
+    if (canal === "email" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(c))
+      return `mailto:${c}?subject=${encodeURIComponent("Cotação — " + (it.descricao || "").slice(0, 60))}`;
+    if (canal === "telefone") {
+      const d = c.replace(/\D/g, "");
+      return d.length >= 8 ? `tel:+${d.length <= 11 ? "55" + d : d}` : "";
+    }
+    return "";
+  }
+
+  // Ele cola, o sistema separa. Nunca sobrescreve o que ele já digitou.
+  function lerEAplicar(it, txt) {
+    const r = lerContato(txt);
+    if (!r) { salvarItem(it.id, { fornecedor_contato: txt }); return; }
+    const campos = { fornecedor_contato: r.contato || txt };
+    if (r.canal && !it.fornecedor_canal) campos.fornecedor_canal = r.canal;
+    if (r.quem && !(it.nome_fornecedor || "").trim()) campos.nome_fornecedor = r.quem;
+    if (r.canal === "link" && !(it.link_fornecedor || "").trim()) campos.link_fornecedor = r.contato;
+    salvarItem(it.id, campos);
+  }
+
   async function salvarItem(itemId, campos) {
     setItens((prev) => prev.map((i) => (i.id === itemId ? { ...i, ...campos } : i)));
     try {
@@ -907,33 +964,59 @@ function OCDetalhe({ oc, token, onClose, onChanged, onDeleted }) {
                       </div>
                     </div>
 
-                    {/* Linha 3 — origem: fornecedor | SKU | link */}
-                    <div className="mt-3 grid grid-cols-3 gap-3 border-t border-line/60 pt-3 text-[11.5px]">
-                      <div>
-                        <div className="text-faint">Fornecedor</div>
-                        <input defaultValue={it.nome_fornecedor || ""}
-                          onBlur={(e) => salvarItem(it.id, { nome_fornecedor: e.target.value })}
-                          placeholder="—"
-                          className="mt-0.5 w-full rounded bg-paper px-1.5 py-0.5 text-ink outline-none placeholder:text-faint focus:ring-1 focus:ring-kist" />
-                      </div>
-                      <div>
-                        <div className="text-faint">SKU / referência</div>
-                        <input defaultValue={it.sku_fornecedor || ""}
-                          onBlur={(e) => salvarItem(it.id, { sku_fornecedor: e.target.value })}
-                          placeholder="—"
-                          className="mt-0.5 w-full rounded bg-paper px-1.5 py-0.5 font-mono text-ink outline-none placeholder:text-faint focus:ring-1 focus:ring-kist" />
-                      </div>
-                      <div>
-                        <div className="flex items-center justify-between">
-                          <span className="text-faint">Link / origem</span>
-                          {isUrl && <a href={link} target="_blank" rel="noreferrer" className="text-[10.5px] font-medium text-kist hover:underline">abrir ↗</a>}
+                    {/* Linha 3 — origem: QUEM | POR ONDE | CONTATO (mesmo setup da proposta).
+                        A OC é onde o operador está comprando: é AQUI que ele tem o WhatsApp
+                        do fornecedor na mão. Item rastreável alimenta o banco de preços. */}
+                    <div className="mt-3 border-t border-line/60 pt-3 text-[11.5px]">
+                      {!rastreavelOC(it) && it.preco_custo > 0 && (
+                        <div className="mb-2 rounded border border-amber/30 bg-amberbg px-2 py-1 text-[11px] text-amber">
+                          ⚠ Sem lastro — {faltaOC(it)}. Este custo <b>não vai</b> pro banco de preços.
                         </div>
-                        <div className="flex items-center gap-1">
-                          {isUrl && <IconLink size={11} className="shrink-0 text-kist" />}
-                          <input defaultValue={link || ""}
-                            onBlur={(e) => salvarItem(it.id, { link_fornecedor: e.target.value })}
-                            placeholder="URL ou texto"
-                            className="mt-0.5 min-w-0 flex-1 rounded bg-paper px-1.5 py-0.5 text-sub outline-none placeholder:text-faint focus:ring-1 focus:ring-kist" />
+                      )}
+                      <div className="grid grid-cols-4 gap-3">
+                        <div>
+                          <div className="text-faint">Quem</div>
+                          <input value={it.nome_fornecedor || ""}
+                            onChange={(e) => setCampoItem(it.id, { nome_fornecedor: e.target.value })}
+                            onBlur={(e) => salvarItem(it.id, { nome_fornecedor: e.target.value })}
+                            placeholder="DigitalSAT"
+                            className="mt-0.5 w-full rounded bg-paper px-1.5 py-0.5 text-ink outline-none placeholder:text-faint focus:ring-1 focus:ring-kist" />
+                        </div>
+                        <div>
+                          <div className="text-faint">Por onde</div>
+                          <select value={it.fornecedor_canal || ""}
+                            onChange={(e) => { setCampoItem(it.id, { fornecedor_canal: e.target.value });
+                                               salvarItem(it.id, { fornecedor_canal: e.target.value }); }}
+                            className="mt-0.5 w-full cursor-pointer rounded bg-paper px-1.5 py-0.5 text-ink outline-none focus:ring-1 focus:ring-kist">
+                            <option value="">—</option>
+                            <option value="link">link</option>
+                            <option value="whatsapp">WhatsApp</option>
+                            <option value="email">e-mail</option>
+                            <option value="telefone">telefone</option>
+                            <option value="loja">loja</option>
+                            <option value="outro">outro</option>
+                          </select>
+                        </div>
+                        <div>
+                          <div className="flex items-center justify-between">
+                            <span className="text-faint">Contato</span>
+                            {acionavel(it) && <a href={acionavel(it)} target="_blank" rel="noreferrer"
+                              className="text-[10.5px] font-medium text-kist hover:underline">abrir ↗</a>}
+                          </div>
+                          <input value={it.fornecedor_contato || ""}
+                            onChange={(e) => setCampoItem(it.id, { fornecedor_contato: e.target.value })}
+                            onBlur={(e) => lerEAplicar(it, e.target.value)}
+                            onPaste={(e) => { const t = e.clipboardData.getData("text");
+                                              setTimeout(() => lerEAplicar(it, t), 0); }}
+                            placeholder="cole o link, o WhatsApp ou o e-mail"
+                            className="mt-0.5 w-full rounded bg-paper px-1.5 py-0.5 text-sub outline-none placeholder:text-faint focus:ring-1 focus:ring-kist" />
+                        </div>
+                        <div>
+                          <div className="text-faint">SKU / referência</div>
+                          <input defaultValue={it.sku_fornecedor || ""}
+                            onBlur={(e) => salvarItem(it.id, { sku_fornecedor: e.target.value })}
+                            placeholder="—"
+                            className="mt-0.5 w-full rounded bg-paper px-1.5 py-0.5 font-mono text-ink outline-none placeholder:text-faint focus:ring-1 focus:ring-kist" />
                         </div>
                       </div>
                     </div>

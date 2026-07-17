@@ -8,8 +8,7 @@ import {
   CONF, brl, btnPrimary, btnGhost, Eyebrow, StateLabel, PageHeader,
   CertaintyStrip, Sidebar,
   IconUpload, IconBolt, IconArrow, IconDownload, IconCheck, IconLink, IconX,
-  IconGoogle, IconBell,
-} from "./kist-ui.jsx";
+  IconGoogle, IconBell, lerContato } from "./kist-ui.jsx";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
@@ -38,62 +37,6 @@ const isLink = (s) => typeof s === "string" && /^https?:\/\//i.test(s.trim());
 // improvisa e o dado nasce torto ("WHATSAPP 19/06/2026 C/ ANDRIELI").
 const CANAL_LBL = { link: "link", whatsapp: "WhatsApp", email: "e-mail",
                     telefone: "telefone", loja: "loja", outro: "" };
-
-// ── Leitor de contato: o operador cola, o sistema separa ────────────────────
-// Os operadores SEMPRE digitaram tudo num campo só: "WPP DATALINK 115848",
-// "volt - wpp", "e-mail leyard", e — o campeão — a URL inteira do Mercado Livre
-// dentro do campo de NOME. Isso não é desleixo, é o jeito natural: ele tem uma
-// coisa na mão e um campo na frente.
-// Em vez de exigir que ele separe, o sistema lê e separa. Ele cola no CONTATO;
-// QUEM e POR ONDE se preenchem sozinhos.
-export function lerContato(txt) {
-  const t = String(txt || "").trim();
-  if (!t) return null;
-
-  // [1] LINK — inclusive sem http:// ("tumelero.com.br/produto")
-  const pareceUrl = /^https?:\/\//i.test(t) || /^www\./i.test(t)
-    || /^[a-z0-9-]+(\.[a-z0-9-]+)*\.(com|com\.br|net|net\.br|org|org\.br|io|shop|store)(\/|\?|$)/i.test(t);
-  if (pareceUrl) {
-    const url = /^https?:\/\//i.test(t) ? t : "https://" + t.replace(/^www\./i, "www.");
-    let quem = "";
-    try {
-      // "www.mercadolivre.com.br" -> "mercadolivre". É o domínio que identifica
-      // o fornecedor; o resto do host é sufixo, não nome.
-      quem = new URL(url).hostname.replace(/^www\./i, "").split(".")[0];
-    } catch { quem = ""; }
-    return { canal: "link", contato: url, quem };
-  }
-
-  // [2] E-MAIL — o nome é o que sobra, ou o domínio do e-mail
-  const em = t.match(/[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+/);
-  if (em) {
-    const resto = t.replace(em[0], "").replace(/e-?mail/ig, "").replace(/[-–·|]/g, " ").trim();
-    const dom = em[0].split("@")[1].split(".")[0];
-    return { canal: "email", contato: em[0], quem: resto || dom };
-  }
-
-  // [3] TELEFONE / WHATSAPP — 10 a 13 dígitos é número BR (com ou sem DDI)
-  const dig = t.replace(/\D/g, "");
-  if (dig.length >= 10 && dig.length <= 13) {
-    // O que não é número nem rótulo de canal é o nome: "48 99999-0000 DigitalSAT"
-    const quem = t.replace(/[\d]/g, " ")
-      .replace(/\b(wpp|whats\w*|zap|tel\.?|telefone|fone|cel\.?|celular)\b/ig, " ")
-      .replace(/[()+\-–·|/]/g, " ").replace(/\s+/g, " ").trim();
-    const ehWpp = /\b(wpp|whats|zap)\b/i.test(t) || dig.length === 11 || dig.length === 13;
-    return { canal: ehWpp ? "whatsapp" : "telefone", contato: t.trim(), quem };
-  }
-
-  // [4] Texto solto com rótulo de canal grudado: "TRON WPP", "e-mail leyard"
-  const mCanal = t.match(/\b(wpp|whats\w*|zap|e-?mail|telefone|fone)\b/i);
-  if (mCanal) {
-    const quem = t.replace(mCanal[0], "").replace(/[-–·|]/g, " ").replace(/\s+/g, " ").trim();
-    const c = mCanal[0].toLowerCase();
-    return { canal: /wpp|whats|zap/.test(c) ? "whatsapp" : /mail/.test(c) ? "email" : "telefone",
-             contato: "", quem };
-  }
-
-  return null;   // não reconheceu — não chuta, deixa o operador decidir
-}
 
 // ── Contato acionável ───────────────────────────────────────────────────────
 // O contato só vale se levar a algum lugar. Nome + número numa tela é lembrete;
