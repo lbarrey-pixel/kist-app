@@ -16,7 +16,7 @@ from google.auth.transport import requests as google_requests
 # duas divergirem, o agente é avisado de que o conhecimento dele está atrasado.
 # Conhecimento velho não avisa que é velho — ele responde com a mesma confiança
 # e erra. Este número é a única coisa que impede isso.
-VERSAO_BACKEND = "3.20"
+VERSAO_BACKEND = "3.21"
 
 app = FastAPI(title="Kist Cotações API", version=VERSAO_BACKEND)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -2686,6 +2686,151 @@ async def listar_ocs(
     return ocs
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# A OC ALIMENTA O BANCO DE PREÇOS (v3.21)
+#
+# Por que isto existe: o banco só sabia CUSTO quando o operador digitava na tela de
+# proposta — e ele digita em 37,7% dos itens. A OC sabe em 89,7%, porque ali ele
+# está comprando de verdade: preço, fornecedor, link. Era a melhor fonte de custo
+# do sistema, e estava desconectada.
+#
+# Sem isto, o checkbox de rastreabilidade do Fábio bloqueia 54,4% dos matches e a
+# única saída é ele redigitar tudo à mão, cotação após cotação.
+#
+# GATILHO (definido pelo Leonardo): é por ITEM, não por status da OC.
+#   item rastreável + com preço + a OC saiu de rascunho -> alimenta.
+# Assim 'confirmada', 'parcialmente_comprada', 'comprada' e 'disponivel' entram
+# todas pelo mesmo critério, e item sem lastro se exclui sozinho — inclusive os
+# 15 itens com custo e fornecedor nenhum, que são estimativa, não compra.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _rastreavel_oc(item: dict) -> bool:
+    """Mesma regra da proposta. Atenção: em oc_itens o campo chama `nome_fornecedor`,
+    em produtos chama `fornecedor` — o mesmo dado com dois nomes."""
+    if not item:
+        return False
+    link = (item.get("link_fornecedor") or "").strip()
+    nome = (item.get("nome_fornecedor") or "").strip()
+    cont = (item.get("fornecedor_contato") or "").strip()
+    try:
+        custo = float(item.get("preco_custo") or 0) > 0
+    except (TypeError, ValueError):
+        custo = False
+    try:
+        venda = float(item.get("preco_venda") or 0) > 0
+    except (TypeError, ValueError):
+        venda = False
+    return bool(link or (nome and cont)) and custo and venda
+
+
+def _oc_alimenta_banco(sb, oc_id: int, usuario: str = "") -> dict:
+    """Leva custo e origem dos itens de uma OC pro banco de preços.
+
+    O QUE GRAVA, e o que deliberadamente NÃO grava:
+      produto JÁ EXISTE  -> só custo + origem (fornecedor/canal/contato/link/SKU).
+                            NÃO toca em preco_un nem data_ref: a venda já entrou pelo
+                            CSV da proposta, e dois escritores no mesmo campo criam
+                            ambiguidade sobre quem vence.
+      produto NÃO EXISTE -> insere completo. É item que veio da PO e nunca casou com
+                            o banco; sem isso ele nunca entraria.
+    """
+    try:
+        oc = sb.table("ordens_compra").select("id,status,cliente,cnpj")\
+               .eq("id", oc_id).limit(1).execute()
+    except Exception:
+        return {"erro": "não consegui ler a OC"}
+    if not oc.data:
+        return {"erro": "OC não encontrada"}
+    if (oc.data[0].get("status") or "") == "rascunho":
+        return {"pulou": "OC em rascunho — ainda não é compra"}
+
+    cliente = oc.data[0].get("cliente") or ""
+    cnpj    = _cnpj_do_cliente(oc.data[0].get("cnpj"))
+    quem    = {"usuario_email": usuario or "",
+               "usuario_nome": APELIDOS.get(usuario, "") or (usuario or "").split("@")[0]}
+    hoje    = date.today().isoformat()
+
+    try:
+        itens = sb.table("oc_itens").select("*").eq("oc_id", oc_id).execute().data or []
+    except Exception:
+        return {"erro": "não consegui ler os itens"}
+
+    atualizados, inseridos, sem_lastro = 0, 0, 0
+    for it in itens:
+        desc = (it.get("descricao") or "").strip()
+        if not desc:
+            continue
+        if not _rastreavel_oc(it):
+            sem_lastro += 1
+            continue
+
+        origem = {"preco_custo": float(it.get("preco_custo") or 0)}
+        for campo_oc, campo_prod in (("nome_fornecedor", "fornecedor"),
+                                     ("link_fornecedor", "link_fornecedor"),
+                                     ("fornecedor_canal", "fornecedor_canal"),
+                                     ("fornecedor_contato", "fornecedor_contato"),
+                                     ("sku_fornecedor", "sku_fornecedor")):
+            if (it.get(campo_oc) or "").strip():
+                origem[campo_prod] = it[campo_oc].strip()
+
+        try:
+            res = sb.table("produtos").select("id")\
+                    .ilike("descricao", _ilike_literal(desc)).limit(1).execute()
+            if res and res.data:
+                sb.table("produtos").update({**origem, **quem})\
+                  .eq("id", res.data[0]["id"]).execute()
+                atualizados += 1
+            else:
+                sb.table("produtos").insert({
+                    "descricao": desc, "un": it.get("unidade") or "UN",
+                    "preco_un": float(it.get("preco_venda") or 0), "data_ref": hoje,
+                    "cliente": cliente, "obs": "inserido via ordem de compra",
+                    **origem, **({"cnpj": cnpj} if cnpj else {}), **quem,
+                }).execute()
+                inseridos += 1
+        except Exception as e:
+            # Corrida com o /upsert-precos: alguém inseriu a mesma descrição no meio.
+            if "23505" in str(e) or "duplicate key" in str(e).lower():
+                try:
+                    r2 = sb.table("produtos").select("id")\
+                           .ilike("descricao", _ilike_literal(desc)).limit(1).execute()
+                    if r2.data:
+                        sb.table("produtos").update({**origem, **quem})\
+                          .eq("id", r2.data[0]["id"]).execute()
+                        atualizados += 1
+                except Exception:
+                    pass
+
+    return {"atualizados": atualizados, "inseridos": inseridos,
+            "sem_lastro": sem_lastro, "total": len(itens)}
+
+
+@app.post("/ordens-compra/{oc_id}/alimentar-banco")
+async def oc_alimentar_banco(oc_id: int, usuario: str = Depends(verificar_token)):
+    """Dispara à mão. O caminho normal é automático (ao sair de rascunho ou ao
+    editar item de OC que já saiu)."""
+    return _oc_alimenta_banco(get_supabase(), oc_id, usuario)
+
+
+@app.post("/ordens-compra/alimentar-banco-lote")
+async def oc_alimentar_banco_lote(usuario: str = Depends(verificar_token)):
+    """Backfill: as OCs que já existiam antes desta feature nunca alimentaram nada.
+    São a maior fonte de custo real do sistema. Admin roda uma vez."""
+    if usuario not in ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="Só o admin.")
+    sb = get_supabase()
+    ocs = sb.table("ordens_compra").select("id").neq("status", "rascunho").execute().data or []
+    tot = {"ocs": 0, "atualizados": 0, "inseridos": 0, "sem_lastro": 0}
+    for o in ocs:
+        r = _oc_alimenta_banco(sb, o["id"], usuario)
+        if "erro" in r or "pulou" in r:
+            continue
+        tot["ocs"] += 1
+        for k in ("atualizados", "inseridos", "sem_lastro"):
+            tot[k] += r.get(k, 0)
+    return tot
+
+
 @app.get("/ordens-compra/{oc_id}/itens")
 async def itens_oc(oc_id: int, usuario: str = Depends(verificar_token)):
     """Retorna itens de uma OC"""
@@ -2713,7 +2858,27 @@ async def atualizar_oc(
             campos["cnpj"] = _cnpj_formatado(dig)
     if "uf" in campos and campos["uf"]:
         campos["uf"] = str(campos["uf"]).strip().upper()[:2]
+
+    # Saiu de rascunho? Então virou compra, e o que ela sabe de custo/fornecedor
+    # tem que chegar no banco. Lê o status ANTES pra saber se é transição.
+    _era_rascunho = False
+    if "status" in campos and campos["status"] != "rascunho":
+        try:
+            _ant = sb.table("ordens_compra").select("status").eq("id", oc_id).limit(1).execute()
+            _era_rascunho = bool(_ant.data) and (_ant.data[0].get("status") or "") == "rascunho"
+        except Exception:
+            _era_rascunho = False
+
     sb.table("ordens_compra").update(campos).eq("id", oc_id).execute()
+
+    _banco = None
+    if _era_rascunho:
+        # Falhar aqui não pode derrubar a atualização da OC — o operador mudou o
+        # status e isso já é verdade. Alimentar o banco é consequência, não requisito.
+        try:
+            _banco = _oc_alimenta_banco(sb, oc_id, usuario)
+        except Exception:
+            _banco = {"erro": "não consegui alimentar o banco agora"}
     # o imposto que o operador definir vira o novo padrão (sobrescreve)
     if "imposto_percent" in payload and payload["imposto_percent"] is not None:
         try:
@@ -2723,7 +2888,7 @@ async def atualizar_oc(
             ).execute()
         except Exception:
             pass
-    return {"ok": True}
+    return {"ok": True, **({"banco": _banco} if _banco else {})}
 
 
 @app.delete("/ordens-compra/{oc_id}")
@@ -2753,7 +2918,20 @@ async def atualizar_item_oc(
     if not campos:
         return {"ok": True}
     sb.table("oc_itens").update(campos).eq("id", item_id).execute()
-    return {"ok": True}
+
+    # O operador preenche o custo item a item, DEPOIS da OC sair de rascunho —
+    # é nessa hora que ele está comprando. Se esperássemos só a transição de
+    # status, o custo real nunca chegaria no banco.
+    _banco = None
+    if any(c in campos for c in ("preco_custo", "preco_venda", "nome_fornecedor",
+                                 "link_fornecedor", "fornecedor_canal", "fornecedor_contato")):
+        try:
+            r = sb.table("oc_itens").select("oc_id").eq("id", item_id).limit(1).execute()
+            if r.data:
+                _banco = _oc_alimenta_banco(sb, r.data[0]["oc_id"], usuario)
+        except Exception:
+            _banco = None
+    return {"ok": True, **({"banco": _banco} if _banco else {})}
 
 
 @app.post("/oc-itens")
