@@ -202,11 +202,11 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto }) {
   const [perguntando, setPerguntando] = useState(false);
   const [rascunhoPergunta, setRascunhoPergunta] = useState("");
   const [mostrarSpecs, setMostrarSpecs] = useState(false);
-  // Ficha do banco: aberta por padrão quando o match NÃO é exato — é justamente onde
-  // o operador precisa comparar. Em match exato fica recolhida pra não poluir.
-  const [mostrarBanco, setMostrarBanco] = useState(
-    !!item.banco && (item.banco.confianca !== "alta" || item.banco.veredito !== "mesmo"
-      || item.banco.sem_lastro));
+  // Ficha do banco: SEMPRE recolhida. A lista fica limpa e o operador abre o que
+  // quiser — e ele não fica cego, porque o rótulo do toggle já carrega o veredito
+  // ("⚠ não é o mesmo item" em vermelho, "⚠ falta informação" em âmbar, "⚠ preço
+  // sem lastro"). O sinal está fora; dentro fica o detalhe.
+  const [mostrarBanco, setMostrarBanco] = useState(false);
   const [mostrarOrigem, setMostrarOrigem] = useState(false);
 
   async function perguntar(texto) {
