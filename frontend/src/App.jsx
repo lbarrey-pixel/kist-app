@@ -205,7 +205,11 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
   // quiser — e ele não fica cego, porque o rótulo do toggle já carrega o veredito
   // ("⚠ não é o mesmo item" em vermelho, "⚠ falta informação" em âmbar, "⚠ preço
   // sem lastro"). O sinal está fora; dentro fica o detalhe.
-  const [mostrarBanco, setMostrarBanco] = useState(false);
+  // Gaveta única "motor de preços": banco + internet + conferir em cascata.
+  // Abre sozinha quando não há banco (aí a internet cobre a lacuna); com banco,
+  // fica fechada e o operador abre quando quiser conferir.
+  const [motorAberto, setMotorAberto] = useState(() =>
+    !item.banco || (item.confianca_match || "nenhuma") === "nenhuma");
   const [mostrarOrigem, setMostrarOrigem] = useState(false);
 
   // ── Ficha da internet (Frente A) ──────────────────────────────────────────
@@ -216,13 +220,12 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
   const [net, setNet] = useState(null);          // ficha devolvida pelo /ficha-internet
   const [netLoad, setNetLoad] = useState(false);
   const [netErr, setNetErr] = useState("");
-  const [mostrarNet, setMostrarNet] = useState(false);
   const [reTermo, setReTermo] = useState("");
   const [descFonte, setDescFonte] = useState("cliente");  // 'cliente' | 'internet'
-  const netBuscadoRef = useRef(false);           // evita auto-disparo repetido
+  const netBuscadoRef = useRef(false);           // evita busca repetida
 
   async function buscarInternet(termoRebusca) {
-    setNetLoad(true); setNetErr(""); setMostrarNet(true);
+    setNetLoad(true); setNetErr("");
     try {
       const r = await fetch(`${apiUrl}/ficha-internet`, {
         method: "POST",
@@ -249,16 +252,15 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
     }
   }
 
-  // Auto-dispara UMA vez quando não há item do banco (a internet cobre a lacuna).
+  // Busca a internet quando a gaveta abre (uma vez). Não ao montar a tela — assim
+  // não dispara em massa; só busca o item cujo motor o operador (ou o "sem banco") abriu.
   useEffect(() => {
-    if (netBuscadoRef.current) return;
-    const semBanco = !item.banco || (item.confianca_match || "nenhuma") === "nenhuma";
-    if (semBanco && (item.descricao_original || item.descricao_final)) {
+    if (motorAberto && !netBuscadoRef.current && (item.descricao_original || item.descricao_final)) {
       netBuscadoRef.current = true;
       buscarInternet();
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [motorAberto]);
 
   // "Usar esta ficha": sobe origem + (descrição, se escolheu a da internet) e marca
   // a escolha p/ o backend aprender o nó. Não sobrescreve o preço de venda — a
@@ -374,41 +376,20 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
           </div>
           <div className="mt-0.5 flex flex-wrap items-center gap-2 pl-1.5">
             <StateLabel conf={confianca} />
-            {item.banco && (
-              <button onClick={() => setMostrarBanco((v) => !v)}
-                className={`inline-flex items-center gap-1 text-[11px] font-medium hover:opacity-80
-                  ${item.banco.veredito === "diferente" ? "text-rose"
-                    : (item.banco.veredito === "inconclusivo" || item.banco.sem_lastro) ? "text-amber"
-                    : "text-kist"}`}>
-                {mostrarBanco ? "− fechar comparação"
-                  : item.banco.veredito === "diferente" ? "⚠ não é o mesmo item"
-                  : item.banco.veredito === "inconclusivo" ? "⚠ falta informação"
-                  : item.banco.sem_lastro ? "⚠ preço sem lastro — recotar"
-                  : "↔ comparar com o banco"}
-              </button>
-            )}
-            {/* internet — auto quando não há banco; manual/toggle quando o operador quiser */}
-            <button
-              onClick={() => {
-                if (!net && !netLoad) { netBuscadoRef.current = true; buscarInternet(); }
-                else setMostrarNet((v) => !v);
-              }}
+            {/* Motor de preços: banco + internet + conferir numa gaveta só.
+                O rótulo carrega o veredito, como antes carregava no toggle do banco. */}
+            <button onClick={() => setMotorAberto((v) => !v)}
               className={`inline-flex items-center gap-1 text-[11px] font-medium hover:opacity-80
-                ${netLoad ? "text-faint"
-                  : (net && (net.apresentacoes || []).length) ? "text-signal"
-                  : netErr ? "text-amber" : "text-kist"}`}>
-              {netLoad ? "buscando na internet…"
-                : mostrarNet ? "− fechar internet"
-                : (net && (net.apresentacoes || []).length) ? "🌐 internet · achei"
-                : netErr ? "🌐 internet · nada"
-                : "🌐 buscar na internet"}
-            </button>
-            {/* Sempre disponível: quem sabe se tem dúvida é o operador, não a
-                heurística. O destaque é só um empurrão quando não há PN/código. */}
-            <button onClick={() => setConferirAberto((v) => !v)}
-              className={`inline-flex items-center gap-1 text-[11px] font-medium hover:opacity-80
-                ${item.pede_atencao ? "text-kist" : "text-faint"}`}>
-              <IconBolt size={11} /> Conferir
+                ${item.banco?.veredito === "diferente" ? "text-rose"
+                  : (item.banco?.veredito === "inconclusivo" || item.banco?.sem_lastro) ? "text-amber"
+                  : "text-kist"}`}>
+              <IconBolt size={11} />
+              {motorAberto ? "fechar motor de preços"
+                : item.banco?.veredito === "diferente" ? "motor de preços · ⚠ não é o mesmo"
+                : item.banco?.veredito === "inconclusivo" ? "motor de preços · ⚠ falta info"
+                : item.banco?.sem_lastro ? "motor de preços · ⚠ sem lastro"
+                : (!item.banco || confianca === "nenhuma") ? "motor de preços · sem banco"
+                : "motor de preços"}
             </button>
             <button onClick={() => setMostrarSpecs((v) => !v)} className="text-[11px] text-faint hover:text-sub">
               {mostrarSpecs ? "− descrição complementar" : "+ descrição complementar"}
@@ -459,7 +440,7 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
           espremido dentro do <td> da descrição, junto com o input, o Google, os
           marketplaces, o sino e quatro toggles — onze coisas numa célula.
           Comparar spec exige ler em paralelo, não rolar pra cima e pra baixo. */}
-      {item.banco && mostrarBanco && (
+      {item.banco && motorAberto && (
         <tr className="border-b border-line/70 bg-paper/60">
           <td /><td />
           <td colSpan={4} className="px-3 pb-3 pt-2">
@@ -613,7 +594,7 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
           Espelha a ficha do banco: apresenta, não decide. O operador escolhe a
           apresentação e sobe a origem (e a descrição, se quiser). O preço de
           venda continua com ele — a internet é referência, não custo. */}
-      {mostrarNet && (
+      {motorAberto && (
         <tr className="border-b border-line/70 bg-paper/60">
           <td /><td />
           <td colSpan={4} className="px-3 pb-3 pt-2">
@@ -714,6 +695,23 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
                 </button>
               </div>
             )}
+          </td>
+        </tr>
+      )}
+
+      {/* ── 3ª CASCATA: conferir com a IA ────────────────────────────────────
+          Quando banco e internet não bastam, o operador pergunta à IA sobre o
+          item (o chat abre logo abaixo, controlado por conferirAberto). */}
+      {motorAberto && (
+        <tr className="border-b border-line/70 bg-paper/60">
+          <td /><td />
+          <td colSpan={4} className="px-3 pb-2.5">
+            <button onClick={() => setConferirAberto((v) => !v)}
+              className={`inline-flex items-center gap-1 text-[11px] font-medium hover:opacity-80
+                ${item.pede_atencao && !conferirAberto ? "text-kist" : "text-sub"}`}>
+              <IconBolt size={11} />
+              {conferirAberto ? "fechar conversa com a IA" : "conferir com a IA — perguntar sobre o item"}
+            </button>
           </td>
         </tr>
       )}
