@@ -633,7 +633,11 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
                             <div className="flex items-baseline justify-between gap-2">
                               <span className="text-[12px] text-sub">{ap.apresentacao || "unidade"}</span>
                               <div className="flex items-center gap-2">
-                                <span className="font-mono text-[14px] font-medium text-ink">{brl(ap.preco_brl)}</span>
+                                {ap.preco_brl != null ? (
+                                  <span className="font-mono text-[14px] font-medium text-ink">{brl(ap.preco_brl)}</span>
+                                ) : (
+                                  <span className="text-[11px] font-medium text-amber">sob consulta</span>
+                                )}
                                 <button
                                   onClick={() => usarFichaInternet(ap)}
                                   title="Usar esta ficha e preencher a origem do preço"

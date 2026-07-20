@@ -563,6 +563,8 @@ Devolva JSON — sem markdown, sem ```:
 }
 
 Se NENHUM candidato for o mesmo produto: {"apresentacoes": [], "resumo": "não encontrei o mesmo item"}.
+
+Se você RECONHECE o mesmo produto mas NENHUM candidato tem preço (só página de fabricante, marca, ou "sob consulta"): devolva UMA apresentação com "preco_brl": null, a url do fabricante/página do produto, "seller" o nome do fabricante e "obs": "sob consulta". É o "achei o item, cote direto" — melhor que dizer que não achou.
 Nunca invente preço, fonte ou url — use só o que veio nos candidatos."""
 
 
@@ -639,6 +641,15 @@ def _agrupar_sem_ia(candidatos: list) -> dict:
                 "fator_importacao": c.get("fator_importacao"),
                 "preco_estimado_brl": c.get("preco_estimado_brl"),
             }
+    if not melhor:
+        # Nada com preço, mas achou o item em algum lugar (link) => sob consulta.
+        for c in candidatos:
+            if (c.get("url") or "").strip():
+                return {"apresentacoes": [{
+                    "apresentacao": "sob consulta", "preco_brl": None,
+                    "fonte": c.get("fonte_nome"), "seller": c.get("seller"),
+                    "url": c.get("url"), "obs": "sob consulta",
+                }], "resumo": "item achado, sem preço público"}
     return {"apresentacoes": list(melhor.values()),
             "resumo": "(sem IA de julgamento — melhor por apresentação)"}
 
@@ -943,7 +954,8 @@ Responda APENAS JSON, sem markdown, sem ```:
 
 Regras:
 - preco: número em reais se aparecer; senão null — MAS traga o link mesmo assim (o operador quer saber onde o item está à venda).
-- Só resultados de LOJAS que vendem o item (dimensional, mercadolivre, lojas de telecom/energia). Ignore fóruns, PDFs, manuais, catálogos sem venda.
+- Prioridade: LOJAS que vendem o item (dimensional, mercadolivre, lojas de telecom/energia). Se NENHUMA loja vende, mas você encontrou a página do FABRICANTE ou do produto (ex.: o site da marca), traga esse link com preco=null e loja="(fabricante)" — o operador cota direto. É melhor que dizer que não achou.
+- Ignore fóruns, PDFs de manual, e resultados que claramente não são o produto.
 - Só o MESMO produto pedido. Divergiu em fabricante/categoria/dimensão, descarte.
 - Nada é o mesmo => {"anuncios": []}. Nunca invente."""
 
