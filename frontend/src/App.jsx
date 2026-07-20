@@ -210,11 +210,14 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
   // Nesse caso a internet cobre a lacuna: a gaveta abre sozinha E a internet busca
   // sozinha. Em match bom (mesmo/EXATO/SIMILAR), a gaveta fica fechada; ao abrir,
   // mostra o banco e a internet é OPCIONAL (botão "buscar na internet").
-  const semMatchUtil = !item.banco
+  // "Sem match útil" decide se a busca dispara. A CONFIANÇA é a fonte de verdade
+  // porque é persistida — a ficha do banco (item.banco) NÃO sobrevive ao reload da
+  // proposta, então usar !item.banco fazia TODO item recarregado parecer "sem
+  // match" e disparar busca em massa (afogava o backend). Match alta/media não busca.
+  const _conf = item.confianca_match || "nenhuma";
+  const semMatchUtil = _conf === "nenhuma" || _conf === "baixa"
     || item.banco?.veredito === "diferente"
-    || item.banco?.veredito === "inconclusivo"
-    || (item.confianca_match || "nenhuma") === "nenhuma"
-    || item.confianca_match === "baixa";
+    || item.banco?.veredito === "inconclusivo";
   const [motorAberto, setMotorAberto] = useState(() => semMatchUtil);
   const [mostrarOrigem, setMostrarOrigem] = useState(false);
 
@@ -258,9 +261,9 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
     }
   }
 
-  // Busca a internet automaticamente SÓ quando não há match útil (a internet
-  // cobre a lacuna). Em match bom, mesmo abrindo a gaveta, a internet espera o
-  // operador clicar "buscar na internet" — não gasta web à toa.
+  // Dispara a busca automaticamente SÓ para item sem match ou incerto (é o que
+  // cobre a lacuna). Match bom não busca. A condição semMatchUtil se apoia na
+  // CONFIANÇA (persistida), não na ficha do banco (que não sobrevive ao reload).
   useEffect(() => {
     if (motorAberto && semMatchUtil && !netBuscadoRef.current && (item.descricao_original || item.descricao_final)) {
       netBuscadoRef.current = true;
