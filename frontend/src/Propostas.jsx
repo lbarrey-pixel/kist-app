@@ -86,6 +86,20 @@ export default function Propostas({ token, usuario, onCriarOC, onAbrirProposta }
 
   useEffect(() => { carregar(); /* eslint-disable-next-line */ }, [equipeToda]);
 
+  async function excluir(p, e) {
+    e.stopPropagation();
+    const id = p.id ?? p.numero_proposta;
+    if (!window.confirm(`Excluir a proposta ${p.numero_proposta} (${p.cliente})?\nEsta ação não pode ser desfeita.`)) return;
+    try {
+      const r = await fetch(`${API}/propostas/${id}`, { method: "DELETE", headers: authHeaders() });
+      if (!r.ok) throw new Error();
+      setLista((prev) => prev.filter((x) => (x.id ?? x.numero_proposta) !== id));
+      if (expandida === id) setExpandida(null);
+    } catch {
+      alert("Não foi possível excluir a proposta.");
+    }
+  }
+
   async function abrir(prop) {
     const id = prop.id ?? prop.numero_proposta;
     if (expandida === id) { setExpandida(null); return; }
@@ -196,6 +210,12 @@ export default function Propostas({ token, usuario, onCriarOC, onAbrirProposta }
                             Abrir e editar
                           </button>
                         )}
+                        <button
+                          onClick={(e) => excluir(p, e)}
+                          title="Excluir proposta"
+                          className="rounded-md border border-line2 bg-surface px-2 py-0.5 text-[11px] text-faint hover:border-rose/40 hover:text-rose">
+                          excluir
+                        </button>
                         <span className="text-[11px] text-faint">{aberta ? "fechar" : "ver itens"}</span>
                       </div>
                     </td>

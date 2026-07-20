@@ -516,8 +516,9 @@ def montar_registry() -> dict:
     implementados/plugados — a cascata os pega por posição, sem mudar código."""
     return {
         "serpapi":   SerpApiShopping(),
+        "google_web": SerpApiGoogleWeb(),
         "websearch": WebSearchAnthropic(),
-        # "brave":     BraveSearch(),        # degrau 2 nacional — quando plugar a chave
+        # "brave":     BraveSearch(),        # degrau extra nacional — quando plugar a chave
         # "ebay":      EbayBrowse(),         # bloco importado — depois
         # "aliexpress":AliExpress(),
         # "paraguai":  ComprasParaguai(),
@@ -526,8 +527,10 @@ def montar_registry() -> dict:
 
 # ── Roteador: monta a cascata na ordem de prioridade, filtra por disponível ───
 def _ordem_nacional(reg: dict) -> list:
-    # Google Shopping (estruturado) -> Brave (índice indep.) -> Web Search (Sonnet).
-    return [reg.get("serpapi"), reg.get("brave"), reg.get("websearch")]
+    # Commodity resolve no Shopping (preço estruturado). Item de nicho não está no
+    # feed => cai no Google Web (a página do distribuidor, que o operador acha).
+    # Web Search (índice Anthropic) fecha como rede final.
+    return [reg.get("serpapi"), reg.get("google_web"), reg.get("brave"), reg.get("websearch")]
 
 
 def _ordem_importada(reg: dict) -> list:
@@ -919,3 +922,97 @@ def aprender_correcao_reescrita(sb, entrada_norm_original: str, termo_reescrito:
                 "apresentacao_desejada")}
     correta["origem_correcao"] = "reescrita_operador"
     aprender_interpretacao(sb, entrada_norm_original, correta)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BLOCO 6 (motor) — Google Web: a busca web normal do Google (não o feed Shopping)
+# ══════════════════════════════════════════════════════════════════════════════
+# O Shopping é só o feed de produtos; item industrial de nicho (gabinete Womer,
+# suporte) não está lá. Mas ESTÁ na busca web do Google — foi assim que o operador
+# achou o dimensional. Este provider usa o engine 'google' do SerpApi (mesma chave)
+# e deixa o Sonnet ler os resultados orgânicos e extrair preço/link.
+
+SYSTEM_EXTRAIR_GOOGLE = """Você recebe RESULTADOS DA BUSCA WEB DO GOOGLE para um produto que uma revenda B2B de telecom/energia procura. Cada resultado tem título, link e um trecho.
+
+Identifique quais resultados são o MESMO produto pedido — mesmo fabricante, categoria e dimensão. Para cada um que for o mesmo, extraia o PREÇO se ele aparecer no título ou no trecho, e o link da loja.
+
+Responda APENAS JSON, sem markdown, sem ```:
+{"anuncios": [
+  {"titulo": "...", "preco": 2690.00, "loja": "dimensional", "url": "https://...", "apresentacao": "unidade"}
+]}
+
+Regras:
+- preco: número em reais se aparecer; senão null — MAS traga o link mesmo assim (o operador quer saber onde o item está à venda).
+- Só resultados de LOJAS que vendem o item (dimensional, mercadolivre, lojas de telecom/energia). Ignore fóruns, PDFs, manuais, catálogos sem venda.
+- Só o MESMO produto pedido. Divergiu em fabricante/categoria/dimensão, descarte.
+- Nada é o mesmo => {"anuncios": []}. Nunca invente."""
+
+
+class SerpApiGoogleWeb(Provider):
+    """Busca WEB do Google (engine 'google'), o mesmo Google do operador. Acha a
+    página do distribuidor para item de nicho que não está no feed de Shopping.
+    O Sonnet lê os resultados orgânicos e extrai preço/link."""
+
+    nome        = "Google Web"
+    tipo_preco  = "varejo"
+    origem_tipo = "web"
+
+    def configurado(self) -> bool:
+        return bool(SERPAPI_KEY)
+
+    def buscar(self, perfil: dict, ctx: dict = None) -> list[dict]:
+        termo = (perfil.get("consulta") or perfil.get("descricao") or "").strip()
+        if not termo:
+            return []
+        params = {"engine": "google", "q": termo, "gl": SERP_GL, "hl": SERP_HL,
+                  "num": "10", "api_key": SERPAPI_KEY}
+        try:
+            data = _http_get_json("https://serpapi.com/search.json?" + urllib.parse.urlencode(params))
+        except Exception:
+            return []
+
+        linhas = []
+        for r in (data.get("organic_results") or [])[:10]:
+            u = r.get("link") or ""
+            if not u:
+                continue
+            linhas.append(f"- titulo: {r.get('title') or ''}\n  link: {u}\n  trecho: {(r.get('snippet') or '')[:220]}")
+        # o Google Web às vezes traz produtos com preço inline
+        for r in (data.get("shopping_results") or [])[:5]:
+            u = r.get("product_link") or r.get("link") or ""
+            if not u:
+                continue
+            linhas.append(f"- titulo: {r.get('title') or ''}\n  link: {u}\n  preco: {r.get('extracted_price')}\n  loja: {r.get('source') or ''}")
+        if not linhas:
+            return []
+
+        claude = (ctx or {}).get("claude")
+        if claude is None:
+            return []
+        pedido = (f"PRODUTO PROCURADO: {perfil.get('consulta')}\n"
+                  f"Fabricante: {perfil.get('fabricante') or '?'} | Categoria: {perfil.get('categoria') or '?'}\n\n"
+                  f"RESULTADOS DO GOOGLE:\n" + "\n".join(linhas))
+        try:
+            resp = claude.messages.create(
+                model="claude-sonnet-4-6", max_tokens=1200,
+                system=SYSTEM_EXTRAIR_GOOGLE,
+                messages=[{"role": "user", "content": pedido}],
+                temperature=0.0, timeout=60.0,
+            )
+            txt = "\n".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+            txt = re.sub(r'^```(?:json)?\s*', '', txt); txt = re.sub(r'\s*```$', '', txt.strip())
+            got = json.loads(txt)
+        except Exception:
+            return []
+
+        out = []
+        for a in (got.get("anuncios") or []):
+            if not (a.get("url") or "").strip():
+                continue
+            out.append(candidato(
+                fonte_nome=self.nome, tipo_preco=self.tipo_preco, origem_tipo=self.origem_tipo,
+                titulo=a.get("titulo") or "", preco=a.get("preco"), moeda="BRL",
+                url=a.get("url") or "", seller=a.get("loja") or "",
+                apresentacao=a.get("apresentacao") or "",
+            ))
+        return out

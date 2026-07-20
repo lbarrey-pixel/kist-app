@@ -2977,6 +2977,16 @@ async def excluir_oc(oc_id: int, usuario: str = Depends(verificar_token)):
     return {"ok": True, "excluida": oc_id}
 
 
+@app.delete("/propostas/{proposta_id}")
+async def excluir_proposta(proposta_id: int, usuario: str = Depends(verificar_token)):
+    """Exclui uma proposta e seus itens (limpeza de testes / proposta errada).
+    Apaga os itens_proposta primeiro caso a FK não seja ON DELETE CASCADE."""
+    sb = get_supabase()
+    sb.table("itens_proposta").delete().eq("proposta_id", proposta_id).execute()
+    sb.table("propostas").delete().eq("id", proposta_id).execute()
+    return {"ok": True, "excluida": proposta_id}
+
+
 @app.put("/oc-itens/{item_id}")
 async def atualizar_item_oc(
     item_id: int, payload: dict, usuario: str = Depends(verificar_token)
