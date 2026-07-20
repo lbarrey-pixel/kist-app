@@ -256,8 +256,9 @@ Responda APENAS com JSON válido — sem markdown, sem ```:
 
 Regras:
 - preco em reais, número puro (ponto decimal). Sem "R$", sem texto.
-- Só o MESMO produto pedido. Na dúvida, não inclua.
-- Não achou o produto certo => {"anuncios": []}. Nunca invente preço ou loja."""
+- Se você ACHOU o produto certo numa loja mas o preço não aparece (é "sob consulta"), traga o anúncio mesmo assim com "preco": null — o operador quer ao menos o link de onde o item está à venda.
+- Só o MESMO produto pedido. Na dúvida sobre a identidade, não inclua.
+- Não achou o produto certo em lugar nenhum => {"anuncios": []}. Nunca invente preço ou loja."""
 
 
 class WebSearchAnthropic(Provider):
@@ -315,14 +316,18 @@ class WebSearchAnthropic(Provider):
 
         out = []
         for a in (data.get("anuncios") or []):
-            if a.get("preco") in (None, ""):
+            tem_preco = a.get("preco") not in (None, "")
+            tem_url = bool((a.get("url") or "").strip())
+            # Sem preço E sem link não serve. Com link (mesmo sem preço) serve:
+            # é o "achei onde o item está à venda", o piso que o operador quer.
+            if not tem_preco and not tem_url:
                 continue
             out.append(candidato(
                 fonte_nome=self.nome,
                 tipo_preco=self.tipo_preco,
                 origem_tipo=self.origem_tipo,
                 titulo=a.get("titulo") or "",
-                preco=a.get("preco"),
+                preco=a.get("preco") if tem_preco else None,
                 moeda="BRL",                       # varejo nacional
                 url=a.get("url") or "",
                 seller=a.get("loja") or "",
@@ -383,17 +388,19 @@ REGRAS:
 - Nunca invente fabricante/MPN. Vazio é melhor que errado."""
 
 
-SYSTEM_CONFERIR_ITEM = """Você é um comprador técnico da Kist (telecom/energia). O item abaixo veio VAGO. Use a busca web para descobrir O QUE É — fabricante provável, part number, tipo e categoria técnica — para que a busca de preço seguinte mire o item certo.
+SYSTEM_CONFERIR_ITEM = """Você é um comprador técnico da Kist (telecom/energia). O cliente mandou a descrição de um item, muitas vezes ABREVIADA ou em CÓDIGO INTERNO (ex.: "W50 - WOMER MINI OUTDOOR ALUMINIO PAREDE W50 16 60" é um gabinete/rack outdoor da Womer). Sua missão é DESCOBRIR o que é o item — como você faria perguntando num chat ou buscando no Google.
 
-NÃO busque preço agora; só IDENTIFIQUE o item. Devolva SOMENTE JSON, sem markdown:
+Use a busca web de verdade: procure o código, o modelo, a marca (Womer, Furukawa, Clamper, Fibersul, etc.), leia as páginas de fabricante e de lojas (dimensional, mercadolivre, etc.) e identifique o produto real, o fabricante, o part number e as características técnicas. Um operador humano acha isso com a mesma descrição — você também consegue.
+
+NÃO busque preço agora; só IDENTIFIQUE. Devolva SOMENTE JSON, sem markdown:
 {
-  "consulta": "termo de busca refinado com o que você descobriu",
+  "consulta": "termo de busca refinado com o nome REAL do produto que você descobriu (marca + modelo + tipo), pronto para achar à venda",
   "fabricante": "", "mpn": "",
   "categoria": "",
   "atributos_excludentes": {"tipo": "", "categoria_tec": "", "bitola_dim": "", "outros": ""},
   "achou_identificacao": true
 }
-Se a web não esclareceu, repita o melhor palpite e achou_identificacao=false. Nunca invente."""
+Se a web esclareceu, achou_identificacao=true e a consulta refinada. Se realmente não deu, repita o melhor palpite e achou_identificacao=false. Nunca invente — mas esforce-se: o item quase sempre existe e é achável."""
 
 
 def _correcoes_similares(entrada: str, sb, lim: int = 3) -> list:
@@ -483,8 +490,13 @@ def interpretar(item: dict, claude, sb=None, avisos: list = None) -> dict:
         if not (base.get("consulta") or "").strip():
             base["consulta"] = desc
 
-        # Conferência web condicional: item incerto => descobre antes de buscar.
-        if got.get("precisa_conferir") or base.get("confianca") == "baixa":
+        # Conferência web: o motor só é chamado para itens que o banco NÃO
+        # resolveu — logo, são difíceis por definição. Replicamos o operador:
+        # identificar o item na web ANTES de buscar preço (é o que ele faz no
+        # Google/chat quando não conhece o item). Só pula quando já veio um MPN
+        # cravado — aí a busca acha direto pelo part number.
+        sem_mpn = not (base.get("mpn") or "").strip()
+        if got.get("precisa_conferir") or base.get("confianca") in ("baixa", "media") or sem_mpn:
             ref = _conferir_web(pedido, claude)
             if ref:
                 base["conferiu_web"] = True

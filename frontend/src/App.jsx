@@ -206,10 +206,15 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
   // ("⚠ não é o mesmo item" em vermelho, "⚠ falta informação" em âmbar, "⚠ preço
   // sem lastro"). O sinal está fora; dentro fica o detalhe.
   // Gaveta única "motor de preços": banco + internet + conferir em cascata.
-  // Abre sozinha quando não há banco (aí a internet cobre a lacuna); com banco,
-  // fica fechada e o operador abre quando quiser conferir.
-  const [motorAberto, setMotorAberto] = useState(() =>
-    !item.banco || (item.confianca_match || "nenhuma") === "nenhuma");
+  // Abre sozinha quando NÃO há match útil — sem banco, ou o banco não é o mesmo
+  // item (veredito diferente), ou é incerto (inconclusivo), ou a confiança é
+  // fraca. Match bom (mesmo/EXATO/SIMILAR) fica fechado: o operador dispara.
+  const [motorAberto, setMotorAberto] = useState(() => {
+    const v = item.banco?.veredito;
+    const conf = item.confianca_match || "nenhuma";
+    return !item.banco || v === "diferente" || v === "inconclusivo"
+        || conf === "nenhuma" || conf === "baixa";
+  });
   const [mostrarOrigem, setMostrarOrigem] = useState(false);
 
   // ── Ficha da internet (Frente A) ──────────────────────────────────────────
