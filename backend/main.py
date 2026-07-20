@@ -12,6 +12,25 @@ import extract_msg
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 
+# Motor de busca de preços na internet (Frente A) — módulo separado de propósito:
+# o /gerar-csv e o fmt_preco são invariantes intocáveis, e um subsistema grande no
+# meio do monólito é onde eles morrem. Import protegido: se o arquivo faltar no
+# deploy, o app sobe normal e só o /ficha-internet avisa que o motor não está lá.
+try:
+    from motor_precos import (
+        resolver_ficha as _resolver_ficha_precos,
+        aprender_no_internet as _mp_aprender_no_internet,
+        aprender_interpretacao as _mp_aprender_interpretacao,
+        tem_no_internet as _mp_tem_no_internet,
+    )
+    _MOTOR_PRECOS_OK = True
+except Exception:
+    _resolver_ficha_precos = None
+    _mp_aprender_no_internet = None
+    _mp_aprender_interpretacao = None
+    _mp_tem_no_internet = None
+    _MOTOR_PRECOS_OK = False
+
 # Versão do backend. O núcleo do Analista guarda a versão que ele descreve; se as
 # duas divergirem, o agente é avisado de que o conhecimento dele está atrasado.
 # Conhecimento velho não avisa que é velho — ele responde com a mesma confiança
@@ -1446,6 +1465,20 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
         if _pid and _entrada:
             aprender.append((_entrada, _pid))
 
+        # [4b] NÓ DA INTERNET: se o operador ESCOLHEU a opção da internet para este
+        # item, aprende "(CNPJ + input) -> internet, esta origem" — próxima vez que
+        # este CNPJ pedir este input, a busca dispara sozinha. Sem CNPJ, não grava
+        # (fica sem âncora — o front já avisou em vermelho). Mesmo gatilho do banco.
+        if (_MOTOR_PRECOS_OK and _entrada and cnpj
+                and (item.get("origem_escolha") == "internet")):
+            try:
+                _mp_aprender_no_internet(sb, _entrada, cnpj, item.get("origem_internet") or {})
+                _interp = item.get("interpretacao")
+                if _interp:
+                    _mp_aprender_interpretacao(sb, _entrada, _interp)
+            except Exception:
+                pass   # aprender não pode derrubar o salvamento da proposta
+
     memoria = _aprender_memoria(sb, aprender, cliente) if aprender else {}
     return {"atualizados": atualizados, "inseridos": inseridos,
             "ignorados": ignorados, "memoria": memoria}
@@ -1747,6 +1780,49 @@ async def conferir(payload: dict, usuario: str = Depends(verificar_token)):
         texto = "Não consegui formular uma resposta. Tenta reformular a pergunta."
 
     return {"resposta": texto, "buscas": [q for q in buscas if q]}
+
+
+@app.post("/ficha-internet")
+async def ficha_internet(payload: dict, usuario: str = Depends(verificar_token)):
+    """Referência de preço na internet para UM item SEM match no banco.
+
+    Chamado pelo frontend item a item, de forma assíncrona (FORA do /extrair): a
+    tela sobe na hora com o matching do banco, e cada ficha da internet preenche
+    sua 3ª coluna quando fica pronta. Um item que falha não derruba os outros.
+
+    O motor faz camada 2 (cache de fichas, TTL 24h) -> camada 3 (cascata de busca
+    + julgamento). A camada 1 (banco de preços) é o matching que já roda no
+    /extrair — por isso este endpoint só é chamado para item sem match.
+
+    NÃO escreve preço no banco: devolve referência. O que migra pra `produtos` é
+    sempre o preço que o operador lança (fluxo normal de /salvar-proposta).
+    """
+    if not _MOTOR_PRECOS_OK:
+        raise HTTPException(503, "Motor de preços indisponível (backend/motor_precos.py ausente)")
+
+    item = payload.get("item") or {}
+    desc = (item.get("descricao") or item.get("descricao_original") or "").strip()
+    if not desc:
+        raise HTTPException(400, "Item sem descrição")
+
+    # O motor lê 'descricao'/'specs_complementares'/'quantidade'/'unidade'.
+    # Normaliza descricao_original -> descricao sem mutar o payload do cliente.
+    item_motor = dict(item)
+    if not item_motor.get("descricao"):
+        item_motor["descricao"] = desc
+
+    # CNPJ da proposta = âncora do nó (client-first). termo_rebusca = correção do
+    # operador (reescreveu o termo): o motor usa o termo dele e aprende com isso.
+    cnpj = _cnpj_do_cliente(payload.get("cnpj"))
+    termo_rebusca = (payload.get("termo_rebusca") or "").strip() or None
+
+    try:
+        ficha = _resolver_ficha_precos(item_motor, get_supabase(), get_claude(),
+                                       usuario_email=usuario, cnpj=cnpj,
+                                       termo_rebusca=termo_rebusca)
+    except Exception as e:
+        raise HTTPException(502, f"Não consegui buscar preço agora: {type(e).__name__}")
+    return ficha
 
 
 # ── PROPOSTAS ─────────────────────────────────────────────────────────────────

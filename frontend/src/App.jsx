@@ -110,7 +110,7 @@ const MARKETPLACES = [
 ];
 
 // ── Linha de item da revisão ───────────────────────────────────────────────
-function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto }) {
+function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
   // ── Alerta ────────────────────────────────────────────────────────────
   const [mostrarAlerta, setMostrarAlerta] = useState(false);
   const [alertaTexto, setAlertaTexto] = useState(() => item.alerta_produto?.texto || "");
@@ -207,6 +207,72 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto }) {
   // sem lastro"). O sinal está fora; dentro fica o detalhe.
   const [mostrarBanco, setMostrarBanco] = useState(false);
   const [mostrarOrigem, setMostrarOrigem] = useState(false);
+
+  // ── Ficha da internet (Frente A) ──────────────────────────────────────────
+  // Busca REFERÊNCIA de mercado quando o item não tem match no banco. A internet
+  // apresenta; o preço de venda continua decisão do operador. "Usar" sobe a origem
+  // (e a descrição, se ele escolher) e marca origem_escolha='internet' — é isso que
+  // ensina o nó no /upsert-precos.
+  const [net, setNet] = useState(null);          // ficha devolvida pelo /ficha-internet
+  const [netLoad, setNetLoad] = useState(false);
+  const [netErr, setNetErr] = useState("");
+  const [mostrarNet, setMostrarNet] = useState(false);
+  const [reTermo, setReTermo] = useState("");
+  const [descFonte, setDescFonte] = useState("cliente");  // 'cliente' | 'internet'
+  const netBuscadoRef = useRef(false);           // evita auto-disparo repetido
+
+  async function buscarInternet(termoRebusca) {
+    setNetLoad(true); setNetErr(""); setMostrarNet(true);
+    try {
+      const r = await fetch(`${apiUrl}/ficha-internet`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          item: {
+            descricao: item.descricao_original || item.descricao_final,
+            descricao_original: item.descricao_original,
+            specs_complementares: item.specs_complementares || "",
+            quantidade: item.quantidade, unidade: item.unidade,
+          },
+          cnpj: cnpj || null,
+          termo_rebusca: (termoRebusca || "").trim() || null,
+        }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const ficha = await r.json();
+      setNet(ficha);
+      if (!(ficha.apresentacoes || []).length) setNetErr("Não achei o mesmo item na internet.");
+    } catch (e) {
+      setNetErr("Não consegui buscar agora. Tente de novo.");
+    } finally {
+      setNetLoad(false);
+    }
+  }
+
+  // Auto-dispara UMA vez quando não há item do banco (a internet cobre a lacuna).
+  useEffect(() => {
+    if (netBuscadoRef.current) return;
+    const semBanco = !item.banco || (item.confianca_match || "nenhuma") === "nenhuma";
+    if (semBanco && (item.descricao_original || item.descricao_final)) {
+      netBuscadoRef.current = true;
+      buscarInternet();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // "Usar esta ficha": sobe origem + (descrição, se escolheu a da internet) e marca
+  // a escolha p/ o backend aprender o nó. Não sobrescreve o preço de venda — a
+  // internet é referência; o operador decide o preço dele.
+  function usarFichaInternet(ap) {
+    if (descFonte === "internet" && net?.perfil?.consulta) {
+      onChange(index, "descricao_final", ap.titulo || net.perfil.consulta);
+    }
+    onChange(index, "origem_escolha", "internet");
+    onChange(index, "origem_internet", {
+      fonte_url: ap.url || "", fonte_nome: ap.fonte || "", apresentacao: ap.apresentacao || "",
+    });
+    if (net?.perfil) onChange(index, "interpretacao", net.perfil);
+  }
 
   async function perguntar(texto) {
     const q = (texto || rascunhoPergunta).trim();
@@ -321,6 +387,22 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto }) {
                   : "↔ comparar com o banco"}
               </button>
             )}
+            {/* internet — auto quando não há banco; manual/toggle quando o operador quiser */}
+            <button
+              onClick={() => {
+                if (!net && !netLoad) { netBuscadoRef.current = true; buscarInternet(); }
+                else setMostrarNet((v) => !v);
+              }}
+              className={`inline-flex items-center gap-1 text-[11px] font-medium hover:opacity-80
+                ${netLoad ? "text-faint"
+                  : (net && (net.apresentacoes || []).length) ? "text-signal"
+                  : netErr ? "text-amber" : "text-kist"}`}>
+              {netLoad ? "buscando na internet…"
+                : mostrarNet ? "− fechar internet"
+                : (net && (net.apresentacoes || []).length) ? "🌐 internet · achei"
+                : netErr ? "🌐 internet · nada"
+                : "🌐 buscar na internet"}
+            </button>
             {/* Sempre disponível: quem sabe se tem dúvida é o operador, não a
                 heurística. O destaque é só um empurrão quando não há PN/código. */}
             <button onClick={() => setConferirAberto((v) => !v)}
@@ -521,6 +603,115 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto }) {
             ) : !item.banco.herdou_custo && (
               <div className="mt-2 text-[11px] text-faint">
                 Custo e origem não foram copiados pro item — o match não é exato.
+              </div>
+            )}
+          </td>
+        </tr>
+      )}
+
+      {/* ── FICHA DA INTERNET (Frente A) — referência de mercado ──────────────
+          Espelha a ficha do banco: apresenta, não decide. O operador escolhe a
+          apresentação e sobe a origem (e a descrição, se quiser). O preço de
+          venda continua com ele — a internet é referência, não custo. */}
+      {mostrarNet && (
+        <tr className="border-b border-line/70 bg-paper/60">
+          <td /><td />
+          <td colSpan={4} className="px-3 pb-3 pt-2">
+
+            {net?.perfil?.consulta && (
+              <div className="mb-2 flex flex-wrap items-center gap-2 text-[12px]">
+                <span className="text-faint">Entendi:</span>
+                <span className="font-medium text-ink">{net.perfil.consulta}</span>
+                {net.perfil.conferiu_web && (
+                  <span className="rounded-md border border-line2 bg-paper px-1.5 py-0.5 text-[10px] font-medium text-kist">conferido na web</span>
+                )}
+              </div>
+            )}
+
+            {netLoad && (
+              <div className="rounded-lg border border-line2 bg-surface px-3 py-2.5 text-[12px] text-sub">
+                Buscando preço na internet…
+              </div>
+            )}
+
+            {!netLoad && netErr && (
+              <div className="rounded-lg border border-amber/30 bg-amberbg px-3 py-2 text-[12px] text-amber">{netErr}</div>
+            )}
+
+            {!netLoad && net && (net.apresentacoes || []).length > 0 && (
+              <div className="rounded-lg border border-kist/40 bg-surface p-3">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="eyebrow text-[9px] font-semibold uppercase text-faint">A internet propõe</div>
+                  <span className="rounded-md bg-signalbg px-1.5 py-0.5 text-[10px] font-medium text-signal">mesmo item</span>
+                </div>
+
+                <div className="mt-2 space-y-1.5">
+                  {net.apresentacoes.map((ap, k) => {
+                    const imp = !!(ap.fator_importacao && ap.fator_importacao > 1);
+                    return (
+                      <div key={k} className="border-t border-line pt-1.5 first:border-t-0 first:pt-0">
+                        <div className="flex items-baseline justify-between gap-2">
+                          <span className="text-[12px] text-sub">{ap.apresentacao || "unidade"}</span>
+                          <div className="flex items-center gap-2">
+                            <span className="font-mono text-[14px] font-medium text-ink">{brl(ap.preco_brl)}</span>
+                            <button
+                              onClick={() => usarFichaInternet(ap)}
+                              title="Subir origem desta ficha para o item"
+                              className="rounded-md border border-line2 px-2 py-0.5 text-[11px] font-medium text-sub hover:border-kist hover:text-kist">
+                              usar esta
+                            </button>
+                          </div>
+                        </div>
+                        {imp && (
+                          <div className="mt-0.5 font-mono text-[10.5px] text-faint">
+                            {ap.moeda_original} {ap.preco_original} × {ap.cotacao_usada} (câmbio) × {ap.fator_importacao} = {brl(ap.preco_estimado_brl)} posto
+                          </div>
+                        )}
+                        <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[10.5px] text-faint">
+                          <span>{ap.fonte || "—"}</span><span>·</span>
+                          <span>{ap.tipo_preco === "atacado" ? "atacado" : (imp ? "importado" : "varejo")}</span>
+                          {ap.url && (<><span>·</span><a href={ap.url} target="_blank" rel="noreferrer" className="text-kist hover:underline">ver anúncio</a></>)}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <div className="mt-2.5 border-t border-line pt-2">
+                  <div className="eyebrow text-[9px] font-semibold uppercase text-faint">Descrição na proposta</div>
+                  <div className="mt-1 flex flex-col gap-1 text-[12px] text-ink">
+                    <label className="flex items-center gap-2">
+                      <input type="radio" name={`desc-${index}`} checked={descFonte === "cliente"} onChange={() => setDescFonte("cliente")} />
+                      manter a do cliente
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input type="radio" name={`desc-${index}`} checked={descFonte === "internet"} onChange={() => setDescFonte("internet")} />
+                      usar a da internet
+                    </label>
+                  </div>
+                </div>
+
+                {!cnpj && (
+                  <div className="mt-2 rounded-md border border-rose/30 bg-rosebg px-2 py-1.5 text-[11px] text-rose">
+                    Sem CNPJ na proposta — dá pra usar, mas o sistema não vai aprender a buscar sozinho para este cliente.
+                  </div>
+                )}
+              </div>
+            )}
+
+            {!netLoad && (
+              <div className="mt-2 flex items-center gap-2">
+                <span className="whitespace-nowrap text-[11px] text-faint">não é isso? re-buscar:</span>
+                <input
+                  value={reTermo}
+                  onChange={(e) => setReTermo(e.target.value)}
+                  placeholder="ex.: cabo S/FTP Cat6a 23AWG"
+                  className="flex-1 rounded-md border border-line2 bg-surface px-2 py-1 text-[12px]" />
+                <button
+                  onClick={() => buscarInternet(reTermo)}
+                  className="rounded-md border border-line2 px-2 py-1 text-[11px] font-medium text-sub hover:border-kist hover:text-kist">
+                  buscar
+                </button>
               </div>
             )}
           </td>
@@ -1691,7 +1882,7 @@ export default function App() {
                     </thead>
                     <tbody>
                       {(prop.itens || []).map((item, i) => (
-                        <ItemRow key={i} item={item} index={i} onChange={atualizarItem} token={token} apiUrl={API} fonteTexto={prop.fonte_texto} />
+                        <ItemRow key={i} item={item} index={i} onChange={atualizarItem} token={token} apiUrl={API} fonteTexto={prop.fonte_texto} cnpj={prop.cnpj} />
                       ))}
                     </tbody>
                   </table>
