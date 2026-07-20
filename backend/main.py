@@ -226,6 +226,30 @@ ATENÇÃO especial:
 - Prefira retornar nenhuma a retornar match errado — falso negativo é melhor que falso positivo
 """
 
+# Mapa de atributos excludentes por categoria — legível em RUNTIME (config_kist),
+# para o operador ajustar uma regra (ex.: "polos são excludentes em disjuntor")
+# sem redeploy. O fallback embutido garante que o matching nunca fica sem as
+# regras críticas se a config sumir.
+_EXCLUDENTES_FALLBACK = """REGRAS DE ATRIBUTOS EXCLUDENTES por categoria (o que NÃO pode divergir):
+- DISJUNTOR: polos (1P/monopolar/unipolar · 2P/bipolar · 3P · 4P), amperagem, curva (B/C/D), tensão. Polos diferentes = NÃO é o mesmo.
+- CABO DE REDE: tipo (UTP/FTP/SFTP), categoria (Cat5e/Cat6/Cat6a). Cor não importa.
+- CABO ELÉTRICO: bitola (mm²), tensão (450/750V). Cor não importa.
+- ÓPTICO: conector (SC/LC), polimento (APC/UPC), modo (SM/MM), nº de fibras.
+- Qualquer item: dimensão, tensão, amperagem/potência, fabricante+modelo. MPN igual confirma; MPN diferente descarta."""
+
+
+def _excludentes_matching(sb) -> str:
+    """Regras de excludente por categoria, lidas da config (fallback embutido)."""
+    try:
+        r = (sb.table("config_kist").select("valor")
+             .eq("chave", "excludentes_matching").limit(1).execute())
+        if r.data and (r.data[0].get("valor") or "").strip():
+            return "\n\n" + r.data[0]["valor"]
+    except Exception:
+        pass
+    return "\n\n" + _EXCLUDENTES_FALLBACK
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _pede_atencao(descricao: str, specs: str) -> bool:
     """Sinaliza item que provavelmente precisa de consulta técnica: sem PN/código
@@ -654,7 +678,7 @@ diferente = null; spec divergente = não é o mesmo item, mesmo que a descriçã
         try:
             resp_match = claude.messages.create(
                 model="claude-haiku-4-5-20251001", max_tokens=6000,
-                system=SYSTEM_MATCHING,
+                system=SYSTEM_MATCHING + _excludentes_matching(sb),
                 messages=[{"role": "user", "content": prompt_matching}],
                 temperature=0.0, timeout=45.0
             )
