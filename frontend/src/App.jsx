@@ -206,15 +206,16 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
   // ("⚠ não é o mesmo item" em vermelho, "⚠ falta informação" em âmbar, "⚠ preço
   // sem lastro"). O sinal está fora; dentro fica o detalhe.
   // Gaveta única "motor de preços": banco + internet + conferir em cascata.
-  // Abre sozinha quando NÃO há match útil — sem banco, ou o banco não é o mesmo
-  // item (veredito diferente), ou é incerto (inconclusivo), ou a confiança é
-  // fraca. Match bom (mesmo/EXATO/SIMILAR) fica fechado: o operador dispara.
-  const [motorAberto, setMotorAberto] = useState(() => {
-    const v = item.banco?.veredito;
-    const conf = item.confianca_match || "nenhuma";
-    return !item.banco || v === "diferente" || v === "inconclusivo"
-        || conf === "nenhuma" || conf === "baixa";
-  });
+  // "Sem match útil" = sem banco, banco diferente, inconclusivo, ou confiança fraca.
+  // Nesse caso a internet cobre a lacuna: a gaveta abre sozinha E a internet busca
+  // sozinha. Em match bom (mesmo/EXATO/SIMILAR), a gaveta fica fechada; ao abrir,
+  // mostra o banco e a internet é OPCIONAL (botão "buscar na internet").
+  const semMatchUtil = !item.banco
+    || item.banco?.veredito === "diferente"
+    || item.banco?.veredito === "inconclusivo"
+    || (item.confianca_match || "nenhuma") === "nenhuma"
+    || item.confianca_match === "baixa";
+  const [motorAberto, setMotorAberto] = useState(() => semMatchUtil);
   const [mostrarOrigem, setMostrarOrigem] = useState(false);
 
   // ── Ficha da internet (Frente A) ──────────────────────────────────────────
@@ -257,10 +258,11 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
     }
   }
 
-  // Busca a internet quando a gaveta abre (uma vez). Não ao montar a tela — assim
-  // não dispara em massa; só busca o item cujo motor o operador (ou o "sem banco") abriu.
+  // Busca a internet automaticamente SÓ quando não há match útil (a internet
+  // cobre a lacuna). Em match bom, mesmo abrindo a gaveta, a internet espera o
+  // operador clicar "buscar na internet" — não gasta web à toa.
   useEffect(() => {
-    if (motorAberto && !netBuscadoRef.current && (item.descricao_original || item.descricao_final)) {
+    if (motorAberto && semMatchUtil && !netBuscadoRef.current && (item.descricao_original || item.descricao_final)) {
       netBuscadoRef.current = true;
       buscarInternet();
     }
@@ -274,6 +276,16 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
     if (descFonte === "internet" && net?.perfil?.consulta) {
       onChange(index, "descricao_final", ap.titulo || net.perfil.consulta);
     }
+    // Preenche a ORIGEM DO PREÇO com o que a internet devolveu — é isso que
+    // carrega o banco (link + loja) e evita re-buscar na web nas próximas
+    // propostas. O canal vira "link" (a URL do anúncio).
+    if (ap.url) {
+      onChange(index, "link_fornecedor", ap.url);
+      onChange(index, "fornecedor_canal", "link");
+      onChange(index, "fornecedor_contato", ap.url);
+    }
+    if (ap.fonte) onChange(index, "fornecedor", ap.fonte);
+    if (ap.sku) onChange(index, "sku_fornecedor", ap.sku);
     onChange(index, "origem_escolha", "internet");
     onChange(index, "origem_internet", {
       fonte_url: ap.url || "", fonte_nome: ap.fonte || "", apresentacao: ap.apresentacao || "",
@@ -445,12 +457,15 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
           espremido dentro do <td> da descrição, junto com o input, o Google, os
           marketplaces, o sino e quatro toggles — onze coisas numa célula.
           Comparar spec exige ler em paralelo, não rolar pra cima e pra baixo. */}
-      {item.banco && motorAberto && (
+      {/* ── MOTOR DE PREÇOS: banco (esq) + internet (dir) lado a lado ──────────
+          A descrição do cliente já está no card do item, no topo — aqui só as
+          duas propostas, como no desenho. Em match bom a internet é opcional. */}
+      {motorAberto && (
         <tr className="border-b border-line/70 bg-paper/60">
           <td /><td />
           <td colSpan={4} className="px-3 pb-3 pt-2">
 
-            {item.banco.veredito === "diferente" && (
+            {item.banco?.veredito === "diferente" && (
               <div className="mb-2.5 rounded-lg border border-rose/30 bg-rosebg px-3 py-2">
                 <div className="text-[12px] font-semibold text-rose">Não é o mesmo item</div>
                 {item.banco.diferencas?.length > 0 ? (
@@ -464,7 +479,7 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
                 )}
               </div>
             )}
-            {item.banco.veredito === "inconclusivo" && (
+            {item.banco?.veredito === "inconclusivo" && (
               <div className="mb-2.5 rounded-lg border border-amber/30 bg-amberbg px-3 py-2">
                 <div className="text-[12px] font-semibold text-amber">Não dá pra decidir</div>
                 <div className="mt-0.5 text-[12px] leading-relaxed text-sub">
@@ -472,137 +487,6 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
                 </div>
               </div>
             )}
-
-            <div className="grid gap-3 md:grid-cols-2">
-              {/* ── lado do cliente ── */}
-              <div className="rounded-lg border border-line2 bg-surface p-3">
-                <div className="eyebrow text-[9px] font-semibold uppercase text-faint">O cliente pediu</div>
-                <div className="mt-1 text-[13px] leading-snug text-ink">{item.descricao_original}</div>
-                {item.specs_complementares ? (
-                  <div className="mt-2 border-t border-line pt-2">
-                    <div className="eyebrow text-[9px] font-semibold uppercase text-faint">Specs</div>
-                    <div className="mt-0.5 whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-sub">
-                      {item.specs_complementares}
-                    </div>
-                  </div>
-                ) : (
-                  <div className="mt-2 border-t border-line pt-2 text-[11px] text-faint">
-                    Sem specs — o cliente não detalhou.
-                  </div>
-                )}
-              </div>
-
-              {/* ── lado do banco ── */}
-              <div className="rounded-lg border border-line2 bg-surface p-3">
-                <div className="flex items-start justify-between gap-2">
-                  <div className="eyebrow text-[9px] font-semibold uppercase text-faint">O banco propõe</div>
-                  <button
-                    onClick={() => onChange(index, "descricao_final", item.banco.descricao)}
-                    title="Substituir a descrição do item por esta"
-                    className="-mt-0.5 flex-shrink-0 rounded-md border border-line2 px-2 py-0.5 text-[11px] font-medium text-sub hover:border-kist hover:text-kist">
-                    usar esta
-                  </button>
-                </div>
-                <div className="mt-1 text-[13px] font-medium leading-snug text-ink">{item.banco.descricao}</div>
-
-                <div className="mt-2.5 flex flex-wrap items-baseline gap-x-4 gap-y-1 border-t border-line pt-2 text-[12px]">
-                  <span><span className="text-faint">Venda </span><span className="font-mono text-ink">{brl(item.banco.preco_un)}</span></span>
-                  <span><span className="text-faint">Custo </span>
-                    <span className={`font-mono ${item.banco.preco_custo > 0 ? "text-ink" : "text-faint"}`}>
-                      {item.banco.preco_custo > 0 ? brl(item.banco.preco_custo) : "—"}
-                    </span></span>
-                  {item.banco.preco_custo > 0 && item.banco.preco_un > 0 && (
-                    <span className="font-mono text-signal">
-                      +{Math.round((item.banco.preco_un / item.banco.preco_custo - 1) * 100)}%
-                    </span>
-                  )}
-                </div>
-
-                <div className="mt-1.5 space-y-1 text-[11.5px]">
-                  <div>
-                    <span className="text-faint">Vendido para </span>
-                    <span className="text-ink">{item.banco.cliente || "—"}</span>
-                    {item.banco.cnpj && <span className="ml-1.5 font-mono text-faint">{item.banco.cnpj}</span>}
-                  </div>
-                  {/* Rastrear = quem vendeu + por onde se fala com ele.
-                      O link resolve os dois; o resto precisa dos dois campos. */}
-                  <div>
-                    <span className="text-faint">Origem </span>
-                    {(() => {
-                      const quem  = item.banco.fornecedor || "";
-                      const canal = item.banco.fornecedor_canal || "";
-                      const cont  = item.banco.fornecedor_contato || "";
-                      const linkProd = isLink(item.banco.link_fornecedor) ? item.banco.link_fornecedor : "";
-                      // O contato leva a algum lugar? (wa.me com o pedido escrito,
-                      // mailto pro Outlook já preenchido, tel:, ou a URL do produto)
-                      const { href, rotulo } = contatoAcionavel(canal, cont, item);
-                      const alvo = href || linkProd;
-                      if (!quem && !cont && !linkProd) return <span className="text-amber">sem lastro</span>;
-                      return (
-                        <span>
-                          {alvo ? (
-                            <a href={alvo} target="_blank" rel="noreferrer"
-                              title={canal === "whatsapp" ? "Abrir conversa no WhatsApp com o pedido pronto"
-                                   : canal === "email" ? "Abrir e-mail com o pedido pronto"
-                                   : "Abrir"}
-                              className="inline-flex items-center gap-1 font-medium text-kist hover:text-kist600">
-                              <IconLink size={10} />{quem || rotulo || "abrir"}
-                            </a>
-                          ) : (
-                            <span className="text-ink">{quem || rotulo || item.banco.link_fornecedor}</span>
-                          )}
-                          {canal && canal !== "outro" && canal !== "link" && (
-                            <span className="text-faint"> · {CANAL_LBL[canal] || canal}</span>
-                          )}
-                          {cont && !isLink(cont) && <span className="ml-1 font-mono text-sub">{cont}</span>}
-                        </span>
-                      );
-                    })()}
-                    {item.banco.sku_fornecedor && <span className="ml-1.5 font-mono text-faint">{item.banco.sku_fornecedor}</span>}
-                  </div>
-                  {/* criado_em é a criação; usuario_nome é quem atualizou POR ÚLTIMO.
-                      Juntar os dois numa frase só ("cadastrado em X por Y") mente
-                      quando quem criou e quem atualizou são pessoas diferentes. */}
-                  <div className="text-faint">
-                    {item.banco.criado_em && <>Criado {new Date(item.banco.criado_em).toLocaleDateString("pt-BR")} · </>}
-                    Atualizado {item.banco.data_ref ? item.banco.data_ref.split("-").reverse().join("/") : "—"}
-                    {item.banco.usuario_nome ? ` por ${item.banco.usuario_nome}` : ""}
-                    {item.banco.proposta_tiny ? ` · proposta ${item.banco.proposta_tiny}` : ""}
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {item.banco.veredito === "mesmo" && item.banco.defesa && (
-              <div className="mt-2 border-l-2 border-signal/40 pl-2 text-[11.5px] leading-relaxed text-sub">
-                {item.banco.defesa}
-              </div>
-            )}
-            {item.banco.sem_lastro ? (
-              <div className="mt-2.5 rounded-lg border border-amber/30 bg-amberbg px-3 py-2">
-                <div className="text-[12px] font-semibold text-amber">Preço não importado</div>
-                <div className="mt-0.5 text-[12px] leading-relaxed text-sub">
-                  Este produto está sem {item.banco.falta_lastro} no banco. Recote e preencha —
-                  o que você digitar corrige o cadastro pra todo mundo.
-                </div>
-              </div>
-            ) : !item.banco.herdou_custo && (
-              <div className="mt-2 text-[11px] text-faint">
-                Custo e origem não foram copiados pro item — o match não é exato.
-              </div>
-            )}
-          </td>
-        </tr>
-      )}
-
-      {/* ── FICHA DA INTERNET (Frente A) — referência de mercado ──────────────
-          Espelha a ficha do banco: apresenta, não decide. O operador escolhe a
-          apresentação e sobe a origem (e a descrição, se quiser). O preço de
-          venda continua com ele — a internet é referência, não custo. */}
-      {motorAberto && (
-        <tr className="border-b border-line/70 bg-paper/60">
-          <td /><td />
-          <td colSpan={4} className="px-3 pb-3 pt-2">
 
             {net?.perfil?.consulta && (
               <div className="mb-2 flex flex-wrap items-center gap-2 text-[12px]">
@@ -614,92 +498,204 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
               </div>
             )}
 
-            {netLoad && (
-              <div className="rounded-lg border border-line2 bg-surface px-3 py-2.5 text-[12px] text-sub">
-                Buscando preço na internet…
-              </div>
-            )}
+            <div className="grid gap-3 md:grid-cols-2">
 
-            {!netLoad && netErr && (
-              <div className="rounded-lg border border-amber/30 bg-amberbg px-3 py-2 text-[12px] text-amber">{netErr}</div>
-            )}
-
-            {!netLoad && net && (net.apresentacoes || []).length > 0 && (
-              <div className="rounded-lg border border-kist/40 bg-surface p-3">
-                <div className="flex items-start justify-between gap-2">
-                  <div className="eyebrow text-[9px] font-semibold uppercase text-faint">A internet propõe</div>
-                  <span className="rounded-md bg-signalbg px-1.5 py-0.5 text-[10px] font-medium text-signal">mesmo item</span>
-                </div>
-
-                <div className="mt-2 space-y-1.5">
-                  {net.apresentacoes.map((ap, k) => {
-                    const imp = !!(ap.fator_importacao && ap.fator_importacao > 1);
-                    return (
-                      <div key={k} className="border-t border-line pt-1.5 first:border-t-0 first:pt-0">
-                        <div className="flex items-baseline justify-between gap-2">
-                          <span className="text-[12px] text-sub">{ap.apresentacao || "unidade"}</span>
-                          <div className="flex items-center gap-2">
-                            <span className="font-mono text-[14px] font-medium text-ink">{brl(ap.preco_brl)}</span>
-                            <button
-                              onClick={() => usarFichaInternet(ap)}
-                              title="Subir origem desta ficha para o item"
-                              className="rounded-md border border-line2 px-2 py-0.5 text-[11px] font-medium text-sub hover:border-kist hover:text-kist">
-                              usar esta
-                            </button>
-                          </div>
-                        </div>
-                        {imp && (
-                          <div className="mt-0.5 font-mono text-[10.5px] text-faint">
-                            {ap.moeda_original} {ap.preco_original} × {ap.cotacao_usada} (câmbio) × {ap.fator_importacao} = {brl(ap.preco_estimado_brl)} posto
-                          </div>
-                        )}
-                        <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[10.5px] text-faint">
-                          <span>{ap.fonte || "—"}</span><span>·</span>
-                          <span>{ap.tipo_preco === "atacado" ? "atacado" : (imp ? "importado" : "varejo")}</span>
-                          {ap.url && (<><span>·</span><a href={ap.url} target="_blank" rel="noreferrer" className="text-kist hover:underline">ver anúncio</a></>)}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-
-                <div className="mt-2.5 border-t border-line pt-2">
-                  <div className="eyebrow text-[9px] font-semibold uppercase text-faint">Descrição na proposta</div>
-                  <div className="mt-1 flex flex-col gap-1 text-[12px] text-ink">
-                    <label className="flex items-center gap-2">
-                      <input type="radio" name={`desc-${index}`} checked={descFonte === "cliente"} onChange={() => setDescFonte("cliente")} />
-                      manter a do cliente
-                    </label>
-                    <label className="flex items-center gap-2">
-                      <input type="radio" name={`desc-${index}`} checked={descFonte === "internet"} onChange={() => setDescFonte("internet")} />
-                      usar a da internet
-                    </label>
+              {/* ── BANCO (esquerda) ── */}
+              {item.banco ? (
+                <div className="rounded-lg border border-line2 bg-surface p-3">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="eyebrow text-[9px] font-semibold uppercase text-faint">O banco propõe</div>
+                    <button
+                      onClick={() => onChange(index, "descricao_final", item.banco.descricao)}
+                      title="Substituir a descrição do item por esta"
+                      className="-mt-0.5 flex-shrink-0 rounded-md border border-line2 px-2 py-0.5 text-[11px] font-medium text-sub hover:border-kist hover:text-kist">
+                      usar esta
+                    </button>
                   </div>
-                </div>
+                  <div className="mt-1 text-[13px] font-medium leading-snug text-ink">{item.banco.descricao}</div>
 
-                {!cnpj && (
-                  <div className="mt-2 rounded-md border border-rose/30 bg-rosebg px-2 py-1.5 text-[11px] text-rose">
-                    Sem CNPJ na proposta — dá pra usar, mas o sistema não vai aprender a buscar sozinho para este cliente.
+                  <div className="mt-2.5 flex flex-wrap items-baseline gap-x-4 gap-y-1 border-t border-line pt-2 text-[12px]">
+                    <span><span className="text-faint">Venda </span><span className="font-mono text-ink">{brl(item.banco.preco_un)}</span></span>
+                    <span><span className="text-faint">Custo </span>
+                      <span className={`font-mono ${item.banco.preco_custo > 0 ? "text-ink" : "text-faint"}`}>
+                        {item.banco.preco_custo > 0 ? brl(item.banco.preco_custo) : "—"}
+                      </span></span>
+                    {item.banco.preco_custo > 0 && item.banco.preco_un > 0 && (
+                      <span className="font-mono text-signal">
+                        +{Math.round((item.banco.preco_un / item.banco.preco_custo - 1) * 100)}%
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="mt-1.5 space-y-1 text-[11.5px]">
+                    <div>
+                      <span className="text-faint">Vendido para </span>
+                      <span className="text-ink">{item.banco.cliente || "—"}</span>
+                      {item.banco.cnpj && <span className="ml-1.5 font-mono text-faint">{item.banco.cnpj}</span>}
+                    </div>
+                    <div>
+                      <span className="text-faint">Origem </span>
+                      {(() => {
+                        const quem  = item.banco.fornecedor || "";
+                        const canal = item.banco.fornecedor_canal || "";
+                        const cont  = item.banco.fornecedor_contato || "";
+                        const linkProd = isLink(item.banco.link_fornecedor) ? item.banco.link_fornecedor : "";
+                        const { href, rotulo } = contatoAcionavel(canal, cont, item);
+                        const alvo = href || linkProd;
+                        if (!quem && !cont && !linkProd) return <span className="text-amber">sem lastro</span>;
+                        return (
+                          <span>
+                            {alvo ? (
+                              <a href={alvo} target="_blank" rel="noreferrer"
+                                className="inline-flex items-center gap-1 font-medium text-kist hover:text-kist600">
+                                <IconLink size={10} />{quem || rotulo || "abrir"}
+                              </a>
+                            ) : (
+                              <span className="text-ink">{quem || rotulo || item.banco.link_fornecedor}</span>
+                            )}
+                            {canal && canal !== "outro" && canal !== "link" && (
+                              <span className="text-faint"> · {CANAL_LBL[canal] || canal}</span>
+                            )}
+                            {cont && !isLink(cont) && <span className="ml-1 font-mono text-sub">{cont}</span>}
+                          </span>
+                        );
+                      })()}
+                      {item.banco.sku_fornecedor && <span className="ml-1.5 font-mono text-faint">{item.banco.sku_fornecedor}</span>}
+                    </div>
+                    <div className="text-faint">
+                      {item.banco.criado_em && <>Criado {new Date(item.banco.criado_em).toLocaleDateString("pt-BR")} · </>}
+                      Atualizado {item.banco.data_ref ? item.banco.data_ref.split("-").reverse().join("/") : "—"}
+                      {item.banco.usuario_nome ? ` por ${item.banco.usuario_nome}` : ""}
+                      {item.banco.proposta_tiny ? ` · proposta ${item.banco.proposta_tiny}` : ""}
+                    </div>
+                  </div>
+
+                  {item.banco.veredito === "mesmo" && item.banco.defesa && (
+                    <div className="mt-2 border-l-2 border-signal/40 pl-2 text-[11.5px] leading-relaxed text-sub">
+                      {item.banco.defesa}
+                    </div>
+                  )}
+                  {item.banco.sem_lastro && (
+                    <div className="mt-2.5 rounded-lg border border-amber/30 bg-amberbg px-3 py-2">
+                      <div className="text-[12px] font-semibold text-amber">Preço não importado</div>
+                      <div className="mt-0.5 text-[12px] leading-relaxed text-sub">
+                        Este produto está sem {item.banco.falta_lastro} no banco. Recote e preencha.
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="flex items-center justify-center rounded-lg border border-dashed border-line2 bg-surface p-3 text-center text-[12px] text-faint">
+                  Sem item correspondente no banco
+                </div>
+              )}
+
+              {/* ── INTERNET (direita) ── */}
+              <div>
+                {netLoad && (
+                  <div className="flex h-full items-center rounded-lg border border-line2 bg-surface px-3 py-2.5 text-[12px] text-sub">
+                    Buscando preço na internet…
+                  </div>
+                )}
+
+                {!netLoad && netErr && (
+                  <div className="rounded-lg border border-amber/30 bg-amberbg px-3 py-2 text-[12px] text-amber">
+                    {netErr}
+                    <button onClick={() => { netBuscadoRef.current = true; buscarInternet(); }}
+                      className="ml-2 rounded-md border border-line2 px-2 py-0.5 text-[11px] font-medium text-sub hover:border-kist hover:text-kist">
+                      tentar de novo
+                    </button>
+                  </div>
+                )}
+
+                {!netLoad && !net && !netErr && !netBuscadoRef.current && (
+                  <div className="flex h-full flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-line2 bg-surface p-3 text-center">
+                    <div className="text-[12px] text-faint">Referência de mercado na internet</div>
+                    <button onClick={() => { netBuscadoRef.current = true; buscarInternet(); }}
+                      className="rounded-md border border-line2 px-2.5 py-1 text-[11px] font-medium text-kist hover:border-kist">
+                      🌐 buscar na internet
+                    </button>
+                  </div>
+                )}
+
+                {!netLoad && net && (net.apresentacoes || []).length > 0 && (
+                  <div className="rounded-lg border border-kist/40 bg-surface p-3">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="eyebrow text-[9px] font-semibold uppercase text-faint">A internet propõe</div>
+                      <span className="rounded-md bg-signalbg px-1.5 py-0.5 text-[10px] font-medium text-signal">mesmo item</span>
+                    </div>
+
+                    <div className="mt-2 space-y-1.5">
+                      {net.apresentacoes.map((ap, k) => {
+                        const imp = !!(ap.fator_importacao && ap.fator_importacao > 1);
+                        return (
+                          <div key={k} className="border-t border-line pt-1.5 first:border-t-0 first:pt-0">
+                            <div className="flex items-baseline justify-between gap-2">
+                              <span className="text-[12px] text-sub">{ap.apresentacao || "unidade"}</span>
+                              <div className="flex items-center gap-2">
+                                <span className="font-mono text-[14px] font-medium text-ink">{brl(ap.preco_brl)}</span>
+                                <button
+                                  onClick={() => usarFichaInternet(ap)}
+                                  title="Usar esta ficha e preencher a origem do preço"
+                                  className="rounded-md border border-line2 px-2 py-0.5 text-[11px] font-medium text-sub hover:border-kist hover:text-kist">
+                                  usar esta
+                                </button>
+                              </div>
+                            </div>
+                            {imp && (
+                              <div className="mt-0.5 font-mono text-[10.5px] text-faint">
+                                {ap.moeda_original} {ap.preco_original} × {ap.cotacao_usada} (câmbio) × {ap.fator_importacao} = {brl(ap.preco_estimado_brl)} posto
+                              </div>
+                            )}
+                            <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[10.5px] text-faint">
+                              <span>{ap.fonte || "—"}</span><span>·</span>
+                              <span>{ap.tipo_preco === "atacado" ? "atacado" : (imp ? "importado" : "varejo")}</span>
+                              {ap.url && (<><span>·</span><a href={ap.url} target="_blank" rel="noreferrer" className="text-kist hover:underline">ver anúncio</a></>)}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    <div className="mt-2.5 border-t border-line pt-2">
+                      <div className="eyebrow text-[9px] font-semibold uppercase text-faint">Descrição na proposta</div>
+                      <div className="mt-1 flex flex-col gap-1 text-[12px] text-ink">
+                        <label className="flex items-center gap-2">
+                          <input type="radio" name={`desc-${index}`} checked={descFonte === "cliente"} onChange={() => setDescFonte("cliente")} />
+                          manter a do cliente
+                        </label>
+                        <label className="flex items-center gap-2">
+                          <input type="radio" name={`desc-${index}`} checked={descFonte === "internet"} onChange={() => setDescFonte("internet")} />
+                          usar a da internet
+                        </label>
+                      </div>
+                    </div>
+
+                    {!cnpj && (
+                      <div className="mt-2 rounded-md border border-rose/30 bg-rosebg px-2 py-1.5 text-[11px] text-rose">
+                        Sem CNPJ na proposta — o sistema não vai aprender a buscar sozinho para este cliente.
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {!netLoad && net && (
+                  <div className="mt-2 flex items-center gap-2">
+                    <span className="whitespace-nowrap text-[11px] text-faint">não é isso?</span>
+                    <input
+                      value={reTermo}
+                      onChange={(e) => setReTermo(e.target.value)}
+                      placeholder="re-buscar com outro termo"
+                      className="flex-1 rounded-md border border-line2 bg-surface px-2 py-1 text-[12px]" />
+                    <button
+                      onClick={() => buscarInternet(reTermo)}
+                      className="rounded-md border border-line2 px-2 py-1 text-[11px] font-medium text-sub hover:border-kist hover:text-kist">
+                      buscar
+                    </button>
                   </div>
                 )}
               </div>
-            )}
-
-            {!netLoad && (
-              <div className="mt-2 flex items-center gap-2">
-                <span className="whitespace-nowrap text-[11px] text-faint">não é isso? re-buscar:</span>
-                <input
-                  value={reTermo}
-                  onChange={(e) => setReTermo(e.target.value)}
-                  placeholder="ex.: cabo S/FTP Cat6a 23AWG"
-                  className="flex-1 rounded-md border border-line2 bg-surface px-2 py-1 text-[12px]" />
-                <button
-                  onClick={() => buscarInternet(reTermo)}
-                  className="rounded-md border border-line2 px-2 py-1 text-[11px] font-medium text-sub hover:border-kist hover:text-kist">
-                  buscar
-                </button>
-              </div>
-            )}
+            </div>
           </td>
         </tr>
       )}
