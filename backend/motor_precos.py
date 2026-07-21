@@ -385,22 +385,28 @@ REGRAS:
 - atributos_excludentes: preencha só o que o cliente deixou claro; o que não puder divergir na busca. Deixe vazio o que não se aplica.
 - confianca = "baixa" e precisa_conferir = true QUANDO você não tem certeza do que é o item (descrição vaga, sem fabricante/PN, ambígua entre categorias). Ser honesto aqui é melhor que chutar.
 - "importado" só true se claramente sem equivalente nacional comum. Na dúvida, false.
+- NÃO converta número de dimensão/código em unidade que o cliente não escreveu (ex.: "16 60" é dimensão, NÃO vire "16W 60°"; "9V" é a tensão da pilha, não impõe marca). Se não sabe o que o número significa, deixe como o cliente escreveu.
 - Nunca invente fabricante/MPN. Vazio é melhor que errado."""
 
 
-SYSTEM_CONFERIR_ITEM = """Você é um comprador técnico da Kist (telecom/energia). O cliente mandou a descrição de um item, muitas vezes ABREVIADA ou em CÓDIGO INTERNO (ex.: "W50 - WOMER MINI OUTDOOR ALUMINIO PAREDE W50 16 60" é um gabinete/rack outdoor da Womer). Sua missão é DESCOBRIR o que é o item — como você faria perguntando num chat ou buscando no Google.
+SYSTEM_CONFERIR_ITEM = """Você é um comprador técnico da Kist (telecom/energia). O cliente mandou a descrição de um item, às vezes ABREVIADA ou em CÓDIGO INTERNO (ex.: "W50 - WOMER MINI OUTDOOR ALUMINIO PAREDE W50 16 60" é um gabinete/rack outdoor da Womer). Sua missão é DESCOBRIR o que é o item usando SÓ o que você CONFIRMAR em páginas reais — nunca um palpite.
 
-Use a busca web de verdade: procure o código, o modelo, a marca (Womer, Furukawa, Clamper, Fibersul, etc.), leia as páginas de fabricante e de lojas (dimensional, mercadolivre, etc.) e identifique o produto real, o fabricante, o part number e as características técnicas. Um operador humano acha isso com a mesma descrição — você também consegue.
+Use a busca web de verdade: procure os termos que o cliente deu (código, modelo, marca — Womer, Furukawa, Clamper, Fibersul, etc.), leia as páginas de fabricante e de lojas (dimensional, mercadolivre, etc.) e identifique o produto real.
+
+REGRA DE OURO — NÃO INVENTAR:
+- Só preencha "mpn"/"fabricante" se você VIU esse código/marca numa página real que corresponde ao item. Não achou o part number numa página? "mpn" fica VAZIO. Um código errado manda a busca para o produto ERRADO (o operador cota 5×–20× abaixo do item certo). Vazio é o resultado CERTO, não uma falha.
+- "consulta" refinada = só marca/modelo/tipo que você CONFIRMOU + os termos do próprio cliente. Se não confirmou nada, repita os termos do cliente como estão. NUNCA acrescente um part number, marca ou atributo que você não viu numa página.
+- Não converta dimensão/código em unidade que o cliente não escreveu ("16 60" é dimensão, não "16W 60°").
 
 NÃO busque preço agora; só IDENTIFIQUE. Devolva SOMENTE JSON, sem markdown:
 {
-  "consulta": "termo de busca refinado com o nome REAL do produto que você descobriu (marca + modelo + tipo), pronto para achar à venda",
+  "consulta": "termos do cliente + marca/modelo/tipo SÓ se confirmado numa página real",
   "fabricante": "", "mpn": "",
   "categoria": "",
   "atributos_excludentes": {"tipo": "", "categoria_tec": "", "bitola_dim": "", "outros": ""},
   "achou_identificacao": true
 }
-Se a web esclareceu, achou_identificacao=true e a consulta refinada. Se realmente não deu, repita o melhor palpite e achou_identificacao=false. Nunca invente — mas esforce-se: o item quase sempre existe e é achável."""
+Confirmou o item numa página real => achou_identificacao=true e a consulta refinada (sem inventar). Não confirmou => achou_identificacao=false, "mpn" e "fabricante" VAZIOS, e "consulta" = os termos do cliente. Melhor devolver o termo do cliente do que um palpite que erra o alvo."""
 
 
 def _correcoes_similares(entrada: str, sb, lim: int = 3) -> list:
@@ -804,36 +810,38 @@ def registrar_log(sb, descricao_busca, camada, ficha, ms_total, usuario_email=No
         pass
 
 
-def resolver_ficha(item: dict, sb, claude, usuario_email: str = None,
-                   cnpj: str = None, termo_rebusca: str = None) -> dict:
-    """ORQUESTRADOR do motor. Percorre camada 2 -> camada 3.
+def _perfil_cru(item: dict) -> dict:
+    """Perfil MÍNIMO a partir da descrição CRUA do cliente — SEM IA, SEM interpretar,
+    SEM inventar identificador. consulta = o que o cliente escreveu (+ as specs que
+    ELE deu). É o Princípio Zero do blueprint: só o que o cliente deu. Espelha o
+    shape que `interpretar()` devolve, para a cascata/julgamento/cache funcionarem
+    sem mudança."""
+    desc  = (item.get("descricao") or item.get("descricao_original") or "").strip()
+    specs = (item.get("specs_complementares") or "").strip()
+    qtd   = item.get("quantidade")
+    uni   = item.get("unidade") or "UN"
+    # consulta crua = descrição + specs (AMBOS dados pelo cliente). Nada inventado.
+    consulta = desc
+    if specs and specs.lower() not in desc.lower():
+        consulta = f"{desc} {specs}".strip()
+    return {
+        "descricao": desc, "specs": specs, "quantidade": qtd, "unidade": uni,
+        "entrada_norm": _norm_entrada(f"{desc} {specs}".strip()),
+        "consulta": consulta, "mpn": "", "fabricante": "", "categoria": "",
+        "atributos_excludentes": {}, "apresentacao_desejada": "indiferente",
+        "importado": False, "confianca": "media", "conferiu_web": False,
+    }
 
-    A CAMADA 1 (banco de preços) NÃO é aqui — é o matching existente do /extrair.
-    O motor só é chamado para itens SEM match no banco. Então começa na camada 2.
 
-      • Camada 2: ficha viva e fresca (< TTL) => serve direto (rápido, barato).
-      • Camada 2 velha (> TTL) ou inexistente => Camada 3 (descoberta), que salva
-        a ficha nova (aposentando a antiga) para virar camada 2 futura.
-
-    `termo_rebusca`: o operador reescreveu o termo (correção implícita, sinal forte)
-    => usa o termo dele E ensina a memória de interpretação.
-    `cnpj`: âncora do nó da internet (registra o acerto quando resolve).
-    """
-    t0 = time.time()
-    ctx = {"claude": claude, "sb": sb}
-    perfil = interpretar(item, claude, sb=sb)
-
-    # Correção implícita: o operador reescreveu. Usa o termo dele e APRENDE.
-    if (termo_rebusca or "").strip():
-        aprender_correcao_reescrita(sb, perfil.get("entrada_norm"), termo_rebusca, claude)
-        perfil["consulta"] = termo_rebusca.strip()
-
-    termo = perfil.get("consulta")
-
-    # ── CAMADA 2 ─────────────────────────────────────────────────────────────
+def _passada(perfil: dict, reg: dict, ctx: dict, sb) -> dict:
+    """Uma passada de resolução para UM perfil: camada 2 (cache vivo < TTL) e, se
+    não servir, camada 3 (cascata de descoberta). NÃO loga e NÃO persiste — quem
+    decide salvar/logar é o orquestrador (uma linha de log por chamada do motor).
+    Devolve sempre uma ficha (apresentacoes podem vir vazias)."""
+    # ── camada 2 — ficha viva e fresca serve direto ──────────────────────────
     aps2, mais_velha = buscar_camada2(perfil, sb)
     if aps2 and mais_velha is not None and mais_velha < FICHA_TTL_HORAS:
-        ficha = {
+        return {
             "apresentacoes": aps2,
             "resumo": "cache (camada 2)",
             "fonte_resolveu": "cache",
@@ -845,17 +853,87 @@ def resolver_ficha(item: dict, sb, claude, usuario_email: str = None,
             "telemetria": [{"fonte": "cache", "bloco": "camada2",
                             "idade_horas": round(mais_velha, 1)}],
         }
-        registrar_log(sb, termo, 2, ficha, int((time.time() - t0) * 1000), usuario_email)
-        return ficha
-
-    # ── CAMADA 3 (nova ou revalidação de ficha > TTL) ────────────────────────
-    reg = montar_registry()
+    # ── camada 3 — descoberta (cascata + julgamento) ─────────────────────────
     ficha = buscar_cascata(perfil, reg, ctx)
     ficha["camada"] = 3
-    if ficha.get("apresentacoes"):
-        salvar_ficha(perfil, ficha["apresentacoes"], sb)   # vira camada 2 futura
-    registrar_log(sb, termo, 3, ficha, int((time.time() - t0) * 1000), usuario_email)
     return ficha
+
+
+def resolver_ficha(item: dict, sb, claude, usuario_email: str = None,
+                   cnpj: str = None, termo_rebusca: str = None) -> dict:
+    """ORQUESTRADOR do motor. Percorre camada 2 -> camada 3, em DUAS PASSADAS.
+
+    A CAMADA 1 (banco de preços) NÃO é aqui — é o matching existente do /extrair.
+    O motor só é chamado para itens SEM match no banco.
+
+    FRENTE 1 — CRUA PRIMEIRO (decisão do Leonardo, blueprint 20/07):
+      1) PASSA CRUA: busca com a descrição do cliente COMO ELE ESCREVEU (+ specs que
+         ele deu), SEM interpretar e SEM inventar identificador. É rápida, barata e
+         não tem como alucinar MPN — a maioria dos itens (commodity, cabo, patch,
+         bobina) resolve aqui.
+      2) SÓ SE A CRUA NÃO ACHAR: interpreta (Sonnet, com a regra de NÃO inventar) e
+         re-busca. É o caminho do item cifrado (ex.: W50 da Womer) — caro e raro,
+         por isso é o último recurso, não o padrão. Também derruba a latência: a
+         interpretação pesada (2 chamadas Sonnet) some do caminho comum.
+
+    `termo_rebusca`: o operador reescreveu o termo (correção implícita, sinal forte)
+      => usa o termo DELE direto (nem crua nem interpretação) e ensina a memória.
+    `cnpj`: âncora do nó da internet (registra o acerto quando resolve).
+
+    Sempre UMA linha em motor_precos_log por chamada. A telemetria carrega a `etapa`
+    (crua | interpretada | reescrita | cache) para o monitoramento medir a verdade —
+    quanto resolve na crua vs. quanto precisa de interpretação.
+    """
+    t0 = time.time()
+    ctx = {"claude": claude, "sb": sb}
+    reg = montar_registry()
+
+    def _ms():
+        return int((time.time() - t0) * 1000)
+
+    def _entregar(perfil, ficha, etapa):
+        """Persiste (só camada 3 com resultado), loga UMA vez e devolve a ficha."""
+        ficha["etapa"] = etapa
+        if ficha.get("apresentacoes") and ficha.get("camada") == 3:
+            salvar_ficha(perfil, ficha["apresentacoes"], sb)   # vira camada 2 futura
+        registrar_log(sb, perfil.get("consulta") or perfil.get("descricao"),
+                      ficha.get("camada", 3), ficha, _ms(), usuario_email)
+        return ficha
+
+    # ── CAMINHO 0 — operador REESCREVEU o termo (sinal forte). Usa o dele. ─────
+    if (termo_rebusca or "").strip():
+        perfil = interpretar(item, claude, sb=sb)   # herda entrada_norm/specs/excludentes
+        aprender_correcao_reescrita(sb, perfil.get("entrada_norm"), termo_rebusca, claude)
+        perfil["consulta"] = termo_rebusca.strip()
+        ficha = _passada(perfil, reg, ctx, sb)
+        return _entregar(perfil, ficha, "reescrita")
+
+    # ── PASSA 1 — CRUA (descrição do cliente, sem IA, sem inventar) ───────────
+    perfil_cru = _perfil_cru(item)
+    ficha_cru = _passada(perfil_cru, reg, ctx, sb)
+    if ficha_cru.get("apresentacoes"):
+        return _entregar(perfil_cru, ficha_cru, "crua")
+
+    # guarda a telemetria da crua p/ juntar no log final (visibilidade num registro só)
+    tel_crua = [{"etapa": "crua", **t} for t in (ficha_cru.get("telemetria") or [])]
+
+    # ── PASSA 2 — FALLBACK: crua não achou => interpreta (sem inventar) e re-busca ─
+    perfil_int = interpretar(item, claude, sb=sb)
+    mudou = (_norm_entrada(perfil_int.get("consulta") or "")
+             != _norm_entrada(perfil_cru.get("consulta") or ""))
+    if mudou:
+        ficha = _passada(perfil_int, reg, ctx, sb)
+    else:
+        # interpretação não mudou o termo => re-buscar seria repetir a crua. Não gasta.
+        ficha = {"apresentacoes": [], "camada": 3, "fonte_resolveu": None,
+                 "resumo": "crua não achou; interpretação não mudou o termo",
+                 "telemetria": []}
+
+    # junta a telemetria das duas passadas num log só
+    ficha["telemetria"] = tel_crua + [{"etapa": "interpretada", **t}
+                                       for t in (ficha.get("telemetria") or [])]
+    etapa = "interpretada" if ficha.get("apresentacoes") else "crua+interpretada_sem_resultado"
+    return _entregar(perfil_int, ficha, etapa)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
