@@ -735,16 +735,30 @@ diferente = null; spec divergente = não é o mesmo item, mesmo que a descriçã
         # Ele recota e, ao preencher, o produto ganha o lastro que faltava.
         # Esconder o match (opção A) seria pior: o operador não validaria nada e a
         # memória registraria erro contra um par que ele nunca viu.
-        _sem_lastro = so_rastreavel and tem_match and not _rastreavel(_row)
+        # ── REGRA (Leonardo, jul/2026): valor SÓ entra automático em MATCH IDÊNTICO
+        # COM lastro. Precisão acima de cobertura — menos item entra sozinho, mais o
+        # operador confirma.
+        #   • "Idêntico" = mesma chave normalizada (_norm_entrada ignora acento,
+        #     pontuação e caixa) OU veio da MEMÓRIA (desfecho que o operador já mandou
+        #     pro Tiny — identidade confirmada por ele). Haiku dizendo "alta" em TEXTO
+        #     DIFERENTE é semântico: NÃO é idêntico, então não auto-preenche.
+        #   • "Trazer do banco = trazer origem": nada entra sem lastro. Venda, custo e
+        #     origem entram JUNTOS, e só quando idêntico E a linha tem lastro
+        #     (origem + custo + venda, via _rastreavel).
+        #   • Qualquer outra coisa (semântico, media, baixa, ou idêntico-sem-lastro):
+        #     o candidato aparece na FICHA como referência, mas nenhum valor entra.
+        _veio_memoria = bool(match.get("_memoria"))
+        _desc_igual = bool(_row) and _norm_entrada(desc_original) == _norm_entrada((_row or {}).get("descricao") or "")
+        _identico = (confianca == "alta") and (_veio_memoria or _desc_igual)
+        _carrega = _identico and _rastreavel(_row)
+        # idêntico mas o banco não tem lastro => mostra e pede recotar (não preenche)
+        _sem_lastro = _identico and not _rastreavel(_row)
 
-        # Preço: sugerido em QUALQUER match. O aceite não é item a item — é o CSV.
-        preco_un = 0.0 if _sem_lastro else (float(match.get("banco_preco") or 0) if tem_match else 0.0)
-
-        # Custo/origem: SÓ em 'alta'. Em media/baixa não herda — na dúvida, em branco,
-        # pra não arrastar o custo de um item parecido mas diferente.
+        preco_un = 0.0
         preco_custo, link_fornecedor, fornecedor, sku_fornecedor = 0.0, "", "", ""
         fornecedor_canal, fornecedor_contato = "", ""
-        if confianca == "alta" and _row and not _sem_lastro:
+        if _carrega:
+            preco_un = float(match.get("banco_preco") or 0)
             try:
                 preco_custo = float(_row.get("preco_custo") or 0)
             except (TypeError, ValueError):
@@ -755,15 +769,20 @@ diferente = null; spec divergente = não é o mesmo item, mesmo que a descriçã
             fornecedor_contato = _row.get("fornecedor_contato") or ""
             sku_fornecedor = _row.get("sku_fornecedor") or ""
 
+        # IDENTIDADE (A) pro save: o item casou com ESTA linha do banco (idêntico) =>
+        # ao salvar, atualiza ELA, sem criar gêmeo cru. Só quando idêntico (a linha
+        # certa); match semântico/incerto não amarra em linha nenhuma.
+        _banco_id = (_row or {}).get("id") if _identico else None
+
         if not tem_match:
             obs_item = "SEM PREÇO"
         elif _sem_lastro:
             obs_item = "⚠ SEM LASTRO — recotar"
-        elif confianca == "alta":
+        elif _carrega:
             _ref = match.get("banco_proposta", "")
             obs_item = f"✓ ref {_ref}" if _ref else "✓"
         else:
-            obs_item = "⚠ CONFIRA"
+            obs_item = "⚠ CONFIRA"   # candidato (semântico/incerto): referência, não preencheu
 
         # ── FICHA DE PROCEDÊNCIA ─────────────────────────────────────────────
         # Tudo que o operador precisa pra bater o que o cliente pediu contra o que
@@ -787,7 +806,8 @@ diferente = null; spec divergente = não é o mesmo item, mesmo que a descriçã
                 "proposta_tiny":  match.get("banco_proposta") or "",
                 "confianca":      confianca,
                 "defesa":         _defesa_do_match(match, _row),
-                "herdou_custo":   confianca == "alta" and not _sem_lastro,
+                "herdou_custo":   _carrega,
+                "identico":       _identico,
                 # Sem lastro: a ficha mostra tudo, mas nenhum valor entrou no item.
                 "sem_lastro":     _sem_lastro,
                 "falta_lastro":   _falta_lastro(_row) if _sem_lastro else "",
@@ -817,6 +837,8 @@ diferente = null; spec divergente = não é o mesmo item, mesmo que a descriçã
             "sku_fornecedor": sku_fornecedor,
             "obs": obs_item,
             "confianca_match": confianca,
+            "identico": _identico,
+            "banco_id": _banco_id,
             "banco": ficha,
             # Mantidos pra não quebrar tela/consumidor antigo enquanto o front migra
             "banco_candidato": banco_desc if confianca == "baixa" else None,
@@ -1423,8 +1445,30 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
         if (item.get("sku_fornecedor") or "").strip():
             origem["sku_fornecedor"] = item["sku_fornecedor"].strip()
 
-        _pid = None
+        # IDENTIDADE (A) — quando o item CASOU (idêntico) com uma linha do banco na
+        # geração, o front devolve o `banco_id`. Atualiza ELA — sem procurar por texto
+        # e sem criar gêmeo cru ("Switch 24 portas" ao lado de "Switch de Rede Gigabit
+        # com 24 Portas"). A descrição da linha canônica NÃO é tocada (fica a rica).
+        _bid = item.get("banco_id")
         try:
+            _bid = int(_bid) if _bid not in (None, "", 0, "0", False) else None
+        except (TypeError, ValueError):
+            _bid = None
+
+        _pid = None
+        if _bid:
+            try:
+                sb.table("produtos").update({
+                    "preco_un": float(preco), "data_ref": hoje,
+                    "proposta_tiny": proposta, "cliente": cliente,
+                    **origem, **({"cnpj": cnpj} if cnpj else {}), **quem,
+                }).eq("id", _bid).execute()
+                atualizados += 1
+                _pid = _bid
+            except Exception:
+                _pid = None          # cai no caminho por texto abaixo
+        if _pid is None:
+          try:
             # REGRA (v3.13): o banco tem UMA linha por descrição.
             #   achou   -> atualiza (o preço mais fresco sempre vence)
             #   não achou -> insere (produto novo)
@@ -1480,7 +1524,7 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
                             ignorados += 1
                     else:
                         raise
-        except Exception:
+          except Exception:
             ignorados += 1
 
         # [4] APRENDIZADO: o par (texto do cliente -> produto que a proposta virou)

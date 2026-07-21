@@ -22,6 +22,51 @@ const USUARIOS_PERMITIDOS = new Set(
 );
 const emailAutorizado = (e) => USUARIOS_PERMITIDOS.has((e || "").trim().toLowerCase());
 
+// ── Preço no padrão brasileiro ────────────────────────────────────────────────
+// PONTO = separador de milhar, VÍRGULA = centavos. "19213,90" e "19.213,90" -> 19213.90.
+// Regra à prova de erro: o separador decimal é o ÚLTIMO ponto/vírgula seguido de 1-2
+// dígitos; tudo antes disso é milhar e some. Assim "19213.90" (ponto por hábito) também
+// cai em 19213,90 em vez de virar 1.921.390 — não dá pra errar 100x.
+function parsePrecoBR(str) {
+  let s = String(str ?? "").trim().replace(/[^\d.,]/g, "");
+  if (!s) return 0;
+  const m = s.match(/[.,](\d{1,2})$/);
+  if (m) {
+    const dec = m[1];
+    const intPart = s.slice(0, s.length - dec.length - 1).replace(/[.,]/g, "");
+    return parseFloat((intPart || "0") + "." + dec) || 0;
+  }
+  return parseFloat(s.replace(/[.,]/g, "")) || 0;
+}
+
+// Mostra o número com vírgula; 0/vazio -> "" (campo fica em branco, sem "0" remanescente).
+function precoDisplay(v) {
+  if (v === "" || v === null || v === undefined) return "";
+  const n = Number(v);
+  if (!n) return "";
+  return String(n).replace(".", ",");
+}
+
+// Campo de preço BR: aceita vírgula/ponto, seleciona tudo no foco (digitar SOBRESCREVE
+// o zero, sem sobra) e empurra o número já parseado pro pai. Mantém o texto cru enquanto
+// o operador digita (não fica "pulando" a vírgula), reformata no blur.
+function PrecoInput({ value, onCommit, className, placeholder = "0,00", ...rest }) {
+  const [raw, setRaw] = useState(null);
+  const display = raw !== null ? raw : precoDisplay(value);
+  return (
+    <input
+      {...rest}
+      inputMode="decimal"
+      className={className}
+      placeholder={placeholder}
+      value={display}
+      onFocus={(e) => e.target.select()}
+      onChange={(e) => { setRaw(e.target.value); onCommit(parsePrecoBR(e.target.value)); }}
+      onBlur={() => setRaw(null)}
+    />
+  );
+}
+
 // Decodifica o payload de um JWT tratando UTF-8 corretamente.
 // atob() puro devolve bytes crus e corrompe acentos (ex.: "Fábio" -> "FÃ¡bio").
 function decodeJwtPayload(jwt) {
@@ -110,7 +155,7 @@ const MARKETPLACES = [
 ];
 
 // ── Linha de item da revisão ───────────────────────────────────────────────
-function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
+function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, cnpj }) {
   // ── Alerta ────────────────────────────────────────────────────────────
   const [mostrarAlerta, setMostrarAlerta] = useState(false);
   const [alertaTexto, setAlertaTexto] = useState(() => item.alerta_produto?.texto || "");
@@ -418,6 +463,14 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
               className={`text-[11px] hover:text-sub ${temOrigem ? "text-kist" : "text-faint"}`}>
               {mostrarOrigem ? "− origem do preço" : temOrigem ? "✓ origem do preço" : "+ origem do preço"}
             </button>
+            {onRemove && (
+              <button
+                onClick={() => { if (window.confirm(`Excluir "${(item.descricao_final || "este item").slice(0, 50)}" da proposta?`)) onRemove(index); }}
+                title="Excluir item da proposta"
+                className="ml-auto text-[11px] text-faint/70 hover:text-rose">
+                ✕ excluir
+              </button>
+            )}
           </div>
           {mostrarSpecs && (
             <textarea
@@ -445,11 +498,12 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
         <td className="py-2 pr-4">
           <div className="flex items-center justify-end gap-1">
             <span className={`text-[11px] ${semPreco ? "text-amber" : "text-faint"}`}>R$</span>
-            <input type="number" step="0.001" placeholder="—"
-              className={`w-20 rounded-md bg-transparent px-1 py-1 text-right font-mono text-[12.5px] cell-input
+            <PrecoInput
+              className={`w-24 rounded-md bg-transparent px-1 py-1 text-right font-mono text-[12.5px] cell-input
                 ${semPreco ? "text-amber placeholder:text-amber/70" : "text-ink"}`}
+              placeholder="—"
               value={item.preco_un}
-              onChange={(e) => onChange(index, "preco_un", parseFloat(e.target.value) || 0)}
+              onCommit={(v) => onChange(index, "preco_un", v)}
             />
           </div>
         </td>
@@ -803,21 +857,19 @@ function ItemRow({ item, index, onChange, token, apiUrl, fonteTexto, cnpj }) {
               <div className="flex items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2.5 py-1.5">
                 <span className="text-[11px] text-faint">Custo un.</span>
                 <span className="text-[11px] text-faint">R$</span>
-                <input type="number" step="0.01"
-                  className="w-20 bg-transparent text-right font-mono text-[12px] text-ink outline-none"
-                  placeholder="0,00"
-                  value={item.preco_custo ?? ""}
-                  onChange={(e) => onChange(index, "preco_custo", parseFloat(e.target.value) || 0)}
+                <PrecoInput
+                  className="w-24 bg-transparent text-right font-mono text-[12px] text-ink outline-none"
+                  value={item.preco_custo}
+                  onCommit={(v) => onChange(index, "preco_custo", v)}
                 />
               </div>
               <div className="flex items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2.5 py-1.5">
                 <span className="text-[11px] text-faint">Frete (item)</span>
                 <span className="text-[11px] text-faint">R$</span>
-                <input type="number" step="0.01"
-                  className="w-20 bg-transparent text-right font-mono text-[12px] text-ink outline-none"
-                  placeholder="0,00"
-                  value={item.frete_vinda ?? ""}
-                  onChange={(e) => onChange(index, "frete_vinda", parseFloat(e.target.value) || 0)}
+                <PrecoInput
+                  className="w-24 bg-transparent text-right font-mono text-[12px] text-ink outline-none"
+                  value={item.frete_vinda}
+                  onCommit={(v) => onChange(index, "frete_vinda", v)}
                 />
               </div>
               {item.preco_custo > 0 && (
@@ -1302,6 +1354,15 @@ export default function App() {
     _dispararAutoSave();
   }
 
+  // Excluir item da proposta (ex.: itens que a Kist não vende — postes). Remove a
+  // linha e reindexa; o CSV/total recalculam sozinhos. Salva no rascunho.
+  function removerItem(index) {
+    setPropostas((prev) => prev.map((p, pi) =>
+      pi !== propostaIdx ? p : { ...p, itens: (p.itens || []).filter((_, i) => i !== index) }
+    ));
+    _dispararAutoSave();
+  }
+
   function _dispararAutoSave() {
     modificadoRef.current = true;
     if (autoSaveRef.current) clearTimeout(autoSaveRef.current);
@@ -1719,10 +1780,11 @@ export default function App() {
                   <div className="mt-2 flex flex-wrap items-center gap-2">
                     <div className="flex items-center gap-1.5 rounded-md border border-line2 bg-surface px-2 py-1">
                       <span className="text-[11px] text-faint">Custo R$</span>
-                      <input type="number" step="0.001" placeholder="—"
-                        className="w-20 bg-transparent text-right font-mono text-[12px] text-ink outline-none"
-                        value={propostas[semLastro.idx]?.itens?.[it._i]?.preco_custo || ""}
-                        onChange={(e) => atualizarItem(it._i, "preco_custo", parseFloat(e.target.value) || 0)} />
+                      <PrecoInput
+                        className="w-24 bg-transparent text-right font-mono text-[12px] text-ink outline-none"
+                        placeholder="—"
+                        value={propostas[semLastro.idx]?.itens?.[it._i]?.preco_custo}
+                        onCommit={(v) => atualizarItem(it._i, "preco_custo", v)} />
                     </div>
                     <div className="flex items-center gap-1.5 rounded-md border border-line2 bg-surface px-2 py-1">
                       <span className="eyebrow text-[9px] font-bold uppercase text-faint">Quem</span>
@@ -1855,6 +1917,19 @@ export default function App() {
                 <div className="mt-4 rounded-xl border border-line bg-surface p-4">
                   <div className="eyebrow text-[10px] font-bold uppercase text-faint">Dados da proposta (Tiny)</div>
                   <div className="mt-2 grid grid-cols-2 gap-3">
+                    <label className="block col-span-2">
+                      <div className="text-[11.5px] text-sub">
+                        CNPJ do cliente
+                        {!(prop.cnpj || "").trim() && (
+                          <span className="ml-1.5 text-amber">— não identificado, preencha</span>
+                        )}
+                      </div>
+                      <input value={prop.cnpj || ""}
+                        onChange={(e) => { setPropostas((prev) => prev.map((p, pi) => pi === propostaIdx ? { ...p, cnpj: e.target.value } : p)); _dispararAutoSave(); }}
+                        placeholder="00.000.000/0000-00"
+                        className={`mt-1 w-full rounded-lg border bg-paper px-2.5 py-1.5 font-mono text-[13px] text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist
+                          ${!(prop.cnpj || "").trim() ? "border-amber/50" : "border-line2"}`} />
+                    </label>
                     <label className="block">
                       <div className="text-[11.5px] text-sub">Prazo de entrega</div>
                       <input value={prop.prazo_entrega || ""}
@@ -1888,7 +1963,7 @@ export default function App() {
                     </thead>
                     <tbody>
                       {(prop.itens || []).map((item, i) => (
-                        <ItemRow key={i} item={item} index={i} onChange={atualizarItem} token={token} apiUrl={API} fonteTexto={prop.fonte_texto} cnpj={prop.cnpj} />
+                        <ItemRow key={i} item={item} index={i} onChange={atualizarItem} onRemove={removerItem} token={token} apiUrl={API} fonteTexto={prop.fonte_texto} cnpj={prop.cnpj} />
                       ))}
                     </tbody>
                   </table>

@@ -39,9 +39,16 @@ from motor_precos import (
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://owpmcoithvzdlhmfkvbe.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
-# domínios "genéricos" cobertos pelo passo Shopping — não viram proposta de roteamento
-DOMINIOS_GENERICOS = {"mercadolivre.com.br", "amazon.com.br", "google.com",
-                      "americanas.com.br", "magazineluiza.com.br", "shopee.com.br"}
+# domínios "genéricos" cobertos pelo passo Shopping — não viram proposta de roteamento.
+# Casado por SUFIXO: pega subdomínios também (produto.mercadolivre.com.br, lista.ml...).
+SUFIXOS_GENERICOS = ("mercadolivre.com.br", "mercadolivre.com", "amazon.com.br", "amazon.com",
+                     "google.com", "google.com.br", "americanas.com.br",
+                     "magazineluiza.com.br", "shopee.com.br")
+
+
+def _eh_generico(dom: str) -> bool:
+    dom = (dom or "").lower()
+    return any(dom == s or dom.endswith("." + s) or dom.endswith(s) for s in SUFIXOS_GENERICOS)
 JANELA_PROPOSTAS_DIAS = 21     # padrão de roteamento precisa acumular alguns dias
 MIN_USOS_REROTA       = 3      # domínio usado >= isso na vertical vira proposta
 MIN_AMOSTRAS_FAIXA    = 8      # só mexe no piso com base amostral suficiente
@@ -119,7 +126,7 @@ def propostas_roteamento(sb, rot_cfg: dict):
     tally = {}
     for it in itens:
         dom = _dominio(it.get("link_fornecedor") or "")
-        if not dom or dom in DOMINIOS_GENERICOS:
+        if not dom or _eh_generico(dom):
             continue
         perfil = {"descricao": (it.get("descricao_original") or "").lower(),
                   "consulta": (it.get("descricao_original") or "").lower(),
@@ -134,6 +141,11 @@ def propostas_roteamento(sb, rot_cfg: dict):
     novas = 0
     for (vert, dom), d in sorted(tally.items(), key=lambda x: -x[1]["n"]):
         if d["n"] < MIN_USOS_REROTA:
+            continue
+        # 'comum' é lata de tudo-que-não-casou-vertical: distribuidor de nicho aqui é
+        # quase sempre item fora do core (ou mal classificado). Shopping/ML já cobre.
+        # Não propõe roteamento pra comum — isso vira revisão manual de tags (semanal).
+        if vert == "comum":
             continue
         atuais = (rot_cfg.get(vert) or {}).get("dominios") or []
         if dom in atuais:
@@ -261,10 +273,17 @@ def main():
         n_rota = propostas_roteamento(sb, rot_cfg)
     except Exception as e:
         _log(f"ERRO propostas roteamento: {e}")
-    try:
-        n_faixa = propostas_faixas(sb, rot_cfg, faixas_cfg)
-    except Exception as e:
-        _log(f"ERRO propostas faixas: {e}")
+
+    # PART C (faixa de preço) DESLIGADO de propósito: o p10 sobre TODOS os itens da
+    # vertical puxa o piso pro preço dos acessórios baratos e sabota o validador (ia
+    # marcar acoplador APC de R$0,88 e HD 1TB de R$460 como suspeitos, e enfraquecer o
+    # fire_alarm). O piso só faz sentido calculado sobre os itens PREMIUM da vertical.
+    # Mantemos os pisos ajustados à mão até desenhar essa estatística. A função fica no
+    # arquivo pra quando for revista.
+    # try:
+    #     n_faixa = propostas_faixas(sb, rot_cfg, faixas_cfg)
+    # except Exception as e:
+    #     _log(f"ERRO propostas faixas: {e}")
 
     # avança a marca d'água só depois de tudo (idempotência)
     try:
