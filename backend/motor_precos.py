@@ -516,18 +516,133 @@ def interpretar(item: dict, claude, sb=None, avisos: list = None) -> dict:
     return base
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIG EM RUNTIME (Fases 2/3/4) — roteamento vertical, faixas de preço e marcas
+# importadas vivem em config_kist (editáveis SEM redeploy). Fallback embutido: se a
+# config sumir, o motor não perde as regras críticas. Mesmo padrão do excludentes.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Vertical -> palavras-chave (kw, regex/substring) + domínios preferidos (ordem =
+# prioridade). Minerado do gabarito real (blueprint §2a). fire_alarm/cftv/optica ANTES
+# de modulo/cabo para o item de nicho não cair no genérico. Ordem do dict importa.
+_ROTEAMENTO_FALLBACK = {
+    "fire_alarm":      {"kw": ["notifire","notifier","kidde","edwards","vigilant","simplex",
+                               "acionador manual endere","gsa-","ki-osd","ki-sb","ki-hrd",
+                               "fmm-","fcm-","frm-","siga-","detector.*(fumaca|calor|temperatura).*(intelig|endere)"],
+                        "dominios": ["mercadolivre.com.br","medsegsolucoes.com.br","ghtech.com.br"]},
+    "cftv":            {"kw": ["camera","câmera","balun","dvr","nvr","vipc","vhd","xas","cftv",
+                               "domo","bullet","full color","sensor magnetico","botao de saida"],
+                        "dominios": ["loja.digitalsat.com.br","mercadolivre.com.br"]},
+    "optica":          {"kw": ["optic","óptic","fibra","dio ","sc/apc","lc/apc","acoplador",
+                               "fibersul","cfoa","24fo","patch cord optic","monomodo"],
+                        "dominios": ["dimensional.com.br","sawasul.com.br","santil.com.br","mercadolivre.com.br"]},
+    "rack_infra":      {"kw": ["rack","bastidor","bandeja","regua.*tomada","calha.*rack"," 1u",
+                               "gabinete","outdoor","patch panel","guia de cabo","chassi"],
+                        "dominios": ["dimensional.com.br","santil.com.br","mercadolivre.com.br"]},
+    "dps":             {"kw": ["dps","surto","clamper","protetor de surto"],
+                        "dominios": ["lojaclamper.com.br","mercadolivre.com.br","dimensional.com.br"]},
+    "cabo":            {"kw": ["cabo","coaxial","rg6","rg59","utp","ftp","cat5","cat6","flexivel","flexível"],
+                        "dominios": ["cirilocabos.com.br","lojaeletrica.com.br","mercadolivre.com.br"]},
+    "disjuntor":       {"kw": ["disjuntor","contator","minidisjuntor"],
+                        "dominios": ["mercadolivre.com.br","superproatacado.com.br","dimensional.com.br"]},
+    "modulo_eletrico": {"kw": ["tomada","interruptor","modulo","módulo","placa","pial","legrand",
+                               "dimmer","espelho","suporte 4x2","611","615","618","675"],
+                        "dominios": ["mercadolivre.com.br","dimensional.com.br","lina.com.br","lojaeletrica.com.br"]},
+    "hd_storage":      {"kw": ["hd ","disco rigido","disco rígido","wd purple","purple","ssd",
+                               "seagate","western digital","wd10","wd22","wd42","wd63","wd84","wd85","wd101"],
+                        "dominios": ["mercadolivre.com.br","loja.digitalsat.com.br"]},
+    "ferramenta":      {"kw": ["furadeira","parafusadeira","broca","alicate","ferramenta","serra"],
+                        "dominios": ["lfmaquinaseferramentas.com.br","dutramaquinas.com.br","mercadolivre.com.br"]},
+    "energia":         {"kw": ["bateria","fonte","nobreak","no-break","carregador","estacionaria","vrla"],
+                        "dominios": ["mercadolivre.com.br","dimensional.com.br"]},
+    "comum":           {"kw": [], "dominios": ["mercadolivre.com.br","amazon.com.br"]},
+}
+
+# Piso de preço por vertical (Fase 3), derivado do p10 de preco_custo do histórico.
+# Preço achado ABAIXO do piso + item com "sinal premium" => suspeito (genérico barato
+# no lugar do item certo). NÃO bloqueia: marca "revisar" e não conta como validado.
+_FAIXAS_FALLBACK = {
+    "fire_alarm": 90.0, "hd_storage": 300.0, "cftv": 10.0, "optica": 0.5,
+    "rack_infra": 8.0, "dps": 30.0, "disjuntor": 5.0, "cabo": 1.0,
+    "modulo_eletrico": 2.0, "energia": 5.0, "ferramenta": 3.0, "comum": 0.0,
+}
+
+# Sinais de "item premium/identidade" por vertical: só com um destes no texto o piso
+# marca suspeito (evita flag em acessório barato legítimo, ex.: base de detector R$38).
+_SINAIS_PREMIUM = {
+    "fire_alarm": ["endere","intelig","dupla ac","dupla aç","notif","kidde","edwards",
+                   "vigilant","simplex","gsa-","fmm-","fcm-","frm-","siga-"],
+    "hd_storage": ["purple","surveillance","western digital","wd"],
+    "cftv":       ["full color","intelig","vipc"],
+    "optica":     ["apc","monomodo"],
+}
+
+# Marcas/linhas ESTRANGEIRAS sem varejo BR comum => elegível à rota importado (Fase 4).
+# Kidde DETECTOR (KI-*) é nacional na ML — NÃO entra; só linhas de módulo GSA/FMM/FCM/
+# FRM/SIGA e marcas de rede estrangeiras.
+_MARCAS_IMPORTADAS_FALLBACK = [
+    "notifier","notifire","edwards","vigilant","kentec",
+    "gsa-","fmm-","fcm-","frm-","siga-",
+    "fortinet","fortigate","zyxel","grandstream","eizo",
+]
+
+
+def _carregar_cfg(sb, chave: str, fallback):
+    """Lê config_kist[chave] (jsonb/texto) em runtime; fallback embutido se ausente."""
+    if sb is None:
+        return fallback
+    try:
+        r = sb.table("config_kist").select("valor").eq("chave", chave).limit(1).execute()
+        if r.data and r.data[0].get("valor") is not None:
+            v = r.data[0]["valor"]
+            if isinstance(v, str):
+                try:
+                    v = json.loads(v)
+                except Exception:
+                    return v or fallback   # excludentes é texto puro
+            return v or fallback
+    except Exception:
+        pass
+    return fallback
+
+
+def _classificar_vertical(perfil: dict, rot: dict) -> str:
+    """Vertical do item por palavra-chave (desc+consulta+specs+categoria). Determinístico,
+    sem IA. Primeira vertical cujo kw casa vence (ordem do dict); senão 'comum'."""
+    txt = " ".join(str(perfil.get(k) or "") for k in
+                   ("descricao", "consulta", "specs", "categoria")).lower()
+    for vert, cfg in (rot or {}).items():
+        if vert == "comum":
+            continue
+        for kw in (cfg.get("kw") or []):
+            try:
+                if re.search(kw, txt):
+                    return vert
+            except re.error:
+                if kw in txt:
+                    return vert
+    return "comum"
+
+
+def _eh_importado(perfil: dict, marcas: list) -> bool:
+    """Item de marca/linha estrangeira sem varejo BR comum (elegível à rota importado)."""
+    if perfil.get("importado"):
+        return True
+    txt = " ".join(str(perfil.get(k) or "") for k in
+                   ("descricao", "consulta", "specs", "fabricante", "mpn")).lower()
+    return any(str(m).lower() in txt for m in (marcas or []))
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 def montar_registry() -> dict:
-    """Providers disponíveis. Ausentes (Brave, importados) entram aqui quando
-    implementados/plugados — a cascata os pega por posição, sem mudar código."""
+    """Providers disponíveis. Cada um dorme se falta credencial (SERPAPI_KEY). Os
+    importados (Fase 4) reusam o SerpApi google + câmbio — sem chave nova."""
     return {
-        "serpapi":   SerpApiShopping(),
+        "serpapi":    SerpApiShopping(),
         "google_web": SerpApiGoogleWeb(),
-        "websearch": WebSearchAnthropic(),
-        # "brave":     BraveSearch(),        # degrau extra nacional — quando plugar a chave
-        # "ebay":      EbayBrowse(),         # bloco importado — depois
-        # "aliexpress":AliExpress(),
-        # "paraguai":  ComprasParaguai(),
+        "websearch":  WebSearchAnthropic(),
+        "import_mkt": SerpApiImport(),        # eBay/AliExpress via Google (Fase 4)
+        "paraguai":   ComprasParaguaiWeb(),   # comprasparaguai.com.br (Fase 4)
     }
 
 
@@ -536,18 +651,18 @@ def _ordem_nacional(reg: dict) -> list:
     # Commodity resolve no Shopping (preço estruturado). Item de nicho não está no
     # feed => cai no Google Web (a página do distribuidor, que o operador acha).
     # Web Search (índice Anthropic) fecha como rede final.
-    return [reg.get("serpapi"), reg.get("google_web"), reg.get("brave"), reg.get("websearch")]
+    return [reg.get("serpapi"), reg.get("google_web"), reg.get("websearch")]
 
 
 def _ordem_importada(reg: dict) -> list:
-    # eBay -> AliExpress -> ComprasParaguai (todos carimbados importado).
-    return [reg.get("ebay"), reg.get("aliexpress"), reg.get("paraguai")]
+    # Marketplace importado (eBay/AliExpress) -> ComprasParaguai.
+    return [reg.get("import_mkt"), reg.get("paraguai")]
 
 
 def rotear(perfil: dict, reg: dict) -> tuple:
-    """Devolve (cascata_nacional, cascata_importada), já filtradas por
-    configurado() e atende(). O bloco importado só é acionado se o nacional
-    voltar vazio (regra do Leonardo: tenta aqui, se não achar, busca fora)."""
+    """Devolve (cascata_nacional, cascata_importada), filtradas por configurado()/
+    atende(). Ambas sempre construídas; QUANDO rodar a importada é decisão da cascata
+    (regra do Leonardo: tenta nacional, escala pra fora se não validar)."""
     nac = [p for p in _ordem_nacional(reg) if p and p.configurado() and p.atende(perfil)]
     imp = [p for p in _ordem_importada(reg) if p and p.configurado() and p.atende(perfil)]
     return nac, imp
@@ -557,6 +672,14 @@ def rotear(perfil: dict, reg: dict) -> tuple:
 SYSTEM_JULGAR = """Você recebe o PEDIDO de um cliente e CANDIDATOS de preço achados na internet. Você trabalha para uma revenda B2B de telecom/energia.
 
 Decida quais candidatos são O MESMO produto pedido — mesmo fabricante (quando indicado), mesma categoria, mesma dimensão/bitola. Divergiu em qualquer um => NÃO é o mesmo, descarte.
+
+ATRIBUTOS EXCLUDENTES (divergiu = NÃO é o mesmo, mesmo que o preço bata):
+- Disjuntor: número de POLOS (mono ≠ bi ≠ tri), amperagem, curva.
+- Tomada/módulo: a COR pode ser corrente (vermelho = 20A) — cor diferente pode ser item diferente.
+- Óptica: conector/polimento (APC ≠ UPC; verde = APC), modo (SM ≠ MM), nº de fibras.
+- Cabo de rede: tipo (UTP ≠ FTP) e categoria (Cat6 ≠ Cat5e). Cabo elétrico: bitola (mm²).
+
+CUIDADO COM O GENÉRICO BARATO: se o pedido é um item PROFISSIONAL/ENDEREÇÁVEL/de linha específica (ex.: acionador/detector/módulo ENDEREÇÁVEL de alarme de incêndio, marca Kidde/Notifier/Edwards) e o candidato é claramente uma versão GENÉRICA/residencial muito mais barata, NÃO é o mesmo — descarte. Um módulo de incêndio endereçável não custa R$ 15.
 
 Agrupe os que sobraram por APRESENTAÇÃO comercial (metro, caixa/bobina, unidade). Em cada apresentação, escolha o de MENOR preço.
 
@@ -604,10 +727,17 @@ def julgar(perfil: dict, candidatos: list, ctx: dict) -> dict:
               f"  Fabricante: {perfil.get('fabricante') or '(?)'} | MPN: {perfil.get('mpn') or '(?)'}\n"
               f"  Apresentação desejada: {perfil.get('apresentacao_desejada')}\n\n"
               f"CANDIDATOS:\n" + "\n".join(linhas))
+    # injeta o mapa de excludentes em RUNTIME (config_kist['excludentes_matching']),
+    # o mesmo que o matcher do banco usa — o juiz da internet passa a aplicar as
+    # mesmas regras de "o que não pode divergir" por categoria.
+    sys_julgar = SYSTEM_JULGAR
+    exc = (ctx or {}).get("excludentes")
+    if exc:
+        sys_julgar = SYSTEM_JULGAR + "\n\nEXCLUDENTES POR CATEGORIA (config da operação):\n" + str(exc)
     try:
         resp = claude.messages.create(
             model="claude-sonnet-4-6", max_tokens=1200,
-            system=SYSTEM_JULGAR,
+            system=sys_julgar,
             messages=[{"role": "user", "content": pedido}],
             temperature=0.0, timeout=60.0,
         )
@@ -660,11 +790,86 @@ def _agrupar_sem_ia(candidatos: list) -> dict:
             "resumo": "(sem IA de julgamento — melhor por apresentação)"}
 
 
-# ── Cascata: executa em ordem, para na primeira fonte que resolve ─────────────
+# ── Validador de magnitude (Fase 3) ──────────────────────────────────────────
+def _validar_magnitude(perfil: dict, ficha: dict, faixas: dict) -> dict:
+    """Marca `suspeito` na apresentação cujo preço está ABAIXO do piso da vertical
+    E o item tem "sinal premium" (endereçável, marca de incêndio, purple...). Não
+    remove nada — o operador vê tudo; só define `achou_validado` (métrica honesta) e
+    escreve um aviso na obs. Item sem preço (sob consulta) não é suspeito de magnitude."""
+    vertical = perfil.get("vertical") or "comum"
+    piso = 0.0
+    try:
+        piso = float((faixas or {}).get(vertical) or 0.0)
+    except (TypeError, ValueError):
+        piso = 0.0
+    sinais = _SINAIS_PREMIUM.get(vertical, [])
+    txt = " ".join(str(perfil.get(k) or "") for k in
+                   ("descricao", "consulta", "specs", "mpn")).lower()
+    tem_sinal = any(s in txt for s in sinais) if sinais else False
+
+    aps = ficha.get("apresentacoes") or []
+    algum_ok = False
+    for ap in aps:
+        p = ap.get("preco_brl")
+        if p is None:
+            ap["suspeito"] = False           # sob consulta: identidade achada, não é magnitude
+            algum_ok = True
+            continue
+        try:
+            suspeito = bool(piso and tem_sinal and float(p) < piso)
+        except (TypeError, ValueError):
+            suspeito = False
+        ap["suspeito"] = suspeito
+        if suspeito:
+            aviso = (f"⚠ R$ {float(p):.2f} abaixo do piso da vertical "
+                     f"(R$ {piso:.0f}) — pode ser genérico, revisar")
+            ap["obs"] = (f"{ap.get('obs')} · {aviso}").strip(" ·") if ap.get("obs") else aviso
+        else:
+            algum_ok = True
+    ficha["achou"] = bool(aps)
+    ficha["achou_validado"] = bool(aps) and algum_ok
+    ficha["vertical"] = vertical
+    return ficha
+
+
+def _melhor_ficha(a: dict, b: dict) -> dict:
+    """Escolhe entre a ficha nacional (a) e a importada (b). Prioriza VALIDADA; depois
+    a que tem apresentação com preço; empate => mantém a nacional (varejo BR primeiro)."""
+    if not a or not a.get("apresentacoes"):
+        return b or a
+    if not b or not b.get("apresentacoes"):
+        return a
+    if a.get("achou_validado") and not b.get("achou_validado"):
+        return a
+    if b.get("achou_validado") and not a.get("achou_validado"):
+        return b
+    def _tem_preco(f):
+        return any(ap.get("preco_brl") is not None for ap in (f.get("apresentacoes") or []))
+    if _tem_preco(a):
+        return a
+    if _tem_preco(b):
+        return b
+    return a
+
+
+# ── Cascata: roteia por vertical, valida magnitude, escala pro importado ──────
 def buscar_cascata(perfil: dict, reg: dict, ctx: dict) -> dict:
-    """Percorre a cascata nacional; para na primeira fonte cujo julgamento acha
-    o MESMO item. Nacional vazio => tenta a cascata importada. Devolve a ficha
-    (apresentações + resumo) mais telemetria por fonte."""
+    """Fase 1 já entregou a `consulta` (crua ou interpretada). Aqui:
+      • Fase 2: classifica a vertical e injeta os domínios preferidos no perfil (os
+        providers web escopam a busca no distribuidor certo).
+      • Roda a cascata NACIONAL, julga (com excludentes) e VALIDA a magnitude (Fase 3).
+      • Fase 4: se não VALIDOU no BR (nada, ou só suspeito), escala pra cascata
+        IMPORTADA (eBay/AliExpress/Paraguai) e fica com a melhor ficha.
+    Uma linha de telemetria por fonte tentada; nunca levanta."""
+    rot    = (ctx or {}).get("rot_cfg") or _ROTEAMENTO_FALLBACK
+    faixas = (ctx or {}).get("faixas")  or _FAIXAS_FALLBACK
+    marcas = (ctx or {}).get("marcas")  or _MARCAS_IMPORTADAS_FALLBACK
+
+    vertical = _classificar_vertical(perfil, rot)
+    perfil["vertical"] = vertical
+    perfil["dominios_preferidos"] = (rot.get(vertical) or {}).get("dominios") or []
+    importado_elig = _eh_importado(perfil, marcas)
+
     nac, imp = rotear(perfil, reg)
     telemetria = []
 
@@ -672,30 +877,45 @@ def buscar_cascata(perfil: dict, reg: dict, ctx: dict) -> dict:
         for prov in cascata:
             t0 = time.time()
             cands = prov.buscar(perfil, ctx)
-            reg_tel = {"fonte": prov.nome, "bloco": bloco, "n_brutos": len(cands),
-                       "ms": int((time.time() - t0) * 1000)}
+            rt = {"fonte": prov.nome, "bloco": bloco, "n_brutos": len(cands),
+                  "ms": int((time.time() - t0) * 1000)}
             if cands:
-                ficha = julgar(perfil, cands, ctx)
-                reg_tel["n_apresentacoes"] = len(ficha.get("apresentacoes") or [])
-                telemetria.append(reg_tel)
-                if ficha.get("apresentacoes"):
-                    ficha["fonte_resolveu"] = prov.nome
-                    return ficha
+                f = julgar(perfil, cands, ctx)
+                rt["n_apresentacoes"] = len(f.get("apresentacoes") or [])
+                telemetria.append(rt)
+                if f.get("apresentacoes"):
+                    f["fonte_resolveu"] = prov.nome
+                    return f
             else:
-                reg_tel["n_apresentacoes"] = 0
-                telemetria.append(reg_tel)
+                rt["n_apresentacoes"] = 0
+                telemetria.append(rt)
         return None
 
+    # NACIONAL primeiro (varejo BR costuma ser mais barato quando existe).
     ficha = _tentar(nac, "nacional")
-    if not ficha:
-        ficha = _tentar(imp, "importado")   # só roda se houver providers importados ativos
-    if not ficha:
-        ficha = {"apresentacoes": [], "resumo": "nada encontrado", "fonte_resolveu": None}
+    if ficha:
+        ficha = _validar_magnitude(perfil, ficha, faixas)
+
+    # ESCALA pro IMPORTADO quando o BR não validou (nada, ou só suspeito) e há rota
+    # importada disponível. Cobre item estrangeiro sem varejo BR (GSA/Notifier/eBay,
+    # HD grande via Paraguai) e o genérico-barato que o validador reprovou.
+    precisa_importar = (ficha is None) or (not ficha.get("achou_validado"))
+    if precisa_importar and imp and (importado_elig or ficha is None):
+        fimp = _tentar(imp, "importado")
+        if fimp:
+            fimp = _validar_magnitude(perfil, fimp, faixas)
+            ficha = _melhor_ficha(ficha, fimp)
+
+    if ficha is None:
+        ficha = {"apresentacoes": [], "resumo": "nada encontrado",
+                 "fonte_resolveu": None, "achou": False, "achou_validado": False}
 
     ficha["telemetria"] = telemetria
+    ficha["vertical"] = vertical
+    ficha["importado_elegivel"] = importado_elig
     ficha["perfil"] = {k: perfil.get(k) for k in
                        ("consulta", "mpn", "fabricante", "categoria",
-                        "apresentacao_desejada", "importado")}
+                        "apresentacao_desejada", "importado", "vertical")}
     return ficha
 
 
@@ -801,6 +1021,7 @@ def registrar_log(sb, descricao_busca, camada, ficha, ms_total, usuario_email=No
             "camada":          camada,
             "fonte_resolveu":  ficha.get("fonte_resolveu"),
             "achou":           bool(ficha.get("apresentacoes")),
+            "achou_validado":  bool(ficha.get("achou_validado")),
             "n_apresentacoes": len(ficha.get("apresentacoes") or []),
             "ms_total":        ms_total,
             "telemetria":      ficha.get("telemetria"),
@@ -885,7 +1106,13 @@ def resolver_ficha(item: dict, sb, claude, usuario_email: str = None,
     quanto resolve na crua vs. quanto precisa de interpretação.
     """
     t0 = time.time()
-    ctx = {"claude": claude, "sb": sb}
+    ctx = {
+        "claude": claude, "sb": sb,
+        "rot_cfg":     _carregar_cfg(sb, "roteamento_vertical",   _ROTEAMENTO_FALLBACK),
+        "faixas":      _carregar_cfg(sb, "faixas_preco_vertical", _FAIXAS_FALLBACK),
+        "marcas":      _carregar_cfg(sb, "marcas_importadas",     _MARCAS_IMPORTADAS_FALLBACK),
+        "excludentes": _carregar_cfg(sb, "excludentes_matching",  ""),
+    }
     reg = montar_registry()
 
     def _ms():
@@ -1054,12 +1281,27 @@ class SerpApiGoogleWeb(Provider):
         termo = (perfil.get("consulta") or perfil.get("descricao") or "").strip()
         if not termo:
             return []
-        params = {"engine": "google", "q": termo, "gl": SERP_GL, "hl": SERP_HL,
-                  "num": "10", "api_key": SERPAPI_KEY}
-        try:
-            data = _http_get_json("https://serpapi.com/search.json?" + urllib.parse.urlencode(params))
-        except Exception:
-            return []
+
+        def _fetch(q):
+            params = {"engine": "google", "q": q, "gl": SERP_GL, "hl": SERP_HL,
+                      "num": "10", "api_key": SERPAPI_KEY}
+            try:
+                return _http_get_json("https://serpapi.com/search.json?" + urllib.parse.urlencode(params))
+            except Exception:
+                return {}
+
+        # Fase 2 — ESCOPA no distribuidor da vertical primeiro (ex.: CFTV=digitalsat,
+        # óptica=dimensional/sawasul, DPS=clamper). Se o escopo não trouxer nada, cai
+        # pra busca aberta. É como o operador procura: no fornecedor certo, não no genérico.
+        doms = perfil.get("dominios_preferidos") or []
+        data = {}
+        if doms:
+            escopo = " OR ".join(f"site:{d}" for d in doms[:4])
+            data = _fetch(f"{termo} ({escopo})")
+            if not (data.get("organic_results") or data.get("shopping_results")):
+                data = _fetch(termo)
+        else:
+            data = _fetch(termo)
 
         linhas = []
         for r in (data.get("organic_results") or [])[:10]:
@@ -1104,5 +1346,168 @@ class SerpApiGoogleWeb(Provider):
                 titulo=a.get("titulo") or "", preco=a.get("preco"), moeda="BRL",
                 url=a.get("url") or "", seller=a.get("loja") or "",
                 apresentacao=a.get("apresentacao") or "",
+            ))
+        return out
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BLOCO 7 (motor) — Rota IMPORTADO (Fase 4): eBay/AliExpress + ComprasParaguai
+# ══════════════════════════════════════════════════════════════════════════════
+# Item de marca/linha estrangeira sem varejo BR (Notifier FMM-1, módulos GSA da
+# Kidde/Edwards/Vigilant, HD grande) o operador cota fora. Reusa o engine 'google'
+# do SerpApi (mesma chave) escopado nos sites de importado, e o câmbio da AwesomeAPI
+# + fator de importação já existentes. Sem credencial nova.
+
+SYSTEM_EXTRAIR_IMPORT = """Você recebe RESULTADOS DE BUSCA de sites de importação (eBay, AliExpress) para um produto que uma revenda B2B de telecom/energia procura importar. Cada resultado tem título, link e trecho.
+
+Identifique quais são o MESMO produto pedido — mesmo fabricante, modelo/part number, categoria. Para cada um que for o mesmo, extraia o PREÇO na MOEDA ORIGINAL (US$ no eBay/AliExpress US) e o link do anúncio.
+
+Responda APENAS JSON, sem markdown, sem ```:
+{"anuncios": [
+  {"titulo": "...", "preco": 42.00, "moeda": "USD", "loja": "ebay", "url": "https://..."}
+]}
+
+Regras:
+- preco: número na moeda original (ponto decimal). moeda: "USD" por padrão no eBay/AliExpress US.
+- Se achou o item mas sem preço claro, traga o link com preco=null (o operador cota).
+- Só o MESMO produto (mesmo PN/modelo). Divergiu, descarte.
+- Nada é o mesmo => {"anuncios": []}. Nunca invente preço, loja ou url."""
+
+
+class SerpApiImport(Provider):
+    """Marketplace importado (eBay/AliExpress) via engine 'google' do SerpApi, escopado
+    nos sites de importação, gl=us. O Sonnet lê e extrai preço em USD; o candidato
+    carrega a conta de importação (× câmbio × fator internacional)."""
+
+    nome        = "Importado (eBay/AliExpress)"
+    tipo_preco  = "varejo"
+    origem_tipo = "web"
+
+    def configurado(self) -> bool:
+        return bool(SERPAPI_KEY)
+
+    def buscar(self, perfil: dict, ctx: dict = None) -> list[dict]:
+        termo = (perfil.get("consulta") or perfil.get("descricao") or "").strip()
+        if not termo:
+            return []
+        claude = (ctx or {}).get("claude")
+        if claude is None:
+            return []
+        q = f"{termo} (site:ebay.com OR site:aliexpress.com)"
+        params = {"engine": "google", "q": q, "gl": "us", "hl": "en",
+                  "num": "10", "api_key": SERPAPI_KEY}
+        try:
+            data = _http_get_json("https://serpapi.com/search.json?" + urllib.parse.urlencode(params))
+        except Exception:
+            return []
+
+        linhas = []
+        for r in (data.get("organic_results") or [])[:10]:
+            u = r.get("link") or ""
+            if not u:
+                continue
+            linhas.append(f"- titulo: {r.get('title') or ''}\n  link: {u}\n  trecho: {(r.get('snippet') or '')[:220]}")
+        for r in (data.get("shopping_results") or [])[:5]:
+            u = r.get("product_link") or r.get("link") or ""
+            if not u:
+                continue
+            linhas.append(f"- titulo: {r.get('title') or ''}\n  link: {u}\n  preco: {r.get('extracted_price')}\n  moeda: USD")
+        if not linhas:
+            return []
+
+        pedido = (f"PRODUTO PROCURADO: {perfil.get('consulta')}\n"
+                  f"Fabricante: {perfil.get('fabricante') or '?'} | MPN: {perfil.get('mpn') or '?'}\n\n"
+                  f"RESULTADOS (importado):\n" + "\n".join(linhas))
+        try:
+            resp = claude.messages.create(
+                model="claude-sonnet-4-6", max_tokens=1200,
+                system=SYSTEM_EXTRAIR_IMPORT,
+                messages=[{"role": "user", "content": pedido}],
+                temperature=0.0, timeout=60.0,
+            )
+            txt = "\n".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+            txt = re.sub(r'^```(?:json)?\s*', '', txt); txt = re.sub(r'\s*```$', '', txt.strip())
+            got = json.loads(txt)
+        except Exception:
+            return []
+
+        out = []
+        for a in (got.get("anuncios") or []):
+            if not (a.get("url") or "").strip():
+                continue
+            out.append(candidato(
+                fonte_nome=self.nome, tipo_preco=self.tipo_preco, origem_tipo=self.origem_tipo,
+                titulo=a.get("titulo") or "", preco=a.get("preco"),
+                moeda=(a.get("moeda") or "USD"),
+                url=a.get("url") or "", seller=a.get("loja") or "ebay",
+                fator_importacao=FATOR_IMPORT_INTERNACIONAL,
+            ))
+        return out
+
+
+class ComprasParaguaiWeb(Provider):
+    """ComprasParaguai (comprasparaguai.com.br) — site BR-facing que já mostra preço em
+    R$. Reusa o engine 'google' escopado no site. Preço em BRL, fator Paraguai (×1,2)."""
+
+    nome        = "ComprasParaguai"
+    tipo_preco  = "varejo"
+    origem_tipo = "web"
+
+    def configurado(self) -> bool:
+        return bool(SERPAPI_KEY)
+
+    def buscar(self, perfil: dict, ctx: dict = None) -> list[dict]:
+        termo = (perfil.get("consulta") or perfil.get("descricao") or "").strip()
+        if not termo:
+            return []
+        claude = (ctx or {}).get("claude")
+        if claude is None:
+            return []
+        params = {"engine": "google", "q": f"{termo} site:comprasparaguai.com.br",
+                  "gl": SERP_GL, "hl": SERP_HL, "num": "10", "api_key": SERPAPI_KEY}
+        try:
+            data = _http_get_json("https://serpapi.com/search.json?" + urllib.parse.urlencode(params))
+        except Exception:
+            return []
+
+        linhas = []
+        for r in (data.get("organic_results") or [])[:10]:
+            u = r.get("link") or ""
+            if not u:
+                continue
+            linhas.append(f"- titulo: {r.get('title') or ''}\n  link: {u}\n  trecho: {(r.get('snippet') or '')[:220]}")
+        for r in (data.get("shopping_results") or [])[:5]:
+            u = r.get("product_link") or r.get("link") or ""
+            if not u:
+                continue
+            linhas.append(f"- titulo: {r.get('title') or ''}\n  link: {u}\n  preco: {r.get('extracted_price')}")
+        if not linhas:
+            return []
+
+        pedido = (f"PRODUTO PROCURADO: {perfil.get('consulta')}\n"
+                  f"Fabricante: {perfil.get('fabricante') or '?'} | MPN: {perfil.get('mpn') or '?'}\n\n"
+                  f"RESULTADOS (ComprasParaguai, preços em R$):\n" + "\n".join(linhas))
+        try:
+            resp = claude.messages.create(
+                model="claude-sonnet-4-6", max_tokens=1000,
+                system=SYSTEM_EXTRAIR_GOOGLE,
+                messages=[{"role": "user", "content": pedido}],
+                temperature=0.0, timeout=60.0,
+            )
+            txt = "\n".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+            txt = re.sub(r'^```(?:json)?\s*', '', txt); txt = re.sub(r'\s*```$', '', txt.strip())
+            got = json.loads(txt)
+        except Exception:
+            return []
+
+        out = []
+        for a in (got.get("anuncios") or []):
+            if not (a.get("url") or "").strip():
+                continue
+            out.append(candidato(
+                fonte_nome=self.nome, tipo_preco=self.tipo_preco, origem_tipo=self.origem_tipo,
+                titulo=a.get("titulo") or "", preco=a.get("preco"), moeda="BRL",
+                url=a.get("url") or "", seller=a.get("loja") or "comprasparaguai",
+                apresentacao=a.get("apresentacao") or "",
+                fator_importacao=FATOR_IMPORT_PARAGUAI,
             ))
         return out
