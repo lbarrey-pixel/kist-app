@@ -68,6 +68,131 @@ def _http_get_json(url: str, headers: dict = None, timeout: int = HTTP_TIMEOUT):
         return json.loads(r.read().decode("utf-8", "replace"))
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# LEITURA DA PÁGINA DO PRODUTO (refino 22/07)
+# ══════════════════════════════════════════════════════════════════════════════
+# ACHADO da rodada de 21/07: nos itens em que a engine ACERTOU a fonte, ela entregou
+# a página de produto certa (superlight, dimensional) mas com preço NULO, marcando
+# "sob consulta" — quando o preço ESTAVA na página. Causa: a engine lia só o SNIPPET
+# do resultado de busca e nunca abria a página. Consequência: vencia sempre a metade
+# errada de cada fonte (Google Web dava produto certo sem preço; Shopping dava preço
+# com link inútil). Aqui a engine passa a ABRIR a página e ler o preço.
+
+_PAGINA_TIMEOUT   = 8      # segundos por página
+_PAGINA_MAX_BYTES = 600_000
+_PAGINA_MAX       = 3      # no máximo 3 páginas por busca (custo de latência)
+
+_UA_NAVEGADOR = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml",
+    "Accept-Language": "pt-BR,pt;q=0.9",
+}
+
+
+def _http_get_text(url: str, timeout: int = _PAGINA_TIMEOUT) -> str:
+    """GET de HTML, best-effort. Nunca levanta: devolve '' em qualquer falha —
+    ler a página é um BÔNUS, não pode derrubar a busca."""
+    try:
+        req = urllib.request.Request(url, headers=_UA_NAVEGADOR)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read(_PAGINA_MAX_BYTES).decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+# URL que NÃO é página de produto: resultado de busca, lista, categoria. Regra do
+# Leonardo (21/07): "link de resultado de busca não identifica produto, não serve
+# como origem e impede o operador de conferir — descarte esse candidato". Apareceu
+# em 4 dos 7 itens refinados (google.com/search?ibp=oshop, lista.mercadolivre...).
+_URL_NAO_PRODUTO = (
+    "google.com/search", "google.com.br/search", "google.com/shopping",
+    "lista.mercadolivre", "/busca", "/buscar", "/search?", "/pesquisa",
+    "/categoria/", "/c/", "bing.com/search", "/s?k=",
+)
+
+
+def _url_de_produto(url: str) -> bool:
+    """True se a URL aparenta ser a PÁGINA DO PRODUTO (comprável e auditável)."""
+    u = (url or "").strip().lower()
+    if not u.startswith("http"):
+        return False
+    return not any(p in u for p in _URL_NAO_PRODUTO)
+
+
+def _num_br(txt) -> float | None:
+    """Converte número de página BR/JSON: '1.234,56' e '1234.56' -> 1234.56."""
+    s = re.sub(r"[^\d.,]", "", str(txt or "")).strip()
+    if not s:
+        return None
+    m = re.search(r"[.,](\d{1,2})$", s)
+    try:
+        if m:
+            dec = m.group(1)
+            inteiro = re.sub(r"[.,]", "", s[: len(s) - len(dec) - 1])
+            return float((inteiro or "0") + "." + dec)
+        return float(re.sub(r"[.,]", "", s))
+    except ValueError:
+        return None
+
+
+def _preco_de_html(html: str) -> float | None:
+    """Extrai o preço de uma página SÓ de dados ESTRUTURADOS (JSON-LD schema.org e
+    meta tags). Deliberadamente NÃO varre 'R$' no texto solto: ali moram parcelas
+    ('12x de R$ 99'), preço riscado e frete, e preço inventado é pior que preço
+    ausente. Não achou estruturado => None, e a ficha segue 'sob consulta'."""
+    if not html:
+        return None
+    padroes = (
+        r'"lowPrice"\s*:\s*"?([\d.,]+)"?',
+        r'"price"\s*:\s*"?([\d.,]+)"?',
+        r'itemprop=["\']price["\'][^>]*content=["\']([\d.,]+)["\']',
+        r'content=["\']([\d.,]+)["\'][^>]*itemprop=["\']price["\']',
+        r'property=["\']product:price:amount["\'][^>]*content=["\']([\d.,]+)["\']',
+        r'property=["\']og:price:amount["\'][^>]*content=["\']([\d.,]+)["\']',
+    )
+    for p in padroes:
+        for m in re.finditer(p, html, re.I):
+            v = _num_br(m.group(1))
+            if v and v > 0:
+                return v
+    return None
+
+
+def _enriquecer_precos_por_pagina(cands: list) -> list:
+    """Para candidatos SEM preço mas com página de produto: abre a página e tenta
+    ler o preço. É o conserto do 'sob consulta' falso. Best-effort e limitado a
+    _PAGINA_MAX páginas; falha só mantém o candidato sem preço (como hoje)."""
+    lidas = 0
+    for c in cands:
+        if lidas >= _PAGINA_MAX:
+            break
+        if c.get("preco_brl") is not None:
+            continue
+        u = c.get("url") or ""
+        if not _url_de_produto(u):
+            continue
+        lidas += 1
+        preco = _preco_de_html(_http_get_text(u))
+        if preco:
+            # recalcula a conta de moeda/importação com o preço lido
+            cot, conv, est = _normalizar(preco, c.get("moeda_original") or "BRL",
+                                         c.get("fator_importacao") or FATOR_NACIONAL)
+            c["preco_original"] = preco
+            c["cotacao_usada"] = cot
+            c["preco_convertido_brl"] = conv
+            c["preco_estimado_brl"] = est
+            c["preco_brl"] = est
+            c["preco_da_pagina"] = True     # telemetria: veio da leitura da página
+    return cands
+
+
+def _so_paginas_de_produto(cands: list) -> list:
+    """Descarta candidato cuja URL não é página de produto (link de busca/lista).
+    Roda ANTES do juiz: o que não dá pra comprar nem auditar não deve nem ser julgado."""
+    return [c for c in (cands or []) if _url_de_produto(c.get("url") or "")]
+
+
 # ── Câmbio (AwesomeAPI) ───────────────────────────────────────────────────────
 # Roda no backend (a rede do Claude não alcança a AwesomeAPI — mesma regra da
 # BrasilAPI). Cache em memória com validade de 1h: a cotação do dia basta, e não
@@ -228,6 +353,10 @@ class SerpApiShopping(Provider):
             preco = it.get("extracted_price")
             if preco in (None, ""):
                 continue
+            # PREFERE o link da LOJA ao product_link do Google: o product_link é um
+            # google.com/search?ibp=oshop, que não identifica produto nem serve de
+            # origem (medido em 21/07). Se sobrar só o link do Google, o candidato é
+            # descartado abaixo — preço sem página comprável não vale como fonte.
             out.append(candidato(
                 fonte_nome=self.nome,
                 tipo_preco=self.tipo_preco,
@@ -235,11 +364,11 @@ class SerpApiShopping(Provider):
                 titulo=it.get("title") or "",
                 preco=preco,
                 moeda="BRL",
-                url=it.get("product_link") or it.get("link") or "",
+                url=it.get("link") or it.get("product_link") or "",
                 seller=it.get("source") or "",              # loja/vendedor
                 disponibilidade=it.get("delivery") or "",
             ))
-        return out
+        return _so_paginas_de_produto(out)
 
 
 # ── Prompt: busca de preço na web crua (Sonnet) ───────────────────────────────
@@ -648,10 +777,14 @@ def montar_registry() -> dict:
 
 # ── Roteador: monta a cascata na ordem de prioridade, filtra por disponível ───
 def _ordem_nacional(reg: dict) -> list:
-    # Commodity resolve no Shopping (preço estruturado). Item de nicho não está no
-    # feed => cai no Google Web (a página do distribuidor, que o operador acha).
-    # Web Search (índice Anthropic) fecha como rede final.
-    return [reg.get("serpapi"), reg.get("google_web"), reg.get("websearch")]
+    # ORDEM INVERTIDA em 22/07, com dado da rodada de 21/07: dos 7 itens refinados,
+    # o Google Shopping produziu o card errado em 6 (câmera CVI no lugar de IP, NVR
+    # genérico, fragmento de trilho, cordão sem polimento...) e SEMPRE com link de
+    # busca inútil; o Google Web achou a PÁGINA DO PRODUTO nos fornecedores reais do
+    # operador (superlight, dimensional). Ele é o buscador do operador — vem primeiro.
+    # O Shopping fica de reserva (preço estruturado quando o Web não resolve), e agora
+    # só entra com link de loja. Web Search (índice Anthropic) fecha como rede final.
+    return [reg.get("google_web"), reg.get("serpapi"), reg.get("websearch")]
 
 
 def _ordem_importada(reg: dict) -> list:
@@ -680,6 +813,13 @@ ATRIBUTOS EXCLUDENTES (divergiu = NÃO é o mesmo, mesmo que o preço bata):
 - Cabo de rede: tipo (UTP ≠ FTP) e categoria (Cat6 ≠ Cat5e). Cabo elétrico: bitola (mm²).
 
 CUIDADO COM O GENÉRICO BARATO: se o pedido é um item PROFISSIONAL/ENDEREÇÁVEL/de linha específica (ex.: acionador/detector/módulo ENDEREÇÁVEL de alarme de incêndio, marca Kidde/Notifier/Edwards) e o candidato é claramente uma versão GENÉRICA/residencial muito mais barata, NÃO é o mesmo — descarte. Um módulo de incêndio endereçável não custa R$ 15.
+
+REGRA DE OURO — NÃO CONFIRMÁVEL ≠ CONFIRMADO: quando o cliente informa um atributo (IP, APC, FTP, bipolar, 20A, SM, Cat6, marca/modelo), o candidato só é "o mesmo" se aquele atributo aparecer EXPLÍCITO no título/trecho do candidato. Se o anúncio não declara o atributo, ou não dá para identificar fabricante/modelo em item profissional, ele NÃO entra — ausência de informação nunca conta como coincidência. Mostrar menos e certo é melhor que carimbar barato e errado.
+Casos reais que essa regra evita: cliente pediu câmera "IP" e veio uma HD/CVI (analógica) de R$ 90; cliente pediu cordão óptico "APC" e veio um anúncio sem polimento declarado; cliente pediu NVR "Hikvision" e veio NVR genérico.
+
+MARCA: se o cliente CITOU a marca, candidato de outra marca ou sem marca declarada é descartado. Se o cliente NÃO citou marca, não imponha nenhuma — qualquer marca serve desde que cumpra as specs, e vence o melhor custo-benefício ENTRE OS QUE CUMPREM (não o mais barato da lista).
+
+O QUE SERVE × O QUE NÃO SERVE: descarte fragmento, amostra, miniatura ou peça de prototipagem quando o pedido é de obra (ex.: "trilho DIN" se vende em barra de 1m/2m — um pedaço de poucos centímetros não atende). Entre variantes que TODAS servem (ex.: haste de aterramento 1,2m e 2,4m, quando o cliente não especificou), todas são válidas e vence a mais barata.
 
 Agrupe os que sobraram por APRESENTAÇÃO comercial (metro, caixa/bobina, unidade). Em cada apresentação, escolha o de MENOR preço.
 
@@ -751,9 +891,13 @@ def julgar(perfil: dict, candidatos: list, ctx: dict) -> dict:
     for ap in (out.get("apresentacoes") or []):
         src = por_url.get(ap.get("url"))
         if src:
+            # `titulo` e `mpn_detectado` entram para AUDITORIA: na revisão de 21/07 o
+            # operador não conseguiu dizer o que a engine tinha proposto, porque a
+            # ficha guardava só preço e link. Sem o título, o ciclo de refino trava.
             for campo in ("tipo_preco", "origem_tipo", "moeda_original", "preco_original",
                           "cotacao_usada", "preco_convertido_brl", "fator_importacao",
-                          "preco_estimado_brl"):
+                          "preco_estimado_brl", "titulo", "mpn_detectado",
+                          "disponibilidade", "preco_da_pagina"):
                 ap.setdefault(campo, src.get(campo))
     return {"apresentacoes": out.get("apresentacoes") or [], "resumo": out.get("resumo") or ""}
 
@@ -1054,6 +1198,18 @@ def _perfil_cru(item: dict) -> dict:
     }
 
 
+def _entrada_pobre(perfil: dict) -> bool:
+    """Entrada curta demais para buscar literal: <=3 palavras E sem specs.
+    Medido em 21/07: 'Trilho Dim' e 'Cordão optco APC' — nesses a busca crua devolve
+    o resultado mais barato que casou as palavras, não o item. Já 'DPS Classe II,
+    1 Pólo, Uc 275VAC' (com specs) a crua acertou de primeira."""
+    desc  = (perfil.get("descricao") or "").strip()
+    specs = (perfil.get("specs") or "").strip()
+    if specs:
+        return False
+    return len([p for p in re.split(r"\s+", desc) if p]) <= 3
+
+
 def _passada(perfil: dict, reg: dict, ctx: dict, sb) -> dict:
     """Uma passada de resolução para UM perfil: camada 2 (cache vivo < TTL) e, se
     não servir, camada 3 (cascata de descoberta). NÃO loga e NÃO persiste — quem
@@ -1137,6 +1293,23 @@ def resolver_ficha(item: dict, sb, claude, usuario_email: str = None,
 
     # ── PASSA 1 — CRUA (descrição do cliente, sem IA, sem inventar) ───────────
     perfil_cru = _perfil_cru(item)
+
+    # EXCEÇÃO (refino 21/07): ENTRADA POBRE não rende busca literal. "Trilho Dim"
+    # (2 palavras, typo de DIN) trouxe um fragmento de trilho de R$3,78 de loja de
+    # eletrônica; "Cordão optco APC" trouxe anúncio sem polimento declarado. Quando o
+    # cliente escreve pouquíssimo e sem specs, o texto cru não tem o que ancorar —
+    # interpretar PRIMEIRO (corrige o termo técnico) vale mais que buscar literal.
+    # Entrada rica continua na crua, que é rápida e barata e funciona (caso do DPS,
+    # que a engine acertou com 1 centavo de diferença).
+    if _entrada_pobre(perfil_cru):
+        perfil_int = interpretar(item, claude, sb=sb)
+        ficha_int = _passada(perfil_int, reg, ctx, sb)
+        if ficha_int.get("apresentacoes"):
+            return _entregar(perfil_int, ficha_int, "interpretada_entrada_pobre")
+        # interpretação não achou: a crua ainda é a rede de segurança
+        ficha_cru = _passada(perfil_cru, reg, ctx, sb)
+        return _entregar(perfil_cru, ficha_cru, "crua_apos_entrada_pobre")
+
     ficha_cru = _passada(perfil_cru, reg, ctx, sb)
     if ficha_cru.get("apresentacoes"):
         return _entregar(perfil_cru, ficha_cru, "crua")
@@ -1347,6 +1520,10 @@ class SerpApiGoogleWeb(Provider):
                 url=a.get("url") or "", seller=a.get("loja") or "",
                 apresentacao=a.get("apresentacao") or "",
             ))
+        # (1) só página de produto — link de busca/lista não serve de origem;
+        # (2) quem veio sem preço tem a página ABERTA para ler o preço de verdade.
+        out = _so_paginas_de_produto(out)
+        out = _enriquecer_precos_por_pagina(out)
         return out
 
 # ══════════════════════════════════════════════════════════════════════════════

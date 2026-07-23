@@ -48,7 +48,14 @@ SUFIXOS_GENERICOS = ("mercadolivre.com.br", "mercadolivre.com", "amazon.com.br",
 
 def _eh_generico(dom: str) -> bool:
     dom = (dom or "").lower()
-    return any(dom == s or dom.endswith("." + s) or dom.endswith(s) for s in SUFIXOS_GENERICOS)
+    # genéricos (Shopping cobre) + importados (têm rota própria na Fase 4): nenhum vira
+    # proposta de roteamento NACIONAL.
+    todos = SUFIXOS_GENERICOS + SUFIXOS_IMPORTADO
+    return any(dom == s or dom.endswith("." + s) or dom.endswith(s) for s in todos)
+
+
+SUFIXOS_IMPORTADO = ("ebay.com", "aliexpress.com", "comprasparaguai.com.br",
+                     "bhphotovideo.com", "markertek.com")
 JANELA_PROPOSTAS_DIAS = 21     # padrão de roteamento precisa acumular alguns dias
 MIN_USOS_REROTA       = 3      # domínio usado >= isso na vertical vira proposta
 MIN_AMOSTRAS_FAIXA    = 8      # só mexe no piso com base amostral suficiente
@@ -138,6 +145,17 @@ def propostas_roteamento(sb, rot_cfg: dict):
         if len(d["ex"]) < 3:
             d["ex"].append((it.get("descricao_original") or "")[:60])
 
+    # RESPEITA A DECISÃO HUMANA: não re-propõe (tipo,chave) que o operador já
+    # rejeitou ou aplicou. O índice único só bloqueia PENDENTES; sem isto, um domínio
+    # rejeitado voltava toda madrugada (ex.: ebay em fire_alarm).
+    ja_decididas = set()
+    try:
+        r = (sb.table("motor_propostas").select("chave")
+             .eq("tipo", "roteamento_dominio").neq("status", "pendente").execute().data) or []
+        ja_decididas = {row.get("chave") for row in r}
+    except Exception:
+        pass
+
     novas = 0
     for (vert, dom), d in sorted(tally.items(), key=lambda x: -x[1]["n"]):
         if d["n"] < MIN_USOS_REROTA:
@@ -146,6 +164,8 @@ def propostas_roteamento(sb, rot_cfg: dict):
         # quase sempre item fora do core (ou mal classificado). Shopping/ML já cobre.
         # Não propõe roteamento pra comum — isso vira revisão manual de tags (semanal).
         if vert == "comum":
+            continue
+        if f"{vert}|{dom}" in ja_decididas:      # já rejeitado/aplicado antes
             continue
         atuais = (rot_cfg.get(vert) or {}).get("dominios") or []
         if dom in atuais:
