@@ -359,18 +359,25 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
     if (net?.perfil) onChange(index, "interpretacao", net.perfil);
   }
 
-  // "usar esta" do card do BANCO: traz o pacote completo (venda + custo + origem),
-  // sem tocar na descrição do cliente.
+  // "usar esta" do card do BANCO: carrega TUDO que veio do banco — preço de VENDA,
+  // custo e a origem inteira (quem, por onde, contato, SKU e link). A única coisa
+  // que NUNCA é tocada é a descrição do cliente.
+  // Obs.: a ficha do banco sempre traz esses campos, mesmo quando o match não é
+  // idêntico e o preenchimento automático não acontece — a trava do backend decide
+  // o que entra SOZINHO; aqui é o operador mandando, e ele é a hierarquia superior.
   function usarFichaBanco() {
     const b = item.banco || {};
     if (b.preco_un > 0)    onChange(index, "preco_un", Number(b.preco_un));
     if (b.preco_custo > 0) onChange(index, "preco_custo", Number(b.preco_custo));
-    if (b.link_fornecedor) {
-      onChange(index, "link_fornecedor", b.link_fornecedor);
-      onChange(index, "fornecedor_canal", "link");
-      onChange(index, "fornecedor_contato", b.link_fornecedor);
-    }
-    if (b.fornecedor) onChange(index, "fornecedor", b.fornecedor);
+    if (b.fornecedor)        onChange(index, "fornecedor", b.fornecedor);
+    if (b.link_fornecedor)   onChange(index, "link_fornecedor", b.link_fornecedor);
+    if (b.sku_fornecedor)    onChange(index, "sku_fornecedor", b.sku_fornecedor);
+    // canal/contato: usa o que o banco tem (pode ser whatsapp/e-mail, não só link).
+    // Só cai no "link" quando o banco tem URL e não registrou canal.
+    const canal   = b.fornecedor_canal   || (b.link_fornecedor ? "link" : "");
+    const contato = b.fornecedor_contato || (b.link_fornecedor || "");
+    if (canal)   onChange(index, "fornecedor_canal", canal);
+    if (contato) onChange(index, "fornecedor_contato", contato);
     onChange(index, "origem_escolha", "banco");
   }
 
