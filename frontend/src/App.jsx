@@ -260,11 +260,26 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
   // proposta, então usar !item.banco fazia TODO item recarregado parecer "sem
   // match" e disparar busca em massa (afogava o backend). Match alta/media não busca.
   const _conf = item.confianca_match || "nenhuma";
-  const semMatchUtil = _conf === "nenhuma" || _conf === "baixa"
-    || item.banco?.veredito === "diferente"
-    || item.banco?.veredito === "inconclusivo";
+  // Busca na internet SÓ em match INCERTO ou SEM match (regra do Leonardo). Match
+  // confiável = 'alta' + IDÊNTICO + com lastro — é o único caso em que o banco
+  // preenche valor (trava do backend). 'media'/'baixa'/'nenhuma', veredito
+  // diferente/inconclusivo e 'alta' apenas SEMÂNTICO não preenchem nada => buscam.
+  // O operador sempre pode disparar a busca na mão pelo botão da gaveta.
+  //
+  // ANCORAGEM (lição do congelamento de 20/07): só campos PERSISTIDOS entram na
+  // condição. `identico` e `banco` só existem na GERAÇÃO; ao reabrir uma proposta
+  // salva voltam undefined. Por isso `identico !== false` — undefined conta como
+  // confiável DE PROPÓSITO, senão o reload dispararia busca em massa e afogaria o
+  // backend. E item que já tem preço nunca busca.
+  const _temPreco = Number(item.preco_un) > 0;
+  const _matchConfiavel = _conf === "alta"
+    && item.identico !== false
+    && !item.banco?.sem_lastro
+    && item.banco?.veredito !== "diferente"
+    && item.banco?.veredito !== "inconclusivo";
+  const semMatchUtil = !_temPreco && !_matchConfiavel;
   const [motorAberto, setMotorAberto] = useState(() => semMatchUtil);
-  const [mostrarOrigem, setMostrarOrigem] = useState(false);
+  const [mostrarOrigem, setMostrarOrigem] = useState(true);
 
   // ── Ficha da internet (Frente A) ──────────────────────────────────────────
   // Busca REFERÊNCIA de mercado quando o item não tem match no banco. A internet
@@ -321,12 +336,15 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
   // a escolha p/ o backend aprender o nó. Não sobrescreve o preço de venda — a
   // internet é referência; o operador decide o preço dele.
   function usarFichaInternet(ap) {
-    if (descFonte === "internet" && net?.perfil?.consulta) {
-      onChange(index, "descricao_final", ap.titulo || net.perfil.consulta);
+    // REGRA (Leonardo, jul/2026): "usar esta" atualiza o card central INTEIRO,
+    // MENOS A DESCRIÇÃO — a descrição do cliente é preservada sempre.
+    // Da internet vem UM preço só: ele é o CUSTO (é o que se paga pra comprar).
+    // A VENDA fica EM BRANCO — quem define é o operador.
+    if (ap.preco_brl !== null && ap.preco_brl !== undefined) {
+      onChange(index, "preco_custo", Number(ap.preco_brl) || 0);
     }
-    // Preenche a ORIGEM DO PREÇO com o que a internet devolveu — é isso que
-    // carrega o banco (link + loja) e evita re-buscar na web nas próximas
-    // propostas. O canal vira "link" (a URL do anúncio).
+    onChange(index, "preco_un", 0);          // venda em branco
+    // Origem do preço: é isso que carrega o banco (link + loja) e evita re-buscar.
     if (ap.url) {
       onChange(index, "link_fornecedor", ap.url);
       onChange(index, "fornecedor_canal", "link");
@@ -339,6 +357,21 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
       fonte_url: ap.url || "", fonte_nome: ap.fonte || "", apresentacao: ap.apresentacao || "",
     });
     if (net?.perfil) onChange(index, "interpretacao", net.perfil);
+  }
+
+  // "usar esta" do card do BANCO: traz o pacote completo (venda + custo + origem),
+  // sem tocar na descrição do cliente.
+  function usarFichaBanco() {
+    const b = item.banco || {};
+    if (b.preco_un > 0)    onChange(index, "preco_un", Number(b.preco_un));
+    if (b.preco_custo > 0) onChange(index, "preco_custo", Number(b.preco_custo));
+    if (b.link_fornecedor) {
+      onChange(index, "link_fornecedor", b.link_fornecedor);
+      onChange(index, "fornecedor_canal", "link");
+      onChange(index, "fornecedor_contato", b.link_fornecedor);
+    }
+    if (b.fornecedor) onChange(index, "fornecedor", b.fornecedor);
+    onChange(index, "origem_escolha", "banco");
   }
 
   async function perguntar(texto) {
@@ -509,6 +542,116 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
         </td>
       </tr>
 
+      {/* Origem do preço — link OU texto livre · viaja junto pra OC */}
+      {mostrarOrigem && (
+        <tr className="border-b border-line/70 bg-paper/60">
+          <td /><td />
+          <td colSpan={4} className="px-3 py-2.5">
+            <div className="flex flex-wrap items-center gap-2">
+              {/* QUEM · POR ONDE · O CONTATO — três coisas, três campos.
+                  Antes disputavam dois, e o operador improvisava: "volt - wpp",
+                  "WPP DATALINK 115848", "DIGITALSAT" no campo de link. */}
+              <div className="flex items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2.5 py-1.5">
+                <span className="eyebrow text-[9px] font-bold uppercase text-faint">Quem</span>
+                <input
+                  className="w-32 bg-transparent text-[12px] text-ink outline-none placeholder:text-faint"
+                  placeholder="DigitalSAT"
+                  value={item.fornecedor || ""}
+                  onChange={(e) => onChange(index, "fornecedor", e.target.value)}
+                />
+              </div>
+              <div className="flex items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2 py-1.5">
+                <select
+                  className="cursor-pointer bg-transparent text-[12px] text-ink outline-none"
+                  value={item.fornecedor_canal || ""}
+                  onChange={(e) => onChange(index, "fornecedor_canal", e.target.value)}>
+                  <option value="">por onde…</option>
+                  <option value="link">link</option>
+                  <option value="whatsapp">WhatsApp</option>
+                  <option value="email">e-mail</option>
+                  <option value="telefone">telefone</option>
+                  <option value="loja">loja</option>
+                  <option value="outro">outro</option>
+                </select>
+              </div>
+              <div className="flex min-w-[240px] flex-1 items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2.5 py-1.5">
+                <span className="eyebrow flex-shrink-0 text-[9px] font-bold uppercase text-faint">Contato</span>
+                <input
+                  className="w-full bg-transparent text-[12px] text-ink outline-none placeholder:text-faint"
+                  placeholder={CONTATO_PH[item.fornecedor_canal] || "cole o link, o WhatsApp ou o e-mail"}
+                  value={item.fornecedor_contato || ""}
+                  onChange={(e) => onChange(index, "fornecedor_contato", e.target.value)}
+                  onBlur={(e) => aplicarLeitura(index, e.target.value, item)}
+                  onPaste={(e) => {
+                    // Colar é o gesto mais comum aqui — resolve na hora, sem esperar o blur.
+                    const txt = e.clipboardData.getData("text");
+                    setTimeout(() => aplicarLeitura(index, txt, item), 0);
+                  }}
+                />
+                {/* Abre o que ele acabou de digitar: confere o dado e já cota. */}
+                {(() => {
+                  const { href } = contatoAcionavel(item.fornecedor_canal, item.fornecedor_contato, item);
+                  if (!href) return null;
+                  return (
+                    <a href={href} target="_blank" rel="noreferrer"
+                      title={item.fornecedor_canal === "whatsapp" ? "Abrir conversa com o pedido pronto"
+                           : item.fornecedor_canal === "email" ? "Abrir e-mail com o pedido pronto" : "Abrir"}
+                      className="flex-shrink-0 rounded-md p-1 text-kist transition-colors hover:bg-paper">
+                      <IconLink size={13} />
+                    </a>
+                  );
+                })()}
+              </div>
+              {isLink(item.link_fornecedor) && (
+                <a href={item.link_fornecedor} target="_blank" rel="noreferrer"
+                  title="Abrir a página do produto no fornecedor"
+                  className="flex items-center gap-1 rounded-lg border border-line2 bg-surface px-2.5 py-1.5 text-[12px] font-medium text-kist hover:border-kist">
+                  <IconLink size={12} /> produto
+                </a>
+              )}
+              <div className="flex items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2.5 py-1.5">
+                <span className="text-[11px] text-faint">SKU forn.</span>
+                <input
+                  className="w-28 bg-transparent font-mono text-[12px] text-ink outline-none"
+                  placeholder="—"
+                  value={item.sku_fornecedor || ""}
+                  onChange={(e) => onChange(index, "sku_fornecedor", e.target.value)}
+                />
+              </div>
+              <div className="flex items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2.5 py-1.5">
+                <span className="text-[11px] text-faint">Custo un.</span>
+                <span className="text-[11px] text-faint">R$</span>
+                <PrecoInput
+                  className="w-24 bg-transparent text-right font-mono text-[12px] text-ink outline-none"
+                  value={item.preco_custo}
+                  onCommit={(v) => onChange(index, "preco_custo", v)}
+                />
+              </div>
+              <div className="flex items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2.5 py-1.5">
+                <span className="text-[11px] text-faint">Frete (item)</span>
+                <span className="text-[11px] text-faint">R$</span>
+                <PrecoInput
+                  className="w-24 bg-transparent text-right font-mono text-[12px] text-ink outline-none"
+                  value={item.frete_vinda}
+                  onCommit={(v) => onChange(index, "frete_vinda", v)}
+                />
+              </div>
+              {item.preco_custo > 0 && (
+                <span className="text-[11px] text-faint">
+                  lucro un.{" "}
+                  <span className={`font-mono ${(item.preco_un - item.preco_custo) >= 0 ? "text-signal" : "text-rose"}`}>
+                    R$ {brl((item.preco_un || 0) - (item.preco_custo || 0))}
+                  </span>
+                </span>
+              )}
+            </div>
+            <p className="mt-1.5 pl-1 text-[11px] text-faint">
+              Essa referência acompanha o item quando a proposta virar ordem de compra. <span className="text-faint/80">Custo é interno — não vai pro Tiny.</span>
+            </p>
+          </td>
+        </tr>
+      )}
+
       {/* ── FICHA DE PROCEDÊNCIA — linha própria, largura inteira ────────────
           Os dois lados LADO A LADO, que é como o olho compara. Antes isto vivia
           espremido dentro do <td> da descrição, junto com o input, o Google, os
@@ -563,8 +706,8 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
                   <div className="flex items-start justify-between gap-2">
                     <div className="eyebrow text-[9px] font-semibold uppercase text-faint">O banco propõe</div>
                     <button
-                      onClick={() => onChange(index, "descricao_final", item.banco.descricao)}
-                      title="Substituir a descrição do item por esta"
+                      onClick={usarFichaBanco}
+                      title="Usar este preço: traz venda, custo e origem (a descrição do cliente é preservada)"
                       className="-mt-0.5 flex-shrink-0 rounded-md border border-line2 px-2 py-0.5 text-[11px] font-medium text-sub hover:border-kist hover:text-kist">
                       usar esta
                     </button>
@@ -778,115 +921,6 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
         </tr>
       )}
 
-      {/* Origem do preço — link OU texto livre · viaja junto pra OC */}
-      {mostrarOrigem && (
-        <tr className="border-b border-line/70 bg-paper/60">
-          <td /><td />
-          <td colSpan={4} className="px-3 py-2.5">
-            <div className="flex flex-wrap items-center gap-2">
-              {/* QUEM · POR ONDE · O CONTATO — três coisas, três campos.
-                  Antes disputavam dois, e o operador improvisava: "volt - wpp",
-                  "WPP DATALINK 115848", "DIGITALSAT" no campo de link. */}
-              <div className="flex items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2.5 py-1.5">
-                <span className="eyebrow text-[9px] font-bold uppercase text-faint">Quem</span>
-                <input
-                  className="w-32 bg-transparent text-[12px] text-ink outline-none placeholder:text-faint"
-                  placeholder="DigitalSAT"
-                  value={item.fornecedor || ""}
-                  onChange={(e) => onChange(index, "fornecedor", e.target.value)}
-                />
-              </div>
-              <div className="flex items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2 py-1.5">
-                <select
-                  className="cursor-pointer bg-transparent text-[12px] text-ink outline-none"
-                  value={item.fornecedor_canal || ""}
-                  onChange={(e) => onChange(index, "fornecedor_canal", e.target.value)}>
-                  <option value="">por onde…</option>
-                  <option value="link">link</option>
-                  <option value="whatsapp">WhatsApp</option>
-                  <option value="email">e-mail</option>
-                  <option value="telefone">telefone</option>
-                  <option value="loja">loja</option>
-                  <option value="outro">outro</option>
-                </select>
-              </div>
-              <div className="flex min-w-[240px] flex-1 items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2.5 py-1.5">
-                <span className="eyebrow flex-shrink-0 text-[9px] font-bold uppercase text-faint">Contato</span>
-                <input
-                  className="w-full bg-transparent text-[12px] text-ink outline-none placeholder:text-faint"
-                  placeholder={CONTATO_PH[item.fornecedor_canal] || "cole o link, o WhatsApp ou o e-mail"}
-                  value={item.fornecedor_contato || ""}
-                  onChange={(e) => onChange(index, "fornecedor_contato", e.target.value)}
-                  onBlur={(e) => aplicarLeitura(index, e.target.value, item)}
-                  onPaste={(e) => {
-                    // Colar é o gesto mais comum aqui — resolve na hora, sem esperar o blur.
-                    const txt = e.clipboardData.getData("text");
-                    setTimeout(() => aplicarLeitura(index, txt, item), 0);
-                  }}
-                />
-                {/* Abre o que ele acabou de digitar: confere o dado e já cota. */}
-                {(() => {
-                  const { href } = contatoAcionavel(item.fornecedor_canal, item.fornecedor_contato, item);
-                  if (!href) return null;
-                  return (
-                    <a href={href} target="_blank" rel="noreferrer"
-                      title={item.fornecedor_canal === "whatsapp" ? "Abrir conversa com o pedido pronto"
-                           : item.fornecedor_canal === "email" ? "Abrir e-mail com o pedido pronto" : "Abrir"}
-                      className="flex-shrink-0 rounded-md p-1 text-kist transition-colors hover:bg-paper">
-                      <IconLink size={13} />
-                    </a>
-                  );
-                })()}
-              </div>
-              {isLink(item.link_fornecedor) && (
-                <a href={item.link_fornecedor} target="_blank" rel="noreferrer"
-                  title="Abrir a página do produto no fornecedor"
-                  className="flex items-center gap-1 rounded-lg border border-line2 bg-surface px-2.5 py-1.5 text-[12px] font-medium text-kist hover:border-kist">
-                  <IconLink size={12} /> produto
-                </a>
-              )}
-              <div className="flex items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2.5 py-1.5">
-                <span className="text-[11px] text-faint">SKU forn.</span>
-                <input
-                  className="w-28 bg-transparent font-mono text-[12px] text-ink outline-none"
-                  placeholder="—"
-                  value={item.sku_fornecedor || ""}
-                  onChange={(e) => onChange(index, "sku_fornecedor", e.target.value)}
-                />
-              </div>
-              <div className="flex items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2.5 py-1.5">
-                <span className="text-[11px] text-faint">Custo un.</span>
-                <span className="text-[11px] text-faint">R$</span>
-                <PrecoInput
-                  className="w-24 bg-transparent text-right font-mono text-[12px] text-ink outline-none"
-                  value={item.preco_custo}
-                  onCommit={(v) => onChange(index, "preco_custo", v)}
-                />
-              </div>
-              <div className="flex items-center gap-1.5 rounded-lg border border-line2 bg-surface px-2.5 py-1.5">
-                <span className="text-[11px] text-faint">Frete (item)</span>
-                <span className="text-[11px] text-faint">R$</span>
-                <PrecoInput
-                  className="w-24 bg-transparent text-right font-mono text-[12px] text-ink outline-none"
-                  value={item.frete_vinda}
-                  onCommit={(v) => onChange(index, "frete_vinda", v)}
-                />
-              </div>
-              {item.preco_custo > 0 && (
-                <span className="text-[11px] text-faint">
-                  lucro un.{" "}
-                  <span className={`font-mono ${(item.preco_un - item.preco_custo) >= 0 ? "text-signal" : "text-rose"}`}>
-                    R$ {brl((item.preco_un || 0) - (item.preco_custo || 0))}
-                  </span>
-                </span>
-              )}
-            </div>
-            <p className="mt-1.5 pl-1 text-[11px] text-faint">
-              Essa referência acompanha o item quando a proposta virar ordem de compra. <span className="text-faint/80">Custo é interno — não vai pro Tiny.</span>
-            </p>
-          </td>
-        </tr>
-      )}
 
       {/* ── Painel de Alerta ─────────────────────────────────────────────── */}
       {mostrarAlerta && (
