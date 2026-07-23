@@ -1388,6 +1388,61 @@ export default function App() {
     finally { setLoading(false); }
   }
 
+  // ── Adicionar itens a uma proposta ABERTA ────────────────────────────────
+  // Cliente pede pra incluir produtos num orçamento já montado. Reusa o MESMO
+  // /extrair da tela de nova proposta (mesma leitura de e-mail/anexo/texto e o
+  // mesmo matching com o banco) e ANEXA os itens no fim da lista — os itens que
+  // já estavam, com preço e origem preenchidos, não são tocados.
+  const [addAberto, setAddAberto] = useState(false);
+  const [addTexto, setAddTexto] = useState("");
+  const [addArquivos, setAddArquivos] = useState([]);
+  const [addLoading, setAddLoading] = useState(false);
+  const [addErro, setAddErro] = useState("");
+  const [addDrag, setAddDrag] = useState(false);
+
+  async function adicionarItens() {
+    if (!addTexto.trim() && addArquivos.length === 0) {
+      setAddErro("Arraste o e-mail/anexo ou cole a lista de itens."); return;
+    }
+    setAddErro(""); setAddLoading(true);
+    try {
+      const form = new FormData();
+      form.append("numero_proposta", numeroProposta || "");
+      form.append("so_rastreavel", soRastreavel ? "1" : "0");
+      addArquivos.forEach((f) => form.append("arquivos", f));
+      if (addTexto) form.append("texto", addTexto);
+
+      const controller = new AbortController();
+      const tid = setTimeout(() => controller.abort(), 120000);
+      let res;
+      try {
+        res = await fetch(`${API}/extrair`, { method: "POST", headers: authHeaders(), body: form, signal: controller.signal });
+      } catch (fe) {
+        clearTimeout(tid);
+        if (fe.name === "AbortError") throw new Error("Tempo limite (120s). Tente com menos arquivos.");
+        throw fe;
+      }
+      clearTimeout(tid);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: `Erro HTTP ${res.status}` }));
+        if (res.status === 401 || res.status === 403) { setAddErro("Sessão expirada. Faça login novamente."); return; }
+        throw new Error(err.detail || "Erro no servidor");
+      }
+      const data = await res.json();
+      // O /extrair pode separar em mais de uma proposta (por cliente). Aqui o
+      // operador escolheu ADICIONAR a ESTA proposta: junta os itens de todas.
+      const novos = (data.propostas || [data]).flatMap((p) => p.itens || []);
+      if (novos.length === 0) { setAddErro("Nenhum item reconhecido no que você mandou."); return; }
+      setPropostas((prev) => prev.map((p, pi) =>
+        pi !== propostaIdx ? p : { ...p, itens: [...(p.itens || []), ...novos] }
+      ));
+      if (Array.isArray(data.avisos) && data.avisos.length) setAvisosSistema(data.avisos);
+      setAddTexto(""); setAddArquivos([]); setAddAberto(false);
+      _dispararAutoSave();
+    } catch (e) { setAddErro(e.message); }
+    finally { setAddLoading(false); }
+  }
+
   function atualizarItem(index, campo, valor) {
     setPropostas((prev) => prev.map((p, pi) =>
       pi !== propostaIdx ? p : { ...p, itens: p.itens.map((item, i) => i === index ? { ...item, [campo]: valor, _alterado: true } : item) }
@@ -2017,6 +2072,86 @@ export default function App() {
                       </span>
                     </div>
                   </div>
+                </div>
+
+                {/* ── Adicionar itens à proposta ABERTA ─────────────────────────
+                    O cliente pede pra incluir produtos num orçamento já montado.
+                    Mesma entrada da tela de nova proposta (e-mail/anexo ou lista
+                    colada); os itens entram no fim, sem tocar nos já preenchidos. */}
+                <div className="mt-3 rounded-xl border border-line bg-white">
+                  {!addAberto ? (
+                    <button onClick={() => { setAddAberto(true); setAddErro(""); }}
+                      className="flex w-full items-center gap-2 px-4 py-3 text-left text-[13px] font-medium text-kist hover:bg-paper/60">
+                      + adicionar itens a esta proposta
+                      <span className="text-[11.5px] font-normal text-faint">— arraste o e-mail do cliente ou cole a lista</span>
+                    </button>
+                  ) : (
+                    <div className="p-4">
+                      <div className="mb-2 flex items-center justify-between">
+                        <div className="eyebrow text-[10px] font-bold uppercase text-faint">Adicionar itens</div>
+                        <button onClick={() => { setAddAberto(false); setAddErro(""); }}
+                          className="text-[11px] text-faint hover:text-sub">fechar</button>
+                      </div>
+
+                      <div
+                        onDragOver={(e) => { e.preventDefault(); setAddDrag(true); }}
+                        onDragLeave={() => setAddDrag(false)}
+                        onDrop={(e) => {
+                          e.preventDefault(); setAddDrag(false);
+                          const fs = Array.from(e.dataTransfer.files || []);
+                          if (fs.length) setAddArquivos((prev) => {
+                            const nomes = new Set(prev.map((x) => x.name));
+                            return [...prev, ...fs.filter((f) => !nomes.has(f.name))];
+                          });
+                        }}
+                        className={`rounded-lg border-2 border-dashed px-3 py-4 text-center text-[12px] transition
+                          ${addDrag ? "border-kist bg-kist/5 text-kist" : "border-line2 text-faint"}`}>
+                        Arraste aqui o e-mail (.msg), PDF, planilha ou imagem
+                        <label className="ml-1 cursor-pointer text-kist underline">
+                          ou escolha um arquivo
+                          <input type="file" multiple className="hidden"
+                            onChange={(e) => {
+                              const fs = Array.from(e.target.files || []);
+                              setAddArquivos((prev) => {
+                                const nomes = new Set(prev.map((x) => x.name));
+                                return [...prev, ...fs.filter((f) => !nomes.has(f.name))];
+                              });
+                              e.target.value = "";
+                            }} />
+                        </label>
+                      </div>
+
+                      {addArquivos.length > 0 && (
+                        <div className="mt-2 flex flex-wrap gap-1.5">
+                          {addArquivos.map((f, i) => (
+                            <span key={i} className="flex items-center gap-1 rounded-md bg-paper px-2 py-1 text-[11.5px] text-sub">
+                              {f.name}
+                              <button onClick={() => setAddArquivos((prev) => prev.filter((_, j) => j !== i))}
+                                className="text-faint hover:text-rose">✕</button>
+                            </span>
+                          ))}
+                        </div>
+                      )}
+
+                      <textarea
+                        value={addTexto}
+                        onChange={(e) => setAddTexto(e.target.value)}
+                        rows={4}
+                        placeholder={"Ou cole a lista de itens e quantidades. Ex.:\n2 - CABO FLEXIVEL 2,5MM AZUL\n10 - DISJUNTOR 20A CURVA C"}
+                        className="mt-2 w-full rounded-lg border border-line2 bg-paper px-3 py-2 text-[13px] text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
+
+                      {addErro && <div className="mt-2 text-[12px] text-rose">{addErro}</div>}
+
+                      <div className="mt-2 flex items-center gap-2">
+                        <button onClick={adicionarItens} disabled={addLoading} className={btnPrimary}>
+                          {addLoading ? "lendo e casando com o banco…" : "adicionar à proposta"}
+                        </button>
+                        <span className="text-[11.5px] text-faint">
+                          Os itens entram no fim da lista. Os que já estão preenchidos não são alterados.
+                        </span>
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 {/* Custo & lucro — uso INTERNO, não vai para o CSV do Tiny */}
