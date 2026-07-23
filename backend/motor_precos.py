@@ -78,9 +78,15 @@ def _http_get_json(url: str, headers: dict = None, timeout: int = HTTP_TIMEOUT):
 # errada de cada fonte (Google Web dava produto certo sem preço; Shopping dava preço
 # com link inútil). Aqui a engine passa a ABRIR a página e ler o preço.
 
-_PAGINA_TIMEOUT   = 8      # segundos por página
-_PAGINA_MAX_BYTES = 600_000
-_PAGINA_MAX       = 3      # no máximo 3 páginas por busca (custo de latência)
+_PAGINA_TIMEOUT   = 4      # segundos por página (era 8 — ver INCIDENTE 23/07)
+_PAGINA_MAX_BYTES = 400_000
+_PAGINA_MAX       = 2      # no máximo 2 páginas por busca (era 3)
+
+# ORÇAMENTO GLOBAL da busca (INCIDENTE 23/07): a leitura de página + Google Web como
+# 1º degrau levaram a latência média de 10s para 33s (máx. 95s). Com 1 worker no
+# Render, cada busca dessas bloqueia TODAS as requisições — o operador vê "sem contato
+# com o banco". A engine agora tem prazo: passou do teto, entrega o que tem e para.
+_ORCAMENTO_BUSCA_S = 25.0
 
 _UA_NAVEGADOR = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -159,14 +165,23 @@ def _preco_de_html(html: str) -> float | None:
     return None
 
 
-def _enriquecer_precos_por_pagina(cands: list) -> list:
+def _enriquecer_precos_por_pagina(cands: list, deadline: float = None) -> list:
     """Para candidatos SEM preço mas com página de produto: abre a página e tenta
-    ler o preço. É o conserto do 'sob consulta' falso. Best-effort e limitado a
-    _PAGINA_MAX páginas; falha só mantém o candidato sem preço (como hoje)."""
+    ler o preço. É o conserto do 'sob consulta' falso.
+
+    ORÇAMENTO (incidente 23/07): só roda quando NENHUM candidato tem preço — se já
+    existe preço, abrir página é latência pura sem ganho. Respeita o prazo global e
+    o teto de páginas. Falha só mantém o candidato sem preço (como antes)."""
+    if not cands:
+        return cands
+    if any(c.get("preco_brl") is not None for c in cands):
+        return cands                      # já tem preço: não gasta tempo
     lidas = 0
     for c in cands:
         if lidas >= _PAGINA_MAX:
             break
+        if deadline and time.time() > deadline:
+            break                          # estourou o prazo: entrega o que tem
         if c.get("preco_brl") is not None:
             continue
         u = c.get("url") or ""
@@ -613,7 +628,7 @@ def interpretar(item: dict, claude, sb=None, avisos: list = None) -> dict:
             model="claude-sonnet-4-6", max_tokens=700,
             system=SYSTEM_INTERPRETAR,
             messages=[{"role": "user", "content": pedido}],
-            temperature=0.0, timeout=45.0,
+            temperature=0.0, timeout=20.0,   # era 45s — orçamento de latência (incidente 23/07)
         )
         txt = resp.content[0].text.strip()
         txt = re.sub(r'^```(?:json)?\s*', '', txt); txt = re.sub(r'\s*```$', '', txt.strip())
@@ -879,7 +894,7 @@ def julgar(perfil: dict, candidatos: list, ctx: dict) -> dict:
             model="claude-sonnet-4-6", max_tokens=1200,
             system=sys_julgar,
             messages=[{"role": "user", "content": pedido}],
-            temperature=0.0, timeout=60.0,
+            temperature=0.0, timeout=20.0,   # era 60s — orçamento de latência (incidente 23/07)
         )
         txt = resp.content[0].text.strip()
         txt = re.sub(r'^```(?:json)?\s*', '', txt); txt = re.sub(r'\s*```$', '', txt.strip())
@@ -1016,9 +1031,17 @@ def buscar_cascata(perfil: dict, reg: dict, ctx: dict) -> dict:
 
     nac, imp = rotear(perfil, reg)
     telemetria = []
+    # prazo global: passou disto, a engine entrega o que tem em vez de segurar o
+    # worker (incidente 23/07 — 1 worker no Render, busca de 95s travava o app).
+    deadline = time.time() + _ORCAMENTO_BUSCA_S
+    ctx = dict(ctx or {}); ctx["deadline"] = deadline
 
     def _tentar(cascata, bloco):
         for prov in cascata:
+            if time.time() > deadline:
+                telemetria.append({"fonte": prov.nome, "bloco": bloco,
+                                   "pulado": "orcamento_estourado"})
+                continue
             t0 = time.time()
             cands = prov.buscar(perfil, ctx)
             rt = {"fonte": prov.nome, "bloco": bloco, "n_brutos": len(cands),
@@ -1502,7 +1525,7 @@ class SerpApiGoogleWeb(Provider):
                 model="claude-sonnet-4-6", max_tokens=1200,
                 system=SYSTEM_EXTRAIR_GOOGLE,
                 messages=[{"role": "user", "content": pedido}],
-                temperature=0.0, timeout=60.0,
+                temperature=0.0, timeout=20.0,   # era 60s — orçamento de latência (incidente 23/07)
             )
             txt = "\n".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
             txt = re.sub(r'^```(?:json)?\s*', '', txt); txt = re.sub(r'\s*```$', '', txt.strip())
@@ -1523,7 +1546,7 @@ class SerpApiGoogleWeb(Provider):
         # (1) só página de produto — link de busca/lista não serve de origem;
         # (2) quem veio sem preço tem a página ABERTA para ler o preço de verdade.
         out = _so_paginas_de_produto(out)
-        out = _enriquecer_precos_por_pagina(out)
+        out = _enriquecer_precos_por_pagina(out, (ctx or {}).get("deadline"))
         return out
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1599,7 +1622,7 @@ class SerpApiImport(Provider):
                 model="claude-sonnet-4-6", max_tokens=1200,
                 system=SYSTEM_EXTRAIR_IMPORT,
                 messages=[{"role": "user", "content": pedido}],
-                temperature=0.0, timeout=60.0,
+                temperature=0.0, timeout=20.0,   # era 60s — orçamento de latência (incidente 23/07)
             )
             txt = "\n".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
             txt = re.sub(r'^```(?:json)?\s*', '', txt); txt = re.sub(r'\s*```$', '', txt.strip())
@@ -1668,7 +1691,7 @@ class ComprasParaguaiWeb(Provider):
                 model="claude-sonnet-4-6", max_tokens=1000,
                 system=SYSTEM_EXTRAIR_GOOGLE,
                 messages=[{"role": "user", "content": pedido}],
-                temperature=0.0, timeout=60.0,
+                temperature=0.0, timeout=20.0,   # era 60s — orçamento de latência (incidente 23/07)
             )
             txt = "\n".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
             txt = re.sub(r'^```(?:json)?\s*', '', txt); txt = re.sub(r'\s*```$', '', txt.strip())

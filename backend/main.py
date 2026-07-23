@@ -1851,7 +1851,16 @@ async def conferir(payload: dict, usuario: str = Depends(verificar_token)):
 
 
 @app.post("/ficha-internet")
-async def ficha_internet(payload: dict, usuario: str = Depends(verificar_token)):
+# SÍNCRONO DE PROPÓSITO (incidente 23/07). Este endpoint faz I/O BLOQUEANTE:
+# SerpApi via urllib, cliente Anthropic síncrono e leitura da página do produto —
+# uma busca leva de 10s a 30s. Declarado como `async def`, esse bloqueio trava o
+# EVENT LOOP INTEIRO: enquanto uma busca roda, nenhuma outra requisição é atendida
+# e o operador vê "sem contato com o banco" (não lista propostas, não pega número).
+# Como `def` comum, o Starlette executa a função num THREADPOOL e o event loop
+# segue livre para servir a tela. Não custa plano nem worker novo — e é melhor que
+# aumentar workers, porque cada worker sozinho continuaria travando o próprio loop.
+# NÃO reconverter para `async def` sem antes tornar as chamadas internas assíncronas.
+def ficha_internet(payload: dict, usuario: str = Depends(verificar_token)):
     """Referência de preço na internet para UM item SEM match no banco.
 
     Chamado pelo frontend item a item, de forma assíncrona (FORA do /extrair): a
