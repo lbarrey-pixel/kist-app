@@ -582,6 +582,14 @@ def _itens_sem_match(itens_raw: list) -> list:
     """
     out = []
     for item in (itens_raw or []):
+        # O modelo às vezes devolve um item como STRING solta em vez de objeto —
+        # acontece quando a "descrição" é um parágrafo de specs sem tabela (foi o que
+        # derrubou a cotação de suporte de TV: AttributeError 'str' has no 'get').
+        # Formato imperfeito do modelo não pode derrubar a extração: normaliza e segue.
+        if isinstance(item, str):
+            item = {"descricao": item, "descricao_original": item}
+        elif not isinstance(item, dict):
+            continue
         desc = item.get("descricao", "") or ""
         out.append({
             "descricao_original":   item.get("descricao_original", desc) or desc,
@@ -1422,10 +1430,16 @@ async def extrair_email(
                 imgs_upload=(imgs_validas if _ordem == 0 else None),
             )
             for p in props:
-                p.setdefault("titulo", nome_arq)
+                if isinstance(p, dict):
+                    p.setdefault("titulo", nome_arq)
             propostas_raw.extend(props)
     else:
-        # Tudo junto (body + imagens)
+        # Sem arquivo de conteúdo: corpo + imagens numa chamada só. Quando há vários
+        # e-mails, seus corpos já estão concatenados em contexto_email — e é o MODELO
+        # que decide a quebra em propostas, pela regra de DESTINO do SYSTEM_EXTRACAO
+        # (endereço/CNPJ diferente = proposta diferente). A quebra é por CONTEÚDO, não
+        # por número de arquivos: 2 e-mails pro mesmo destino = 1 aba; 1 e-mail com 2
+        # destinos = 2 abas.
         props = await _chamar_extracao(contexto_email, imgs_inline=imgs_msg, imgs_upload=imgs_validas)
         propostas_raw.extend(props)
 
@@ -1456,6 +1470,38 @@ async def extrair_email(
                     for n, c in descartados_files),
         (texto or "").strip(),
     ] if x).strip()
+    # ── Normalizar o que o modelo devolveu ──────────────────────────────────
+    # O modelo é instruído a devolver propostas[] de objetos, cada uma com itens[]
+    # de objetos. Quando falha nisso — proposta como string, itens como lista de
+    # strings, itens ausente — o código antigo estourava (AttributeError/TypeError)
+    # e derrubava a extração INTEIRA. Uma proposta malformada não pode custar as
+    # outras quatro. Normaliza aqui, uma vez, antes de qualquer acesso.
+    _props_norm = []
+    for _pr in propostas_raw:
+        if isinstance(_pr, str):
+            _pr = {"itens": [{"descricao": _pr, "descricao_original": _pr}]}
+        elif not isinstance(_pr, dict):
+            continue
+        _its = _pr.get("itens")
+        if isinstance(_its, dict):            # um item solto fora de lista
+            _its = [_its]
+        elif not isinstance(_its, list):
+            _its = []
+        _its_ok = []
+        for _it in _its:
+            if isinstance(_it, str):
+                _its_ok.append({"descricao": _it, "descricao_original": _it})
+            elif isinstance(_it, dict):
+                _its_ok.append(_it)
+            # qualquer outra coisa (número, null) é descartada em silêncio
+        _pr["itens"] = _its_ok
+        _props_norm.append(_pr)
+    propostas_raw = _props_norm
+
+    if not propostas_raw:
+        propostas_raw = [{"titulo": "", "cliente": "", "cnpj": None,
+                          "rc_neg": None, "itens": []}]
+
     for idx_p, prop_raw in enumerate(propostas_raw):
         num_prop = str(base_num + idx_p) if base_num is not None else (
             numero_proposta if idx_p == 0 else f"{numero_proposta}-{idx_p + 1}")
