@@ -1667,7 +1667,7 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
     # o operador vê um preço órfão e não sabe a quem perguntar.
     quem     = {"usuario_email": usuario,
                 "usuario_nome": APELIDOS.get(usuario, "") or (usuario or "").split("@")[0]}
-    itens    = payload.get("itens", [])
+    itens    = _itens_payload(payload)
     hoje     = date.today().isoformat()
     atualizados, inseridos, ignorados = 0, 0, 0
     aprender = []   # [(entrada_norm, produto_id)] — desfechos pra memória de matching
@@ -2200,6 +2200,29 @@ async def buscar_alerta_imagem(descricao: str, usuario: str = Depends(verificar_
     return {"alerta_imagem": res.data[0].get("alerta_imagem")}
 
 
+def _norm_item_payload(it):
+    """Garante que um item vindo do payload seja SEMPRE um dict.
+
+    O modelo de extração às vezes devolve item como string, e esse formato viaja
+    pelo frontend de volta aos endpoints que salvam/geram (salvar-proposta,
+    upsert-precos, gerar-csv). Sem isto, `item.get(...)` estoura
+    'str' object has no attribute 'get' — e como o auto-save dispara logo após a
+    extração, o operador via a proposta na tela e o erro ao mesmo tempo.
+    String vira {descricao...}; qualquer outra coisa vira dict vazio (não derruba).
+    """
+    if isinstance(it, dict):
+        return it
+    if isinstance(it, str):
+        return {"descricao_original": it, "descricao_final": it,
+                "descricao": it, "quantidade": 1, "unidade": "UN"}
+    return {}
+
+
+def _itens_payload(payload):
+    """Lista de itens do payload, cada um garantidamente dict."""
+    return [_norm_item_payload(i) for i in (payload.get("itens") or [])]
+
+
 @app.post("/salvar-proposta")
 async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)):
     """Upsert de proposta e itens. status: 'rascunho' | 'confirmada'.
@@ -2207,7 +2230,7 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
     Itens antigos são substituídos pelos novos (delete + insert).
     """
     sb = get_supabase()
-    itens = payload.get("itens", [])
+    itens = _itens_payload(payload)
     valor_total = sum(
         float(i.get("preco_un") or 0) * float(i.get("quantidade") or 1)
         for i in itens
