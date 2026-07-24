@@ -118,6 +118,7 @@ Formato — SEMPRE retorne um array de propostas, mesmo que seja apenas uma:
         {
           "descricao": "descrição comercial curta — máx 120 chars",
           "descricao_original": "texto exato do cliente, preservado integralmente",
+          "codigo_cliente": "código do item no sistema do cliente, ou null",
           "specs_complementares": "specs técnicas ou PN se presentes, senão null",
           "quantidade": 1,
           "unidade": "UN",
@@ -129,9 +130,21 @@ Formato — SEMPRE retorne um array de propostas, mesmo que seja apenas uma:
 }
 
 QUANDO CRIAR MÚLTIPLAS PROPOSTAS:
+- LOCAL DE ENTREGA DIFERENTE = PROPOSTA DIFERENTE. Esta é a regra mais forte e ela
+  vem ANTES de todas as outras. Cada endereço/base/filial de entrega vira uma proposta
+  própria, porque cada uma vira um frete e um faturamento separados.
+  • Duas requisições diferentes para o MESMO destino = UMA proposta só.
+  • Uma requisição com DOIS destinos = DUAS propostas.
+  • O que manda é o destino, nunca o número da requisição.
 - O conteúdo traz seções claramente separadas por arquivo/planilha/aba → uma proposta por seção
 - O e-mail menciona explicitamente múltiplos projetos, RCs ou solicitações distintas → uma por demanda
-- Lista de itens é única (mesmo que longa) → uma única proposta
+- Lista de itens é única, com destino único (mesmo que longa) → uma única proposta
+- Quando quebrar por destino: "cliente", "cnpj" e "rc_neg" são os MESMOS em todas as
+  propostas (é um pedido só, do mesmo cliente). O "titulo" é que muda — use o destino
+  como título (ex.: "Presidente Prudente", "Base João Dias — SP"), porque é ele que o
+  operador vê na aba.
+- O MESMO item pode aparecer em propostas diferentes com quantidades diferentes. Isso é
+  normal e correto: são entregas distintas. NUNCA junte, NUNCA descarte como duplicata.
 
 REGRAS DE DESCRIÇÃO:
 - "descricao": sempre curta e comercial. Formato: [Categoria] [Marca/Modelo] [Spec principal]
@@ -168,6 +181,22 @@ REGRAS GERAIS:
 - Em tabelas com coluna Qtd/Quantidade/QTDE: leia a célula exata da coluna. A quantidade NÃO
   é o número da linha nem o código do item. Verifique cada linha antes de confirmar.
 - Em tabelas com coluna PN/Código/Nº do item/SKU: inclua em specs_complementares como "PN: XXXXX"
+
+CÓDIGO DO CLIENTE (campo "codigo_cliente"):
+- É o código do item no ERP/sistema DO CLIENTE — a coluna "Item", "Código", "Material",
+  "Nº do item". Exemplos reais: "UC.107572", "AF.101766", "ES.102241", "MAT-4471".
+- Copie EXATAMENTE como está, sem reformatar, sem completar, sem corrigir.
+- NÃO confunda com o número da LINHA (1, 2, 3...) nem com o número da requisição.
+- NÃO é o PN do fabricante nem o nosso SKU. Se o material só traz o PN do fabricante e
+  nenhum código do cliente, devolva null e deixe o PN em specs_complementares.
+- Não existe código do cliente na maioria das cotações. Ausente → null. NUNCA invente:
+  este campo é usado para copiar preço entre propostas, e um código errado copia o
+  preço do item errado.
+
+LOCAL DE ENTREGA:
+- Quando o material informar destino por item, escreva-o SEMPRE no FIM de
+  specs_complementares, no formato "Entrega: <texto do destino como veio>".
+- O destino nunca entra na "descricao" nem na "descricao_original" — ele não é o produto.
 """
 
 SYSTEM_MATCHING = """Você é especialista em materiais elétricos, telecom, infraestrutura e TI.
@@ -392,6 +421,85 @@ def _norm_entrada(s: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# IDENTIDADE DE CONTEÚDO — o anexo é a cotação ou só repete o corpo?
+#
+# Nasceu do e-mail da Universal (22/07/2026, NEG-0040613): o corpo trazia 45
+# linhas de item e o CNPJ; junto vinha um PDF "Ferramentas Padrão Eletricista",
+# que é ANEXO DE REFERÊNCIA — 18 dos 19 códigos dele já estavam no corpo.
+# O /extrair promoveu o PDF a "CONTEÚDO PARA COTAÇÃO" e rebaixou o corpo a
+# "contexto" cortado em 3.000 chars (36 das 46 linhas e o CNPJ, que estava a 88%
+# do corpo, foram jogados fora). A proposta chegou vazia na tela.
+#
+# A decisão de descartar é DETERMINÍSTICA e acontece ANTES de qualquer chamada
+# de IA — comparar dois textos não precisa de modelo.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Código de item no ERP do cliente: UC.107572, AF.101766, ES.102241, MAT-4471.
+_COD_CLIENTE_RE = re.compile(r'\b[A-Z]{2,4}[.\-]\d{4,8}\b')
+
+
+def _tokens_identidade(txt: str) -> set:
+    """Tokens que identificam os ITENS de um texto, para comparar duas fontes.
+
+    Prefere o CÓDIGO DO CLIENTE: é um identificador que o cliente deu, não um que
+    a gente inferiu — a chave mais confiável que existe aqui. Mas ele é raro: em
+    36 e-mails reais medidos, só 8 traziam código. Quando não há código suficiente,
+    cai para linhas de descrição normalizadas, que é o que sobra de determinístico.
+
+    As duas fontes precisam usar o MESMO tipo de token para a comparação valer —
+    quem garante isso é o _anexo_redundante.
+    """
+    if not txt:
+        return set()
+    cods = {c.upper() for c in _COD_CLIENTE_RE.findall(txt)}
+    if len(cods) >= 3:
+        return cods
+    linhas = set()
+    for l in re.split(r'[\r\n]+', txt or ""):
+        l = re.sub(r'\s+', ' ', l).strip()
+        # 25 chars + ao menos uma letra: descarta número solto, unidade e célula vazia
+        if len(l) >= 25 and re.search(r'[A-Za-zÀ-ÿ]', l):
+            linhas.add(_norm_entrada(l))
+    return linhas
+
+
+def _anexo_redundante(txt_anexo: str, txt_corpo: str):
+    """O anexo só repete o que o corpo já traz? -> (bool, lista de exclusivos).
+
+    Conservador de propósito. Exige evidência dos DOIS lados (>= 3 tokens cada) e
+    sobreposição alta (>= 80%). Na dúvida NÃO descarta: processar o mesmo item duas
+    vezes é um incômodo que o operador vê e corrige; descartar o anexo que ERA a
+    cotação é uma proposta vazia que ele não tem como diagnosticar.
+
+    Os `exclusivos` voltam para a tela. Anexo descartado em silêncio esconderia do
+    operador que alguma coisa ficou de fora.
+    """
+    ta = _tokens_identidade(txt_anexo)
+    tc = _tokens_identidade(txt_corpo)
+    if len(ta) < 3 or len(tc) < 3:
+        return False, []
+    comuns = ta & tc
+    if len(comuns) / len(ta) < 0.8:
+        return False, []
+    return True, sorted(ta - comuns)
+
+
+def _recorte_contexto(txt: str, teto: int = 12000) -> str:
+    """Recorta preservando as DUAS pontas do e-mail.
+
+    O CNPJ e a assinatura moram no RODAPÉ. Cortar só a cauda (`txt[:teto]`) é o jeito
+    mais eficiente de perder exatamente o campo que o SYSTEM_EXTRACAO chama de "o mais
+    negligenciado" — no e-mail da Universal o CNPJ estava no caractere 11.872 de 13.715.
+    """
+    txt = txt or ""
+    if len(txt) <= teto:
+        return txt
+    cab = int(teto * 0.6)
+    rod = teto - cab
+    return txt[:cab] + "\n\n[... trecho do meio omitido ...]\n\n" + txt[-rod:]
+
+
 _TITULOS_FALHA = {
     "candidatos_trgm_lote": "Busca no banco de preços falhou ao gerar proposta",
     "memoria_match":        "Memória de matching indisponível",
@@ -478,6 +586,7 @@ def _itens_sem_match(itens_raw: list) -> list:
         out.append({
             "descricao_original":   item.get("descricao_original", desc) or desc,
             "descricao_final":      desc,
+            "codigo_cliente":       (item.get("codigo_cliente") or "").strip(),
             "specs_complementares": item.get("specs_complementares") or "",
             "quantidade":           item.get("quantidade", 1),
             "unidade":              item.get("unidade", "UN"),
@@ -825,6 +934,10 @@ diferente = null; spec divergente = não é o mesmo item, mesmo que a descriçã
         itens_com_preco.append({
             "descricao_original": desc_original,
             "descricao_final": desc_final,
+            # Código do item no ERP do cliente. Não participa do matching com o banco
+            # (o banco é nosso, o código é dele) — é a chave de propagação de preço
+            # entre propostas do MESMO pedido, quando o cliente quebra por destino.
+            "codigo_cliente": (item.get("codigo_cliente") or "").strip(),
             "specs_complementares": specs_comp,
             "quantidade": item.get("quantidade", 1),
             "unidade": item.get("unidade", "UN"),
@@ -1001,7 +1114,7 @@ async def extrair_email(
 
     imgs_msg: list = []        # imagens embutidas nos .msg
     contexto_email = ""        # body/assunto do email (contexto de cliente/CNPJ)
-    conteudo_files: list = []  # [(nome, texto)] por arquivo de conteúdo (Excel, PDF)
+    conteudo_files: list = []  # [(nome, texto, tipo)] por arquivo de conteúdo (Excel, PDF)
     todas_imgs_len = 0
 
     _IMG_SKIP_EXT = re.compile(r'logo|logotipo|assinatura|signature|bullet|icon', re.I)
@@ -1122,11 +1235,11 @@ async def extrair_email(
                         # Fallback: extração por texto (IA vai processar)
                         xl = _extrair_excel_bytes(att.data, afn)
                         if xl.strip():
-                            conteudo_files.append((att.longFilename or att.shortFilename, xl))
+                            conteudo_files.append((att.longFilename or att.shortFilename, xl, "excel"))
                 elif afn.endswith(".pdf") and not _PDF_SKIP.search(afn) and len(att.data) <= _PDF_MAX_BYTES:
                     pt = _pdf_po_texto(att.data)
                     if pt.strip():
-                        conteudo_files.append((att.longFilename or att.shortFilename, pt))
+                        conteudo_files.append((att.longFilename or att.shortFilename, pt, "pdf"))
                 elif afn.endswith((".png", ".jpg", ".jpeg", ".webp")):
                     if not _IMG_SKIP_EXT.search(afn) and len(att.data) >= 5000:
                         imgs_msg.append((afn, att.data))
@@ -1147,12 +1260,12 @@ async def extrair_email(
             else:
                 xl = _extrair_excel_bytes(dados, fname)
                 if xl.strip():
-                    conteudo_files.append((fname, xl))
+                    conteudo_files.append((fname, xl, "excel"))
 
         elif flo.endswith(".pdf") and not _PDF_SKIP.search(flo) and len(dados) <= _PDF_MAX_BYTES:
             pt = _pdf_po_texto(dados)
             if pt.strip():
-                conteudo_files.append((fname, pt))
+                conteudo_files.append((fname, pt, "pdf"))
 
         elif flo.endswith((".png", ".jpg", ".jpeg", ".webp")):
             if not _IMG_SKIP_EXT.search(flo):
@@ -1166,6 +1279,47 @@ async def extrair_email(
 
     if texto:
         contexto_email += texto
+
+    # ── Avisos e notas (declarados aqui: o filtro abaixo já escreve neles) ───
+    # avisos_extracao = FALHA do sistema (abre chamado automático).
+    # notas_extracao  = decisão que o operador precisa saber, mas não é falha.
+    # Misturar os dois faria "descartei um anexo repetido" abrir chamado como se
+    # fosse quebra — e chamado que não é problema treina todo mundo a ignorar chamado.
+    avisos_extracao: list = []
+    notas_extracao: list = []
+
+    # ── Anexo que só repete o corpo NÃO é a cotação ──────────────────────────
+    # Sem isto, o anexo de referência vira "CONTEÚDO PARA COTAÇÃO" e o corpo — onde
+    # estão os itens e o CNPJ — é rebaixado a contexto recortado. Foi exatamente o
+    # que esvaziou a proposta da Universal (NEG-0040613, 22/07).
+    # Só vale para PDF: Excel estruturado nem chega aqui (o parser determinístico
+    # insere direto em propostas_raw), e quando um Excel chega junto ele É a cotação.
+    descartados_files: list = []   # [(nome, texto)] — não foram à IA, mas ficam na fonte
+    if conteudo_files and len(contexto_email.strip()) >= 400:
+        _mantidos = []
+        for _nome, _cont, _tipo in conteudo_files:
+            if _tipo != "pdf":
+                _mantidos.append((_nome, _cont, _tipo))
+                continue
+            _red, _excl = _anexo_redundante(_cont, contexto_email)
+            if not _red:
+                _mantidos.append((_nome, _cont, _tipo))
+                continue
+            descartados_files.append((_nome, _cont))
+            _msg_nota = (f"O anexo “{_nome}” repete os itens que já estão no corpo do "
+                         f"e-mail, então usei o corpo como fonte da cotação.")
+            if _excl:
+                _msg_nota += (" Estes códigos aparecem só no anexo e NÃO viraram item: "
+                              + ", ".join(_excl[:12])
+                              + (f" (e mais {len(_excl) - 12})" if len(_excl) > 12 else "")
+                              + ". Confira se algum deles deveria estar na proposta.")
+            notas_extracao.append({
+                "tipo": "anexo_redundante",
+                "arquivo": _nome,
+                "mensagem": _msg_nota,
+                "exclusivos": _excl[:40],
+            })
+        conteudo_files = _mantidos
 
     # ── Montar chamadas de extração ──────────────────────────────────────────
     # Regra: um arquivo de conteúdo (Excel/PDF) = uma proposta candidata
@@ -1181,7 +1335,14 @@ async def extrair_email(
         if payload_txt.strip():
             msg_content.append({"type": "text", "text": payload_txt[:20000]})
         if imgs_inline:
-            msg_content.append({"type": "text", "text": f"Analise também {len(imgs_inline)} imagem(ns):"})
+            # Só cabem 4. O filtro por NOME não separa banner de print, porque o
+            # Outlook nomeia tudo de "image.png" — no e-mail da Universal vieram dois
+            # banners de assinatura (6 KB e 14 KB) e dois prints da tabela (105 KB e
+            # 122 KB), todos com o mesmo nome. Maior primeiro: banner de assinatura é
+            # faixa fina e leve, print de tabela é pesado. Assim o print nunca perde
+            # a vaga para a logo quando o e-mail tem muita imagem.
+            imgs_inline = sorted(imgs_inline, key=lambda p: len(p[1]), reverse=True)
+            msg_content.append({"type": "text", "text": f"Analise também {len(imgs_inline[:4])} imagem(ns):"})
             for _, img_bytes in (imgs_inline or [])[:4]:
                 msg_content.append({"type": "image", "source": {"type": "base64",
                     "media_type": _media_type_img(img_bytes), "data": _b64.standard_b64encode(img_bytes).decode()}})
@@ -1192,11 +1353,26 @@ async def extrair_email(
                     "data": _b64.standard_b64encode(ib).decode()}})
         if not msg_content:
             return []
+        # 4000 tokens não cabiam uma cotação grande. O e-mail da Universal
+        # (NEG-0040613) precisava de ~4.400 no piso e ~7.000 com os endereços de
+        # entrega por item: a resposta cortava no meio, o JSON ficava inválido, o
+        # except devolvia [] e a proposta chegava VAZIA na tela — sem nenhum sinal
+        # de que tinha havido corte. Teto alto + o aviso abaixo: se bater, o
+        # operador fica sabendo em vez de receber uma lista silenciosamente curta.
         resp = claude.messages.create(
-            model=modelo_extracao, max_tokens=4000,
+            model=modelo_extracao, max_tokens=16000,
             system=SYSTEM_EXTRACAO,
             messages=[{"role": "user", "content": msg_content}],
         )
+        if getattr(resp, "stop_reason", "") == "max_tokens":
+            avisos_extracao.append({
+                "tipo": "busca_falhou", "etapa": "extracao_truncada",
+                "assinatura": "extracao:max_tokens",
+                "mensagem": ("A lista de itens era grande demais e a extração foi cortada "
+                             "no meio. A proposta pode ter vindo INCOMPLETA — confira "
+                             "contra o e-mail antes de gerar o CSV."),
+                "detalhe": f"stop_reason=max_tokens · modelo={modelo_extracao}",
+            })
         raw = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
         # Extração robusta: remove backticks/preamble e extrai pelo primeiro { → último }
         raw = re.sub(r'^```(?:json)?\s*', '', raw.strip())
@@ -1214,15 +1390,37 @@ async def extrair_email(
             if "itens" in parsed and "propostas" not in parsed:
                 parsed = {"propostas": [parsed]}
             return parsed.get("propostas", [])
-        except Exception:
+        except Exception as e:
+            # Antes este except devolvia [] calado e a tela mostrava proposta vazia
+            # como se o e-mail não tivesse itens. "Não veio nada" e "não consegui ler"
+            # são coisas diferentes e o operador precisa saber qual das duas é.
+            avisos_extracao.append({
+                "tipo": "busca_falhou", "etapa": "extracao_json",
+                "assinatura": f"extracao:json:{type(e).__name__}",
+                "mensagem": ("Li o e-mail mas não consegui interpretar a resposta da "
+                             "extração. Os itens NÃO foram perdidos no e-mail — foi "
+                             "falha do sistema. Tente de novo; se repetir, me chame."),
+                "detalhe": f"{type(e).__name__}: {e}"[:400],
+            })
             return []
 
     if conteudo_files:
         # Uma chamada por arquivo de conteúdo
-        for nome_arq, conteudo_arq in conteudo_files:
-            ctx = f"CONTEXTO (cliente/CNPJ/referência do e-mail):\n{contexto_email[:3000]}\n\n" \
+        for _ordem, (nome_arq, conteudo_arq, _tipo_arq) in enumerate(conteudo_files):
+            # O corpo entra pelas DUAS pontas: o cabeçalho diz quem pediu, o rodapé
+            # é onde mora o CNPJ. Cortar só a cauda em 3.000 chars perdia o CNPJ de
+            # todo e-mail longo — e o CNPJ é o campo que amarra o preço ao cliente.
+            ctx = f"CONTEXTO (cliente/CNPJ/referência do e-mail):\n{_recorte_contexto(contexto_email)}\n\n" \
                   f"CONTEÚDO PARA COTAÇÃO — arquivo: {nome_arq}\n{conteudo_arq[:15000]}"
-            props = await _chamar_extracao(ctx)
+            # As imagens embutidas eram coletadas e NUNCA enviadas neste ramo — e o
+            # modelo já era promovido a Sonnet por causa delas, então pagávamos por
+            # visão sem mandar imagem nenhuma. Vão na primeira chamada só: elas são
+            # do e-mail, não de um arquivo, e repeti-las por arquivo multiplicaria custo.
+            props = await _chamar_extracao(
+                ctx,
+                imgs_inline=(imgs_msg if _ordem == 0 else None),
+                imgs_upload=(imgs_validas if _ordem == 0 else None),
+            )
             for p in props:
                 p.setdefault("titulo", nome_arq)
             propostas_raw.extend(props)
@@ -1243,12 +1441,19 @@ async def extrair_email(
 
     t0 = time.time()
     resultado_propostas = []
-    avisos_extracao = []
+    # ATENÇÃO: `avisos_extracao` NÃO é zerado aqui. Ele é declarado antes do filtro
+    # de anexos e já pode conter avisos da própria extração (corte por max_tokens,
+    # JSON ilegível). Zerar neste ponto apagava justamente os avisos que dizem por
+    # que a proposta veio curta.
 
     # Tudo que a IA viu: corpo do e-mail, anexos convertidos e o texto colado.
+    # O anexo descartado entra MARCADO: a fonte é o registro do que chegou, e sumir
+    # com ele esconderia a decisão de quem for auditar a proposta depois.
     _fonte = "\n\n".join(x for x in [
         contexto_email.strip(),
-        "\n\n".join(f"--- {n} ---\n{c}" for n, c in conteudo_files),
+        "\n\n".join(f"--- {n} ---\n{c}" for n, c, _t in conteudo_files),
+        "\n\n".join(f"--- {n} (anexo redundante — não enviado à IA) ---\n{c}"
+                    for n, c in descartados_files),
         (texto or "").strip(),
     ] if x).strip()
     for idx_p, prop_raw in enumerate(propostas_raw):
@@ -1323,8 +1528,11 @@ async def extrair_email(
                 "chamado": num,
             })
 
+    # `notas` é chave NOVA e separada de `avisos` de propósito: o frontend antigo
+    # ignora o que não conhece, então o backend pode subir sozinho sem a tela
+    # renderizar uma nota informativa dentro do banner vermelho de falha.
     return {"propostas": resultado_propostas, "elapsed": round(elapsed, 2),
-            "avisos": avisos_saida}
+            "avisos": avisos_saida, "notas": notas_extracao}
 
 
 def _ilike_literal(s: str) -> str:
@@ -1999,6 +2207,7 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
             "proposta_id":          proposta_id,
             "descricao_original":   i.get("descricao_original", ""),
             "descricao_final":      i.get("descricao_final", ""),
+            "codigo_cliente":       (i.get("codigo_cliente") or "").strip() or None,
             "quantidade":           float(i.get("quantidade") or 1),
             "unidade":              i.get("unidade", "UN"),
             "preco_venda":          float(i.get("preco_un") or 0),

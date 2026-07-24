@@ -481,6 +481,24 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
           </div>
           <div className="mt-0.5 flex flex-wrap items-center gap-2 pl-1.5">
             <StateLabel conf={confianca} />
+            {/* Código do item no ERP do cliente. É a chave que liga o mesmo produto
+                entre as abas do pedido — mostrar dá ao operador como conferir a
+                herança de preço sem abrir o e-mail de novo. */}
+            {(item.codigo_cliente || "").trim() && (
+              <span className="rounded bg-paper px-1.5 py-0.5 font-mono text-[10.5px] text-faint"
+                title="Código do item no sistema do cliente">
+                {item.codigo_cliente}
+              </span>
+            )}
+            {/* Preço que veio de outra aba do MESMO pedido, não do banco nem da
+                internet. O operador tem que saber o que ele preencheu e o que veio
+                de carona antes de bater o martelo no CSV desta aba. */}
+            {item._herdado && (
+              <span className="rounded bg-signal/15 px-1.5 py-0.5 font-mono text-[10.5px] text-signal"
+                title="Preço e origem copiados de outra aba deste mesmo pedido">
+                herdado
+              </span>
+            )}
             {/* Motor de preços: banco + internet + conferir numa gaveta só.
                 O rótulo carrega o veredito, como antes carregava no toggle do banco. */}
             <button onClick={() => setMotorAberto((v) => !v)}
@@ -1109,6 +1127,117 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
   );
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// PROPAGAÇÃO DE LASTRO ENTRE ABAS
+//
+// Cliente que quebra o pedido por destino manda o MESMO item várias vezes, uma
+// vez por local de entrega. O operador cotava o mesmo produto 4 vezes. Gerar o
+// CSV de uma aba agora copia preço e origem para as irmãs.
+//
+// O que copia: ORIGEM/LASTRO — venda, custo, frete de vinda (que é do fornecedor
+// até a Kist, igual para todos os destinos) e o rastro inteiro do fornecedor.
+// O que NUNCA copia: o cadastro do item — descrição, specs, quantidade, unidade.
+// O que muda entre destinos é quanto e para onde, não o que o produto é.
+// ─────────────────────────────────────────────────────────────────────────
+const CAMPOS_LASTRO = [
+  "preco_un", "preco_custo", "frete_vinda",
+  "fornecedor", "fornecedor_canal", "fornecedor_contato",
+  "link_fornecedor", "sku_fornecedor",
+];
+
+// Espelho do _norm_entrada (backend) e do norm_entrada() (Postgres). Se mudar
+// em um, mude nos três — senão a mesma descrição gera chaves diferentes.
+function normEntrada(s) {
+  return (s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function descNorm(it) {
+  return normEntrada(it?.descricao_original || it?.descricao_final || "");
+}
+
+// Chave de identidade entre propostas. Preferência absoluta pelo código do
+// cliente: é um identificador que ELE deu, não um que a gente inferiu. Sem
+// código, cai para descrição idêntica — que ainda é igualdade, não semelhança.
+function chaveItem(it) {
+  const cod = (it?.codigo_cliente || "").trim().toUpperCase();
+  if (cod) return "C:" + cod;
+  const d = descNorm(it);
+  return d ? "D:" + d : "";
+}
+
+function vazio(v) {
+  if (typeof v === "number") return !(v > 0);
+  if (v === null || v === undefined) return true;
+  if (typeof v === "string") return !v.trim();
+  return !v;
+}
+
+function temAlgumLastro(it) {
+  return CAMPOS_LASTRO.some((c) => !vazio(it[c]));
+}
+
+function propagarLastro(lista, idxOrigem) {
+  const origem = lista[idxOrigem];
+  if (!origem) return { lista, itens: 0, abas: 0, conflitos: [] };
+
+  // Doadores: itens da aba que acabou de virar CSV. Chave repetida dentro da
+  // MESMA aba com lastro divergente = ambígua. Não escolhemos por ela — copiar
+  // o preço errado é pior que não copiar, e o operador não teria como perceber.
+  const doadores = new Map();
+  for (const it of (origem.itens || [])) {
+    const k = chaveItem(it);
+    if (!k || !temAlgumLastro(it)) continue;
+    const ja = doadores.get(k);
+    if (ja === undefined) { doadores.set(k, it); continue; }
+    if (ja === "ambiguo") continue;
+    const divergem = CAMPOS_LASTRO.some((c) => String(ja[c] ?? "") !== String(it[c] ?? ""));
+    if (divergem) doadores.set(k, "ambiguo");
+  }
+  if (doadores.size === 0) return { lista, itens: 0, abas: 0, conflitos: [] };
+
+  let nItens = 0;
+  const abas = new Set();
+  const conflitos = [];
+
+  const nova = lista.map((p, pi) => {
+    if (pi === idxOrigem) return p;
+    let mudou = false;
+    const itens = (p.itens || []).map((it) => {
+      const k = chaveItem(it);
+      if (!k) return it;
+      const d = doadores.get(k);
+      if (!d) return it;
+      if (d === "ambiguo") {
+        conflitos.push({ aba: pi, motivo: "ambiguo", chave: k,
+          descricao: it.descricao_original || it.descricao_final || "" });
+        return it;
+      }
+      // Código igual com descrição diferente não é o mesmo item — é sinal de
+      // que alguma coisa está errada no pedido. Mostra, não preenche.
+      if (descNorm(it) !== descNorm(d)) {
+        conflitos.push({ aba: pi, motivo: "descricao", chave: k,
+          descricao: it.descricao_original || it.descricao_final || "" });
+        return it;
+      }
+      // Só preenche o que está VAZIO. O que o operador digitou é dele — o
+      // sistema aprende com ele, nunca sobrescreve.
+      const patch = {};
+      for (const c of CAMPOS_LASTRO) {
+        if (vazio(it[c]) && !vazio(d[c])) patch[c] = d[c];
+      }
+      if (Object.keys(patch).length === 0) return it;
+      mudou = true; nItens += 1; abas.add(pi);
+      return { ...it, ...patch, tem_preco: (patch.preco_un ?? it.preco_un) > 0,
+               _alterado: true, _herdado: true };
+    });
+    return mudou ? { ...p, itens } : p;
+  });
+
+  return { lista: nova, itens: nItens, abas: abas.size, conflitos };
+}
+
+
 export default function App() {
   // Sessão persistida em sessionStorage: sobrevive a refresh/deploy,
   // limpa ao fechar a aba. auto_select no Google reconecta silenciosamente
@@ -1154,6 +1283,14 @@ export default function App() {
   // Avisos do backend quando a BUSCA FALHOU (≠ produto ausente no banco).
   // Cada um traz o número do chamado que o sistema abriu sozinho.
   const [avisosSistema, setAvisosSistema] = useState([]);
+  // Notas do backend: decisão que o operador precisa saber, mas que NÃO é falha
+  // (ex.: anexo descartado por repetir o corpo). Canal separado dos avisos de
+  // propósito — nota informativa dentro de banner vermelho de erro faz o operador
+  // parar de ler os dois.
+  const [notasSistema, setNotasSistema] = useState([]);
+  // Resumo da última propagação de lastro entre abas (gerou CSV de uma, as outras
+  // herdaram). Some ao reiniciar.
+  const [propagacao, setPropagacao] = useState(null);
   // "Não importar preços sem rastreabilidade": ON pro Fábio por padrão, OFF pros demais.
   // Ele pode desmarcar. Diferente do antigo checkbox de preservar descrição (que criava
   // duas verdades no mesmo dado), este não muda o que o sistema SABE — só o que ele
@@ -1377,6 +1514,10 @@ export default function App() {
       // Falha do sistema != produto ausente no banco. Sem isto, o operador
       // precifica 20 itens na mão achando que o banco está pobre.
       setAvisosSistema(Array.isArray(data.avisos) ? data.avisos : []);
+      // Notas: decisão do sistema que não é falha (anexo descartado por repetir o
+      // corpo, e quais códigos ficaram de fora). Canal e visual separados do erro.
+      setNotasSistema(Array.isArray(data.notas) ? data.notas : []);
+      setPropagacao(null);
       // Normalizar: backend sempre retorna {propostas:[...]}, mas suportar legado {itens:[...]}
       const props = data.propostas || [data];
       setPropostas(props); setPropostaIdx(0); setDownloadados(new Set());
@@ -1437,6 +1578,7 @@ export default function App() {
         pi !== propostaIdx ? p : { ...p, itens: [...(p.itens || []), ...novos] }
       ));
       if (Array.isArray(data.avisos) && data.avisos.length) setAvisosSistema(data.avisos);
+      if (Array.isArray(data.notas) && data.notas.length) setNotasSistema(data.notas);
       setAddTexto(""); setAddArquivos([]); setAddAberto(false);
       _dispararAutoSave();
     } catch (e) { setAddErro(e.message); }
@@ -1444,8 +1586,14 @@ export default function App() {
   }
 
   function atualizarItem(index, campo, valor) {
+    // Mexeu num campo de lastro? Então o valor passou a ser dele, não mais herdado
+    // da aba irmã — o selo sai. Selo que sobrevive à edição mente sobre a origem
+    // do dado, e é justamente a origem que ele existe para informar.
+    const saiHerdado = CAMPOS_LASTRO.includes(campo);
     setPropostas((prev) => prev.map((p, pi) =>
-      pi !== propostaIdx ? p : { ...p, itens: p.itens.map((item, i) => i === index ? { ...item, [campo]: valor, _alterado: true } : item) }
+      pi !== propostaIdx ? p : { ...p, itens: p.itens.map((item, i) => i === index
+        ? { ...item, [campo]: valor, _alterado: true, ...(saiHerdado ? { _herdado: false } : {}) }
+        : item) }
     ));
     _dispararAutoSave();
   }
@@ -1507,6 +1655,7 @@ export default function App() {
       const itens = (data.itens || []).map(it => ({
         descricao_original:   it.descricao_original || "",
         descricao_final:      it.descricao_final || "",
+        codigo_cliente:       it.codigo_cliente || "",
         specs_complementares: it.specs_complementares || "",
         quantidade:           Number(it.quantidade) || 1,
         unidade:              it.unidade || "UN",
@@ -1604,6 +1753,16 @@ export default function App() {
       const a = document.createElement("a"); a.href = url;
       a.download = `proposta_${prop.proposta}.csv`; a.click();
       URL.revokeObjectURL(url);
+      // Gerar CSV é o mantra: alimenta o banco, salva a proposta e AGORA também
+      // propaga preço e lastro para as abas irmãs do mesmo pedido. Roda depois do
+      // arquivo sair — se o CSV falhar, nada se espalha.
+      if (propostas.length > 1) {
+        const r = propagarLastro(propostas, idx);
+        if (r.itens > 0) setPropostas(r.lista);
+        if (r.itens > 0 || r.conflitos.length > 0) {
+          setPropagacao({ itens: r.itens, abas: r.abas, conflitos: r.conflitos });
+        }
+      }
       // Marcar proposta como baixada; só avança para download quando todas forem baixadas
       setDownloadados((prev) => {
         const next = new Set(prev); next.add(idx);
@@ -1616,6 +1775,8 @@ export default function App() {
 
   function reiniciar() {
     setAvisosSistema([]);
+    setNotasSistema([]);
+    setPropagacao(null);
     setStep("input"); setPropostas([]); setPropostaIdx(0); setDownloadados(new Set()); setBancoInfo(null);
     setTexto(""); setArquivos([]); setImagens([]); setNumeroProposta(""); setErro("");
     setPropostaId(null); setSalvando(false); setUltimoSalvo(null);
@@ -1979,6 +2140,81 @@ export default function App() {
                         </div>
                       </div>
                     ))}
+                  </div>
+                )}
+
+                {/* NOTAS — decisão do sistema que não é falha. Visual âmbar, distinto
+                    do vermelho de erro: o operador precisa conseguir diferenciar num
+                    relance "o sistema quebrou" de "o sistema decidiu, confere aí". */}
+                {notasSistema.length > 0 && (
+                  <div className="mt-4 space-y-2">
+                    {notasSistema.map((nt, i) => (
+                      <div key={i} className="rounded-xl border border-amber/40 bg-amberbg px-4 py-3">
+                        <div className="flex items-start gap-2.5">
+                          <span className="mt-0.5 flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full bg-amber text-[10px] font-bold text-white">i</span>
+                          <div className="min-w-0 flex-1">
+                            <div className="text-[13px] font-semibold text-amber">Anexo repetido — usei o corpo do e-mail</div>
+                            <div className="mt-0.5 text-[12.5px] leading-relaxed text-sub">{nt.mensagem}</div>
+                          </div>
+                          <button onClick={() => setNotasSistema((p) => p.filter((_, j) => j !== i))}
+                            title="Dispensar" className="rounded p-0.5 text-amber/60 hover:bg-white/40 hover:text-amber">
+                            <IconX size={14} />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* PROPAGAÇÃO — o que a geração do CSV copiou para as abas irmãs.
+                    Precisa aparecer: o operador acabou de ver 3 abas se preencherem
+                    sozinhas e tem que saber o que foi, para conferir antes do CSV delas. */}
+                {propagacao && (
+                  <div className="mt-4 rounded-xl border border-signal/40 bg-signalbg px-4 py-3">
+                    <div className="flex items-start gap-2.5">
+                      <span className="mt-0.5 flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full bg-signal text-white">
+                        <IconCheck size={11} />
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        {propagacao.itens > 0 ? (
+                          <>
+                            <div className="text-[13px] font-semibold text-signal">
+                              Preço e origem copiados para {propagacao.itens} {propagacao.itens === 1 ? "item" : "itens"}
+                              {propagacao.abas > 0 && ` em ${propagacao.abas} ${propagacao.abas === 1 ? "outra aba" : "outras abas"}`}
+                            </div>
+                            <div className="mt-0.5 text-[12.5px] leading-relaxed text-sub">
+                              São os mesmos itens deste pedido, em outro destino. Vieram marcados como
+                              <span className="mx-1 rounded bg-signal/15 px-1 py-0.5 font-mono text-[10.5px] text-signal">herdado</span>
+                              nas abas — confira antes de gerar o CSV de cada uma.
+                            </div>
+                          </>
+                        ) : (
+                          <div className="text-[13px] font-semibold text-signal">Nada foi copiado para as outras abas</div>
+                        )}
+                        {propagacao.conflitos?.length > 0 && (
+                          <details className="mt-1.5">
+                            <summary className="cursor-pointer text-[12px] text-sub hover:text-ink">
+                              {propagacao.conflitos.length} {propagacao.conflitos.length === 1 ? "item ficou" : "itens ficaram"} de fora — ver por quê
+                            </summary>
+                            <div className="mt-1.5 space-y-1">
+                              {propagacao.conflitos.slice(0, 12).map((c, i) => (
+                                <div key={i} className="rounded bg-surface/70 px-2 py-1 text-[11.5px] text-sub">
+                                  <span className="font-mono text-faint">Proposta {c.aba + 1}</span>{" · "}
+                                  {c.motivo === "descricao"
+                                    ? "mesmo código do cliente, mas descrição diferente — não preenchi"
+                                    : "o código aparece mais de uma vez com origens diferentes — não dava pra escolher"}
+                                  <div className="mt-0.5 truncate text-[11px] text-faint">{c.descricao}</div>
+                                </div>
+                              ))}
+                            </div>
+                          </details>
+                        )}
+                      </div>
+                      <button onClick={() => setPropagacao(null)}
+                        title="Dispensar" className="rounded p-0.5 text-signal/60 hover:bg-white/40 hover:text-signal">
+                        <IconX size={14} />
+                      </button>
+                    </div>
                   </div>
                 )}
 
