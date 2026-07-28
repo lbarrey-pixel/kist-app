@@ -4569,21 +4569,45 @@ _DS_LOGO_CACHE = {"b64": None, "bytes": None}
 
 
 def _ds_logo(sb) -> Optional[bytes]:
+    """Logo da KIST, em duas fontes — nesta ordem:
+
+      1. config_kist['datasheet_logo_b64'] (base64) — permite trocar a marca em
+         runtime, sem redeploy;
+      2. backend/assets/logo_kist.png — o arquivo no repositório.
+
+    A fonte 2 existe porque transferir 12 KB de base64 por texto e' fragil: um
+    unico caractere errado no meio do blob invalida o PNG inteiro, e o erro so'
+    aparece na hora de desenhar. Arrastar o PNG no GitHub nao transcreve nada.
+    Cache em memoria: sao 22 KB que nao mudam.
+    """
     if _DS_LOGO_CACHE["bytes"] is not None:
         return _DS_LOGO_CACHE["bytes"]
+
+    dados = None
     try:
         r = sb.table("config_kist").select("valor").eq("chave", "datasheet_logo_b64")\
             .limit(1).execute()
         b64 = (r.data or [{}])[0].get("valor") or ""
     except Exception:
         b64 = ""
-    if not b64.strip():
+    if b64.strip():
+        try:
+            dados = _b64.b64decode(b64.strip(), validate=True)
+        except Exception:
+            dados = None          # blob corrompido: cai pro arquivo em vez de quebrar
+
+    if dados is None:
+        caminho = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "assets", "logo_kist.png")
+        try:
+            with open(caminho, "rb") as f:
+                dados = f.read()
+        except Exception:
+            dados = None
+
+    # Um PNG/JPEG de verdade, nao 3 bytes de sobra de um base64 truncado.
+    if not dados or len(dados) < 512:
         return None
-    try:
-        dados = _b64.b64decode(b64.strip())
-    except Exception:
-        return None
-    _DS_LOGO_CACHE["b64"] = b64
     _DS_LOGO_CACHE["bytes"] = dados
     return dados
 
@@ -4688,8 +4712,9 @@ async def datasheet_gerar(payload: DatasheetGerarIn, usuario: str = Depends(veri
     sb = get_supabase()
     logo = _ds_logo(sb)
     if not logo:
-        raise HTTPException(503, "Logo da KIST não está no config_kist "
-                                 "(chave 'datasheet_logo_b64'). Rode sql/logo_kist.sql.")
+        raise HTTPException(503, "Logo da KIST não encontrado. Coloque o arquivo em "
+                                 "backend/assets/logo_kist.png OU rode sql/logo_kist.sql "
+                                 "(chave config_kist['datasheet_logo_b64']).")
 
     item = payload.item or {}
     anterior, ds_row = None, None
