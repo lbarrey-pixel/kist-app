@@ -11,6 +11,7 @@ from datetime import date
 import extract_msg
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
+import requests
 
 # Motor de busca de preços na internet (Frente A) — módulo separado de propósito:
 # o /gerar-csv e o fmt_preco são invariantes intocáveis, e um subsistema grande no
@@ -908,6 +909,10 @@ diferente = null; spec divergente = não é o mesmo item, mesmo que a descriçã
         if tem_match:
             ficha = {
                 "descricao":      banco_desc,
+                # Id do candidato do banco. Serve ao selo de datasheet (que e'
+                # dado do produto) sem precisar recriar a RPC candidatos_trgm_lote,
+                # que devolve TABLE fixo e e' o coracao do matching.
+                "produto_id":     (_row or {}).get("id"),
                 "preco_un":       float(match.get("banco_preco") or 0),
                 "preco_custo":    float((_row or {}).get("preco_custo") or 0),
                 "fornecedor":     (_row or {}).get("fornecedor") or "",
@@ -970,6 +975,7 @@ diferente = null; spec divergente = não é o mesmo item, mesmo que a descriçã
             "alerta_produto": _alerta_do_candidato(banco_desc, todos_candidatos),
         })
 
+    _ds_marcar_itens(sb, itens_com_preco)
     return itens_com_preco
 
 
@@ -2290,6 +2296,7 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
             "fornecedor_contato":   i.get("fornecedor_contato", ""),
             "sku_fornecedor":       i.get("sku_fornecedor", ""),
             "obs_interna":          i.get("obs_interna", ""),
+            "datasheet_id":         i.get("datasheet_id") or None,
         } for i in itens]
         sb.table("itens_proposta").insert(rows).execute()
 
@@ -4501,3 +4508,446 @@ async def limpar_anexos_orfaos(dias: int = 7, usuario: str = Depends(verificar_t
         _anx_remove(a["path"])
         sb.table("chamado_anexos").delete().eq("id", a["id"]).execute()
     return {"ok": True, "removidos": len(r.data or [])}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# DATASHEETS (chamado #6)
+#
+# O cliente pede a ficha técnica dos itens ofertados. Hoje o operador copia
+# link por link no ChatGPT, espera e baixa cada PDF na mão.
+#
+# Import protegido, mesmo padrão do motor de preços: se `datasheet.py` ou
+# `reportlab` faltarem no deploy, o app sobe normal e só estas rotas avisam.
+# ══════════════════════════════════════════════════════════════════════════
+try:
+    import datasheet as _ds_mod
+    _DATASHEET_OK = True
+    _DATASHEET_ERRO = ""
+except Exception as _e_ds:                                   # pragma: no cover
+    _ds_mod = None
+    _DATASHEET_OK = False
+    _DATASHEET_ERRO = f"{type(_e_ds).__name__}: {_e_ds}"
+
+DATASHEETS_BUCKET = os.environ.get("DATASHEETS_BUCKET", "datasheets")
+_DS_TIMEOUT_HTTP = 20
+_DS_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+
+def _ds_storage():
+    return get_supabase().storage.from_(DATASHEETS_BUCKET)
+
+
+def _ds_upload(path: str, dados: bytes, mime: str = "application/pdf"):
+    _ds_storage().upload(path, dados, {"content-type": mime, "upsert": "true"})
+
+
+def _ds_signed(path: str, expira: int = 3600) -> str:
+    if not path:
+        return ""
+    try:
+        r = _ds_storage().create_signed_url(path, expira) or {}
+        return r.get("signedURL") or r.get("signedUrl") or ""
+    except Exception:
+        return ""
+
+
+def _ds_remove(path: str):
+    if not path:
+        return
+    try:
+        _ds_storage().remove([path])
+    except Exception:
+        pass
+
+
+# ── Logo ──────────────────────────────────────────────────────────────────
+# Vive no config_kist em base64, não no repositório: trocar a marca não exige
+# redeploy, e não há binário para subir no GitHub. Cache em memória porque são
+# 22 KB que não mudam.
+_DS_LOGO_CACHE = {"b64": None, "bytes": None}
+
+
+def _ds_logo(sb) -> Optional[bytes]:
+    if _DS_LOGO_CACHE["bytes"] is not None:
+        return _DS_LOGO_CACHE["bytes"]
+    try:
+        r = sb.table("config_kist").select("valor").eq("chave", "datasheet_logo_b64")\
+            .limit(1).execute()
+        b64 = (r.data or [{}])[0].get("valor") or ""
+    except Exception:
+        b64 = ""
+    if not b64.strip():
+        return None
+    try:
+        dados = _b64.b64decode(b64.strip())
+    except Exception:
+        return None
+    _DS_LOGO_CACHE["b64"] = b64
+    _DS_LOGO_CACHE["bytes"] = dados
+    return dados
+
+
+# ── Rede ──────────────────────────────────────────────────────────────────
+# Funções pequenas e injetadas no módulo do datasheet, para ele continuar
+# testável sem rede. Toda falha vira exceção que o `datasheet.py` já trata.
+def _ds_pagina(url: str) -> str:
+    r = requests.get(url, timeout=_DS_TIMEOUT_HTTP,
+                     headers={"User-Agent": _DS_UA,
+                              "Accept-Language": "pt-BR,pt;q=0.9"})
+    r.raise_for_status()
+    ct = (r.headers.get("content-type") or "").lower()
+    if "html" not in ct and "xml" not in ct and "json" not in ct:
+        return ""
+    return r.text[:400000]
+
+
+def _ds_json(url: str):
+    r = requests.get(url, timeout=_DS_TIMEOUT_HTTP,
+                     headers={"User-Agent": _DS_UA, "Accept": "application/json"})
+    r.raise_for_status()
+    return r.json()
+
+
+def _ds_baixar(url: str) -> bytes:
+    r = requests.get(url, timeout=_DS_TIMEOUT_HTTP, stream=True,
+                     headers={"User-Agent": _DS_UA})
+    r.raise_for_status()
+    dados, teto = b"", 8 * 1024 * 1024
+    for pedaco in r.iter_content(64 * 1024):
+        dados += pedaco
+        if len(dados) > teto:
+            break
+    return dados
+
+
+# ── Serialização ──────────────────────────────────────────────────────────
+def _ds_para_front(row: dict, com_url: bool = True) -> dict:
+    payload = row.get("payload") or {}
+    return {
+        "id": row.get("id"),
+        "produto_id": row.get("produto_id"),
+        "nome_produto": row.get("nome_produto") or "",
+        "fabricante": row.get("fabricante") or "",
+        "modelo": row.get("modelo") or "",
+        "status": row.get("status") or "rascunho",
+        "versao": row.get("versao") or 1,
+        "critica": row.get("critica") or "",
+        "imagem_origem": row.get("imagem_origem") or "",
+        "tem_foto": bool(row.get("imagem_path")),
+        "conteudo": payload.get("conteudo") or {},
+        "identificacao": payload.get("identificacao") or {},
+        "foto": payload.get("foto") or {},
+        "avisos": payload.get("avisos") or [],
+        "nome_arquivo": payload.get("nome_arquivo") or "",
+        "aprovado_por": row.get("aprovado_por") or "",
+        "aprovado_em": str(row.get("aprovado_em") or ""),
+        "pdf_url": _ds_signed(row.get("pdf_path") or "") if com_url else "",
+    }
+
+
+def _ds_chave_link(link: str) -> str:
+    """Normaliza o link para servir de chave de cache.
+
+    Tira querystring de rastreamento e barra final — o mesmo anúncio chega com
+    `?utm_source=` diferente toda vez e viraria um datasheet novo a cada busca.
+    """
+    l = (link or "").strip().lower()
+    if not l:
+        return ""
+    l = re.sub(r"[?#].*$", "", l)
+    l = re.sub(r"/+$", "", l)
+    return l[:400]
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────
+class DatasheetGerarIn(BaseModel):
+    item: dict
+    item_id: Optional[int] = None
+    produto_id: Optional[int] = None
+    datasheet_id: Optional[int] = None      # regeração
+    pistas: Optional[str] = ""              # correção do operador na identificação
+    critica: Optional[str] = ""             # o que ele reprovou
+    fonte_texto: Optional[str] = ""
+    imagem_b64: Optional[str] = ""          # foto que o operador subiu
+    imagem_url: Optional[str] = ""          # ou o link dela
+    contato_rodape: Optional[str] = ""
+
+
+@app.post("/datasheets/gerar")
+async def datasheet_gerar(payload: DatasheetGerarIn, usuario: str = Depends(verificar_token)):
+    """Gera (ou regera) o datasheet de UM item.
+
+    Síncrono e lento de propósito — o operador pediu e está esperando, igual ao
+    /conferir. O 'gerar todos' é uma fila no FRONT, um item por vez: com um
+    worker só no Render, disparar 20 buscas em paralelo derruba o backend (foi
+    exatamente o incidente de 20/07).
+    """
+    if not _DATASHEET_OK:
+        raise HTTPException(503, f"Módulo de datasheet indisponível ({_DATASHEET_ERRO})")
+    sb = get_supabase()
+    logo = _ds_logo(sb)
+    if not logo:
+        raise HTTPException(503, "Logo da KIST não está no config_kist "
+                                 "(chave 'datasheet_logo_b64'). Rode sql/logo_kist.sql.")
+
+    item = payload.item or {}
+    anterior, ds_row = None, None
+    if payload.datasheet_id:
+        r = sb.table("datasheets").select("*").eq("id", payload.datasheet_id).limit(1).execute()
+        if r.data:
+            ds_row = r.data[0]
+            anterior = (ds_row.get("payload") or {}).get("conteudo") or None
+
+    # Foto que o operador mandou vence a busca — ele é a hierarquia superior.
+    img_op = None
+    if (payload.imagem_b64 or "").strip():
+        try:
+            img_op = _b64.b64decode(re.sub(r"^data:[^,]+,", "", payload.imagem_b64.strip()))
+        except Exception:
+            raise HTTPException(400, "Não consegui ler a imagem enviada.")
+    elif (payload.imagem_url or "").strip():
+        try:
+            img_op = _ds_baixar(payload.imagem_url.strip())
+        except Exception as e:
+            raise HTTPException(400, f"Não consegui baixar a imagem desse link ({type(e).__name__}).")
+
+    try:
+        r = _ds_mod.gerar(
+            get_claude(), item, logo,
+            baixar=_ds_baixar, buscar_pagina=_ds_pagina, buscar_json=_ds_json,
+            fonte_texto=payload.fonte_texto or "",
+            pistas=payload.pistas or "", critica=payload.critica or "",
+            anterior=anterior, imagem_operador=img_op,
+            contato_rodape=payload.contato_rodape or "",
+        )
+    except Exception as e:
+        raise HTTPException(502, f"Falhou ao gerar o datasheet: {type(e).__name__}: {e}")
+
+    # Identificação ambígua: não grava nada, devolve as perguntas.
+    if r.get("precisa_operador"):
+        return {"precisa_operador": True, "etapa": "identificacao",
+                "identificacao": r.get("identificacao") or {},
+                "avisos": r.get("avisos") or []}
+
+    conteudo = r["conteudo"]
+    ident = r["identificacao"]
+    versao = int((ds_row or {}).get("versao") or 0) + 1
+    base = f"ds/{payload.produto_id or 'novo'}/{int(time.time())}_{versao}"
+
+    pdf_path = f"{base}.pdf"
+    _ds_upload(pdf_path, r["pdf_bytes"], "application/pdf")
+    img_path = ""
+    if r.get("imagem_bytes"):
+        ext = {"image/jpeg": "jpg", "image/png": "png",
+               "image/webp": "webp", "image/gif": "gif"}.get(r["foto"].get("mime"), "png")
+        img_path = f"{base}_foto.{ext}"
+        _ds_upload(img_path, r["imagem_bytes"], r["foto"].get("mime") or "image/png")
+
+    # Histórico: a versão reprovada + a crítica ficam guardadas. É o que permite
+    # a regeração corrigir em vez de sortear de novo.
+    historico = list((ds_row or {}).get("historico") or [])
+    if ds_row:
+        historico.append({
+            "versao": ds_row.get("versao"),
+            "critica": payload.critica or "",
+            "conteudo": (ds_row.get("payload") or {}).get("conteudo") or {},
+            "pdf_path": ds_row.get("pdf_path") or "",
+        })
+        historico = historico[-10:]
+
+    linha = {
+        "produto_id": payload.produto_id,
+        "chave_link": _ds_chave_link(item.get("link_fornecedor") or ""),
+        "chave_desc": _norm_entrada(item.get("descricao_final")
+                                    or item.get("descricao_original") or ""),
+        "nome_produto": conteudo.get("nome_produto") or ident.get("nome_produto") or "Item",
+        "fabricante": ident.get("fabricante") or "",
+        "modelo": conteudo.get("modelo") or ident.get("modelo") or "",
+        "payload": {"conteudo": conteudo, "identificacao": ident,
+                    "foto": r.get("foto") or {}, "avisos": r.get("avisos") or [],
+                    "nome_arquivo": r.get("nome_arquivo") or ""},
+        "imagem_path": img_path or None,
+        "imagem_origem": (r.get("foto") or {}).get("origem") or "ausente",
+        "pdf_path": pdf_path,
+        "status": "rascunho",
+        "versao": versao,
+        "critica": payload.critica or "",
+        "historico": historico,
+        "criado_por": usuario,
+    }
+
+    if ds_row:
+        _ds_remove(ds_row.get("pdf_path") or "")
+        sb.table("datasheets").update(linha).eq("id", ds_row["id"]).execute()
+        ds_id = ds_row["id"]
+    else:
+        ins = sb.table("datasheets").insert(linha).execute()
+        ds_id = (ins.data or [{}])[0].get("id")
+
+    novo = dict(linha, id=ds_id)
+    saida = _ds_para_front(novo)
+    saida["precisa_operador"] = False
+    saida["etapa"] = "revisao"
+    saida["tem_foto"] = bool(img_path)
+    return saida
+
+
+class DatasheetAprovarIn(BaseModel):
+    item_id: Optional[int] = None
+    produto_id: Optional[int] = None
+
+
+@app.post("/datasheets/{ds_id}/aprovar")
+async def datasheet_aprovar(ds_id: int, payload: DatasheetAprovarIn,
+                            usuario: str = Depends(verificar_token)):
+    """Aprovado = o datasheet vira DADO do produto e não precisa mais revisão.
+
+    A partir daqui, a próxima proposta com o mesmo produto puxa do cache.
+    """
+    from datetime import datetime, timezone
+    sb = get_supabase()
+    r = sb.table("datasheets").select("*").eq("id", ds_id).limit(1).execute()
+    if not r.data:
+        raise HTTPException(404, "Datasheet não encontrado.")
+
+    upd = {"status": "aprovado", "aprovado_por": usuario,
+           "aprovado_em": datetime.now(timezone.utc).isoformat(),
+           "atualizado_em": datetime.now(timezone.utc).isoformat()}
+    if payload.produto_id:
+        upd["produto_id"] = payload.produto_id
+    sb.table("datasheets").update(upd).eq("id", ds_id).execute()
+
+    # Vínculo nos dois lados. Falhar aqui não derruba a aprovação — o PDF já
+    # existe e o operador já pode baixar.
+    if payload.produto_id:
+        try:
+            sb.table("produtos").update({"datasheet_id": ds_id})\
+              .eq("id", payload.produto_id).execute()
+        except Exception:
+            pass
+    if payload.item_id:
+        try:
+            sb.table("itens_proposta").update({"datasheet_id": ds_id})\
+              .eq("id", payload.item_id).execute()
+        except Exception:
+            pass
+
+    row = dict(r.data[0], **upd)
+    return _ds_para_front(row)
+
+
+@app.post("/datasheets/{ds_id}/reprovar")
+async def datasheet_reprovar(ds_id: int, payload: dict,
+                             usuario: str = Depends(verificar_token)):
+    """Marca a reprovação e guarda a crítica.
+
+    Não regera aqui: quem regera é o /datasheets/gerar com `datasheet_id` +
+    `critica`, para o modelo receber a versão anterior junto do que deu errado.
+    """
+    sb = get_supabase()
+    critica = (payload.get("critica") or "").strip()
+    if not critica:
+        raise HTTPException(400, "Escreva o que precisa ser ajustado — sem isso a "
+                                 "regeração é sorteio, não correção.")
+    r = sb.table("datasheets").select("*").eq("id", ds_id).limit(1).execute()
+    if not r.data:
+        raise HTTPException(404, "Datasheet não encontrado.")
+    sb.table("datasheets").update({"status": "reprovado", "critica": critica})\
+      .eq("id", ds_id).execute()
+    return {"ok": True, "id": ds_id, "critica": critica}
+
+
+@app.get("/datasheets/{ds_id}")
+async def datasheet_ver(ds_id: int, usuario: str = Depends(verificar_token)):
+    sb = get_supabase()
+    r = sb.table("datasheets").select("*").eq("id", ds_id).limit(1).execute()
+    if not r.data:
+        raise HTTPException(404, "Datasheet não encontrado.")
+    return _ds_para_front(r.data[0])
+
+
+@app.get("/datasheets")
+async def datasheet_buscar(produto_id: Optional[int] = None,
+                           link: Optional[str] = None,
+                           descricao: Optional[str] = None,
+                           usuario: str = Depends(verificar_token)):
+    """Cache: existe datasheet APROVADO para este produto?
+
+    Ordem das chaves: produto do banco → link normalizado → descrição
+    normalizada. É o que evita regerar (e repagar) o mesmo documento.
+    """
+    sb = get_supabase()
+    q = sb.table("datasheets").select("*").eq("status", "aprovado")
+    if produto_id:
+        r = q.eq("produto_id", produto_id).order("id", desc=True).limit(1).execute()
+        if r.data:
+            return {"achou": True, "por": "produto", "datasheet": _ds_para_front(r.data[0])}
+    if link:
+        r = sb.table("datasheets").select("*").eq("status", "aprovado")\
+            .eq("chave_link", _ds_chave_link(link)).order("id", desc=True).limit(1).execute()
+        if r.data:
+            return {"achou": True, "por": "link", "datasheet": _ds_para_front(r.data[0])}
+    if descricao:
+        r = sb.table("datasheets").select("*").eq("status", "aprovado")\
+            .eq("chave_desc", _norm_entrada(descricao)).order("id", desc=True).limit(1).execute()
+        if r.data:
+            return {"achou": True, "por": "descricao", "datasheet": _ds_para_front(r.data[0])}
+    return {"achou": False, "datasheet": None}
+
+
+@app.delete("/datasheets/{ds_id}")
+async def datasheet_excluir(ds_id: int, usuario: str = Depends(verificar_token)):
+    sb = get_supabase()
+    r = sb.table("datasheets").select("*").eq("id", ds_id).limit(1).execute()
+    if not r.data:
+        raise HTTPException(404, "Datasheet não encontrado.")
+    row = r.data[0]
+    _ds_remove(row.get("pdf_path") or "")
+    _ds_remove(row.get("imagem_path") or "")
+    for h in (row.get("historico") or []):
+        _ds_remove(h.get("pdf_path") or "")
+    sb.table("datasheets").delete().eq("id", ds_id).execute()
+    return {"ok": True}
+
+
+def _ds_marcar_itens(sb, itens):
+    """Acende o selo de datasheet nos itens que acabaram de casar com o banco.
+
+    POR QUE UMA CONSULTA EXTRA E NAO UMA COLUNA NA RPC:
+        `candidatos_trgm_lote` devolve um TABLE com tipo fixo. Adicionar coluna
+        exige DROP + CREATE da funcao que e' o coracao do matching. Uma consulta
+        indexada nos poucos ids que casaram custa quase nada e nao arrisca nada.
+
+    REGRA DE VINCULO (Leonardo, jul/2026):
+      • veredito "mesmo" (semanticamente identico) -> vincula sozinho;
+      • qualquer outro caso -> o datasheet fica DISPONIVEL na ficha e o front
+        pergunta se vincula, na hora do "usar esta".
+    Regua diferente da do dinheiro de proposito: custo precisa de exatidao
+    porque variante muda preco; datasheet precisa de identidade tecnica, e dois
+    textos diferentes do mesmo produto compartilham o documento legitimamente.
+    """
+    ids = []
+    for it in itens or []:
+        pid = ((it.get("banco") or {}) or {}).get("produto_id")
+        if pid and pid not in ids:
+            ids.append(pid)
+    if not ids:
+        return
+    try:
+        r = sb.table("produtos").select("id,datasheet_id").in_("id", ids).execute()
+    except Exception:
+        return                      # selo e' conforto, nao pode derrubar extracao
+    mapa = {x["id"]: x.get("datasheet_id") for x in (r.data or []) if x.get("datasheet_id")}
+    if not mapa:
+        return
+    for it in itens or []:
+        ficha = it.get("banco") or {}
+        ds_id = mapa.get(ficha.get("produto_id"))
+        if not ds_id:
+            continue
+        ficha["datasheet_id"] = ds_id
+        if (ficha.get("veredito") or "") == "mesmo":
+            it["datasheet_id"] = ds_id          # identidade tecnica confirmada
+        else:
+            it["datasheet_disponivel"] = ds_id  # existe, mas o operador decide

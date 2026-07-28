@@ -10,3 +10,5 @@ openpyxl
 xlrd
 google-auth
 requests
+reportlab
+Pillow

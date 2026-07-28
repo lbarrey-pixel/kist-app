@@ -4,6 +4,7 @@ import Propostas from "./Propostas.jsx";
 import OrdensCompra from "./OrdensCompra.jsx";
 import Analista from "./Analista.jsx";
 import ChamadosAdmin from "./ChamadosAdmin.jsx";
+import { DatasheetBotao, DatasheetLote } from "./Datasheet.jsx";
 import {
   CONF, brl, btnPrimary, btnGhost, Eyebrow, StateLabel, PageHeader,
   CertaintyStrip, Sidebar,
@@ -521,6 +522,10 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
               className={`text-[11px] hover:text-sub ${temOrigem ? "text-kist" : "text-faint"}`}>
               {mostrarOrigem ? "− origem do preço" : temOrigem ? "✓ origem do preço" : "+ origem do preço"}
             </button>
+            {/* Datasheet: mesma natureza da origem — é DADO do produto, viaja com
+                ele para o banco quando aprovado, e o selo acende vindo de lá. */}
+            <DatasheetBotao item={item} index={index} onChange={onChange}
+              token={token} apiUrl={apiUrl} fonteTexto={fonteTexto} />
             {onRemove && (
               <button
                 onClick={() => { if (window.confirm(`Excluir "${(item.descricao_final || "este item").slice(0, 50)}" da proposta?`)) onRemove(index); }}
@@ -1996,6 +2001,8 @@ export default function App() {
                       title="Salvar como rascunho para continuar depois">
                       Salvar rascunho
                     </button>
+                    <DatasheetLote itens={prop.itens || []} token={token} apiUrl={API}
+                      fonteTexto={prop.fonte_texto} onChange={atualizarItem} />
                     <button onClick={() => baixarCSV(propostaIdx)} disabled={loading || salvandoBanco || jaBaixado} className={btnPrimary}>
                       {salvandoBanco
                         ? <><span className="inline-block animate-spin"><IconBolt size={15} /></span> Salvando…</>
