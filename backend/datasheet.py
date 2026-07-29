@@ -470,6 +470,41 @@ _RX_META_INV = re.compile(
     r'(?:property|name)\s*=\s*["\'](?:og:image(?::secure_url)?|twitter:image)["\']', re.I)
 _RX_LDJSON = re.compile(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
                         re.I | re.S)
+_RX_IMG = re.compile(r'<img\b([^>]*)>', re.I)
+_RX_ATRIB = re.compile(
+    r'(?:^|\s)(src|data-src|data-original|data-lazy|data-zoom-image|data-large_image|srcset)'
+    r'\s*=\s*["\']([^"\']+)["\']', re.I)
+_RX_LINK_IMG = re.compile(
+    r'<link[^>]+rel=["\']image_src["\'][^>]*href=["\']([^"\']+)["\']', re.I)
+
+# Nao e' foto de produto. Filtro DETERMINISTICO, antes de gastar chamada de visao.
+# Nasceu de um caso real: a pagina do fabricante ADATA devolvia
+# `adata_logo_1200_630.png` como og:image; a visao recusou certo, mas era a unica
+# candidata e o item ficou sem foto.
+_LIXO_IMAGEM = re.compile(
+    r'logo|logotipo|brand|marca[-_]|icon|sprite|placeholder|banner|bandeira|'
+    r'avatar|selo|pixel|spacer|blank|loading|spinner|whatsapp|facebook|instagram|'
+    r'youtube|twitter|linkedin|pagamento|payment|boleto|pix[-_]|cartao|visa|master|'
+    r'carrinho|cart[-_]|favicon|thumb[-_]?nail[-_]?default|sem[-_]imagem|no[-_]image',
+    re.I)
+# Ao contrario, isto CHEIRA a foto de produto.
+_BOM_IMAGEM = re.compile(r'produto|product|media|imagens?|images?|photo|foto|upload|catalog',
+                         re.I)
+
+
+def _pontua_imagem(url: str) -> int:
+    """Ordena candidatas. Quanto maior, mais cedo entra na fila."""
+    p = 0
+    if _BOM_IMAGEM.search(url):
+        p += 3
+    if re.search(r'\.(jpe?g|png|webp)(\?|$)', url, re.I):
+        p += 2
+    m = re.search(r'(\d{3,4})\s*[xX]\s*(\d{3,4})', url)
+    if m and min(int(m.group(1)), int(m.group(2))) >= 400:
+        p += 2
+    if re.search(r'(^|[^0-9])(\d{1,2})x\2($|[^0-9])', url):
+        p -= 1
+    return p
 
 
 def _absoluta(url: str, base: str) -> str:
@@ -489,14 +524,27 @@ def urls_de_imagem(html: str, base_url: str = "") -> List[str]:
     """Candidatas a foto do produto numa página de loja/fabricante.
 
     Regex em vez de BeautifulSoup de propósito: evita mais uma dependência de
-    produção para ganhar pouco. og:image é convenção estável — quem publica
-    produto quer que o link fique bonito no WhatsApp, então preenche.
+    produção para ganhar pouco.
+
+    TRES CAMADAS, nesta ordem de confianca:
+      1. og:image / twitter:image — convencao estavel, quem publica produto quer
+         que o link fique bonito no WhatsApp;
+      2. JSON-LD (schema.org/Product) — dado estruturado;
+      3. as tags <img> da pagina — a rede de baixo.
+
+    A camada 3 nasceu de um caso real: a memoria ADATA da mazer.com.br nao tem
+    og:image nem JSON-LD; a foto do produto e' um <img> comum, e o item saiu sem
+    imagem nos dois modos. Sem esta camada, toda loja que nao preenche meta tag
+    fica de fora — e sao muitas.
     """
     achadas: List[str] = []
     for rx in (_RX_META, _RX_META_INV):
         for m in rx.finditer(html or ""):
             u = _absoluta(_norm(m.group(1)), base_url)
-            if u and u not in achadas:
+            # og:image de site de FABRICANTE costuma ser o logo institucional.
+            # Recusar aqui poupa uma chamada de visao e, mais importante, nao
+            # deixa a unica vaga da fila ser gasta com um logotipo.
+            if u and u not in achadas and not _LIXO_IMAGEM.search(u):
                 achadas.append(u)
     for m in _RX_LDJSON.finditer(html or ""):
         try:
@@ -521,6 +569,37 @@ def urls_de_imagem(html: str, base_url: str = "") -> List[str]:
                 pilha.extend(v for v in no.values() if isinstance(v, (dict, list)))
             elif isinstance(no, list):
                 pilha.extend(no)
+
+    # ── Camada 3: <img> da pagina ──────────────────────────────────────────
+    for m in _RX_LINK_IMG.finditer(html or ""):
+        u = _absoluta(_norm(m.group(1)), base_url)
+        if u and u not in achadas:
+            achadas.append(u)
+
+    brutas: List[str] = []
+    for m in _RX_IMG.finditer(html or ""):
+        atrs = m.group(1)
+        for _a, valor in _RX_ATRIB.findall(atrs):
+            # data-uri e' imagem embutida (placeholder de lazy-load). Testar ANTES
+            # de partir por virgula: "data:image/gif;base64,R0lGOD" TEM virgula, e
+            # o split fazia a metade final virar URL candidata.
+            if _norm(valor).lower().startswith("data:"):
+                continue
+            # srcset traz "url 1x, url 2x": fica com a ultima (maior)
+            for pedaco in reversed(valor.split(",")):
+                cru = _norm(pedaco.split()[0]) if pedaco.strip() else ""
+                if not cru or cru.startswith("data:"):
+                    continue
+                u = _absoluta(cru, base_url)
+                if u and u not in brutas and u not in achadas:
+                    brutas.append(u)
+                break
+
+    # Descarta o obvio (logo, icone, selo de pagamento) SEM gastar visao, e
+    # ordena o resto pelo que cheira a foto de produto.
+    limpas = [u for u in brutas if not _LIXO_IMAGEM.search(u)]
+    limpas.sort(key=_pontua_imagem, reverse=True)
+    achadas.extend(limpas[:12])
     return achadas
 
 
@@ -652,7 +731,8 @@ def achar_foto(claude, ident: Dict[str, Any], link: str,
                buscar_pagina: Callable[[str], str],
                buscar_json: Callable[[str], Any],
                paginas_oficiais: Optional[List[str]] = None,
-               tentativas: int = 5) -> Dict[str, Any]:
+               html_origem: str = "",
+               tentativas: int = 8) -> Dict[str, Any]:
     """Procura a foto real, na ordem de confiança, e CONFIRMA antes de aceitar.
 
     ORDEM DAS FONTES — depende de conhecermos o fabricante:
@@ -676,10 +756,14 @@ def achar_foto(claude, ident: Dict[str, Any], link: str,
         for u in urls_imagem_mercadolivre(link, buscar_json):
             saida.append((u, "anuncio"))
         if link and not saida:
-            try:
-                html = buscar_pagina(link)
-            except Exception:
-                html = ""
+            # `gerar()` ja' leu esta pagina. Reusar evita a segunda requisicao e
+            # garante que a extracao veja exatamente o mesmo HTML.
+            html = html_origem
+            if not html:
+                try:
+                    html = buscar_pagina(link)
+                except Exception:
+                    html = ""
             for u in urls_de_imagem(html or "", link):
                 saida.append((u, "anuncio"))
         return saida
@@ -695,10 +779,18 @@ def achar_foto(claude, ident: Dict[str, Any], link: str,
                 saida.append((u, "fabricante"))
         return saida
 
-    if _norm(ident.get("fabricante")):
-        candidatas = _do_fabricante() + _do_anuncio()
-    else:
-        candidatas = _do_anuncio() + _do_fabricante()
+    # ORDEM — o ANUNCIO DO PROPRIO ITEM vem primeiro, sempre.
+    #
+    # Eu tinha colocado o fabricante na frente quando a marca era conhecida,
+    # argumentando que a foto dele e' mais limpa. O caso da memoria ADATA
+    # mostrou o contrario: o site do fabricante devolveu o logotipo
+    # institucional como og:image, a visao recusou (certo), e o item ficou sem
+    # foto mesmo tendo foto boa na pagina de origem.
+    #
+    # A pagina de origem e' a do ITEM EXATO que estamos ofertando. O site do
+    # fabricante e' da linha de produtos. Origem primeiro, fabricante como
+    # reforco.
+    candidatas = _do_anuncio() + _do_fabricante()
 
     vistas, fila = set(), []
     for u, de_onde in candidatas:
@@ -799,7 +891,8 @@ def gerar(claude, item: Dict[str, Any], logo_bytes: bytes,
                  "recusadas": [f"arquivo do operador: {nota}"], "nota": nota})
     else:
         foto = achar_foto(claude, ident, link, baixar, buscar_pagina, buscar_json,
-                          paginas_oficiais=conteudo.get("paginas_oficiais") or [])
+                          paginas_oficiais=conteudo.get("paginas_oficiais") or [],
+                          html_origem=pagina)
 
     # ── Regra 6: varredura determinística antes de desenhar ────────────────
     problemas = validar_dados(conteudo)
