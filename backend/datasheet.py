@@ -284,7 +284,8 @@ FERRAMENTA_CONTEUDO = {
 
 def montar_conteudo(claude, ident: Dict[str, Any], contexto: str,
                     critica: str = "", anterior: Optional[Dict[str, Any]] = None,
-                    max_buscas: int = 5) -> Dict[str, Any]:
+                    max_buscas: int = 5, modo: str = "tecnico",
+                    system_comercial: str = "") -> Dict[str, Any]:
     """Levanta specs e monta o conteúdo.
 
     `critica` + `anterior` são o loop de reprovação: sem a versão anterior em
@@ -313,14 +314,26 @@ def montar_conteudo(claude, ident: Dict[str, Any], contexto: str,
         partes.append("\n### ORIENTAÇÃO DO OPERADOR")
         partes.append(critica)
 
-    resp = claude.messages.create(
-        model=MODELO_TEXTO, max_tokens=4000, system=SYSTEM_CONTEUDO,
-        messages=[{"role": "user", "content": "\n".join(partes)}],
-        tools=[{"type": "web_search_20250305", "name": "web_search",
-                "max_uses": max_buscas},
-               FERRAMENTA_CONTEUDO],
-        temperature=0, timeout=TIMEOUT,
-    )
+    # MODO COMERCIAL: sem busca web. `tool_choice` força a ferramenta, porque
+    # sem web_search o modelo tende a responder em prosa.
+    if modo == "comercial":
+        resp = claude.messages.create(
+            model=MODELO_TEXTO, max_tokens=4000,
+            system=system_comercial or SYSTEM_CONTEUDO,
+            messages=[{"role": "user", "content": "\n".join(partes)}],
+            tools=[FERRAMENTA_CONTEUDO],
+            tool_choice={"type": "tool", "name": "montar_datasheet"},
+            temperature=0, timeout=TIMEOUT,
+        )
+    else:
+        resp = claude.messages.create(
+            model=MODELO_TEXTO, max_tokens=4000, system=SYSTEM_CONTEUDO,
+            messages=[{"role": "user", "content": "\n".join(partes)}],
+            tools=[{"type": "web_search_20250305", "name": "web_search",
+                    "max_uses": max_buscas},
+                   FERRAMENTA_CONTEUDO],
+            temperature=0, timeout=TIMEOUT,
+        )
     dados = _bloco_ferramenta(resp, "montar_datasheet") or {}
 
     destaques = [{"rotulo": _norm(d.get("rotulo")), "valor": _norm(d.get("valor"))}
@@ -347,6 +360,103 @@ def montar_conteudo(claude, ident: Dict[str, Any], contexto: str,
     }
     return conteudo
 
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# MODO COMERCIAL — o prompt do Fábio, cru
+#
+# O modo "tecnico" (acima) identifica, busca na web e valida. O modo
+# "comercial" NÃO busca: entrega o prompt que o Fábio já usava no ChatGPT e
+# deixa o modelo montar a apresentação a partir do que o item diz.
+#
+# É mais rápido e não depende de rede. Em troca, as especificações saem da
+# memória do modelo, não de fonte verificada — por isso a revisão do operador
+# deixa de ser conferência e passa a ser a ÚNICA validação. Está dito na tela.
+#
+# Vive em config_kist['datasheet_prompt_comercial'] quando existir, para o
+# Fábio afinar o próprio prompt sem redeploy. O texto abaixo é o padrão.
+# ══════════════════════════════════════════════════════════════════════════
+PROMPT_COMERCIAL_PADRAO = """Você vai criar datasheets profissionais em PDF para a KIST Soluções.
+
+OBJETIVO
+Os datasheets serão enviados a clientes finais para revenda de equipamentos. Portanto, o documento deve parecer um material técnico/comercial próprio da KIST, contendo somente:
+1. identidade visual da KIST;
+2. nome e imagem real do produto;
+3. descrição objetiva;
+4. especificações técnicas relevantes.
+
+REGRAS OBRIGATÓRIAS
+
+2. IDENTIDADE VISUAL
+- Estrutura visual padrão:
+  a) cabeçalho com logotipo e "DATASHEET TÉCNICO";
+  b) nome do produto e modelo;
+  c) subtítulo técnico curto;
+  d) introdução objetiva;
+  e) imagem real do produto à esquerda;
+  f) quatro boxes com os principais destaques à direita;
+  g) tabela completa de especificações;
+  h) rodapé mínimo com linha e número da página.
+
+5. ESPECIFICAÇÕES TÉCNICAS
+- Use as informações da PÁGINA DE ORIGEM do item e da descrição enviada. Não consulte nem cite nenhuma outra fonte.
+- Se a página de origem não trouxer uma característica, deixe-a de fora. Ficha curta e correta é melhor que ficha cheia e suposta.
+- Para produtos genéricos, inclua apenas características altamente prováveis e praticamente universais para aquele tipo de item.
+- Não invente part number, marca, certificação, dimensão, desempenho ou compatibilidade.
+- Quando uma característica variar por versão e não estiver confirmada, não inclua ou use redação tecnicamente segura.
+- Mantenha unidades padronizadas e claras.
+- Destaque nos quatro boxes as informações mais úteis, como capacidade, velocidade, interface, alcance, resolução, tamanho ou potência.
+- A tabela deve conter somente informações relevantes ao cliente final.
+
+6. INFORMAÇÕES PROIBIDAS
+Nunca inclua no datasheet:
+- preço, valor, desconto, economia, frete ou impostos;
+- condições de pagamento;
+- nome do fornecedor, distribuidor, marketplace ou vendedor;
+- onde a KIST está comprando o item;
+- links de compra;
+- referência a carrinho, proposta, cotação, anúncio ou página consultada;
+- frase dizendo de onde os dados foram extraídos;
+- observações internas de compra ou revenda;
+- comentários como "imagem obtida do anúncio";
+- justificativas sobre omissão de preço;
+- referências a fontes, pesquisas ou processo de criação;
+- informações que não interessam ao cliente final;
+- quadro "Observações" com informações internas ou comerciais.
+
+O documento deve conter apenas a identidade da KIST e as especificações do item.
+
+7. LAYOUT E REVISÃO VISUAL
+- Evite que uma palavra fique quebrada de forma feia.
+- Revise acentos, unidades, nomenclaturas e coerência técnica.
+
+Português do Brasil."""
+
+# O contrato de saída. O prompt do Fábio foi escrito para um assistente que
+# DESENHA o PDF; aqui quem desenha é o template, então o modelo precisa saber
+# em que campos devolver. É o único acréscimo — e fica separado, para o texto
+# dele continuar sendo o dele.
+_CONTRATO_COMERCIAL = """
+
+---
+FORMATO DA RESPOSTA
+O layout, o logotipo, as cores, as margens e o controle de sobreposição já são
+garantidos pelo template — você não desenha nada. Devolva apenas o CONTEÚDO
+pela ferramenta `montar_datasheet`: nome, modelo, subtítulo, introdução,
+exatamente 4 destaques e a tabela de especificações."""
+
+
+def prompt_comercial(sb=None) -> str:
+    """Prompt do modo comercial: config_kist se houver, senão o padrão."""
+    texto = ""
+    if sb is not None:
+        try:
+            r = sb.table("config_kist").select("valor")\
+                .eq("chave", "datasheet_prompt_comercial").limit(1).execute()
+            texto = ((r.data or [{}])[0].get("valor") or "").strip()
+        except Exception:
+            texto = ""
+    return (texto or PROMPT_COMERCIAL_PADRAO) + _CONTRATO_COMERCIAL
 
 # ══════════════════════════════════════════════════════════════════════════
 # 3. FOTO REAL
@@ -631,29 +741,53 @@ def gerar(claude, item: Dict[str, Any], logo_bytes: bytes,
           critica: str = "",
           anterior: Optional[Dict[str, Any]] = None,
           imagem_operador: Optional[bytes] = None,
-          contato_rodape: str = "") -> Dict[str, Any]:
+          contato_rodape: str = "",
+          modo: str = "tecnico",
+          system_comercial: str = "") -> Dict[str, Any]:
     """Fluxo completo de um item.
 
     Devolve sempre um dicionário — nunca levanta por falha de conteúdo. Quando
     não dá pra seguir, volta com `precisa_operador=True` e as perguntas.
     """
+    comercial = (modo == "comercial")
+
     link = _norm(item.get("link_fornecedor"))
     pagina = ""
+    # OS DOIS MODOS leem a pagina de origem. A diferenca esta' no RESTO:
+    #   tecnico   -> pagina + busca web (fabricante, catalogos, fontes tecnicas)
+    #   comercial -> SOMENTE a pagina de origem. Nada de busca web.
+    # Ler a origem no comercial nao e' "buscar em outra fonte": e' ler o anuncio
+    # do proprio item. E' o que impede o modelo de escrever a spec de memoria.
     if link:
         try:
             pagina = (buscar_pagina(link) or "")[:20000]
         except Exception:
             pagina = ""
 
-    ident = identificar(claude, item, fonte_texto=fonte_texto,
-                        pagina=pagina, pistas=pistas)
-    if ident.get("precisa_operador"):
-        return {"etapa": "identificacao", "precisa_operador": True,
-                "identificacao": ident, "avisos": ident.get("descartado") or []}
+    if comercial:
+        # Sem etapa de identificação: o prompt do Fábio parte da descrição do
+        # item, e é isso que ele pediu — gera, aprova ou corrige. Uma chamada
+        # ao modelo em vez de duas.
+        ident = {
+            "nome_produto": _norm(item.get("descricao_final")
+                                  or item.get("descricao_original")),
+            "fabricante": "", "modelo": "", "categoria": "", "subtitulo": "",
+            "confianca": "operador", "ambiguidade": [], "perguntas": [],
+            "termos_busca": [], "descartado": [], "precisa_operador": False,
+        }
+    else:
+        ident = identificar(claude, item, fonte_texto=fonte_texto,
+                            pagina=pagina, pistas=pistas)
+        if ident.get("precisa_operador"):
+            return {"etapa": "identificacao", "precisa_operador": True,
+                    "identificacao": ident, "avisos": ident.get("descartado") or []}
 
     contexto = contexto_do_item(item, fonte_texto, pagina)
+    if comercial and _norm(pistas):
+        contexto += f"\n\n### ORIENTAÇÃO DO OPERADOR\n{pistas}"
     conteudo = montar_conteudo(claude, ident, contexto,
-                               critica=critica, anterior=anterior)
+                               critica=critica, anterior=anterior,
+                               modo=modo, system_comercial=system_comercial)
 
     # ── Foto ───────────────────────────────────────────────────────────────
     if imagem_operador:
@@ -687,8 +821,21 @@ def gerar(claude, item: Dict[str, Any], logo_bytes: bytes,
     avisos += [f"⚠ ainda proibido após limpeza: {p}" for p in problemas_restantes]
     avisos += [f"não confirmado: {i}" for i in (conteudo.get("incertezas") or [])]
 
+    if comercial:
+        if pagina:
+            avisos.append("modo apresentação comercial: montado SÓ com a página de "
+                          "origem do item, sem busca na internet")
+        elif link:
+            avisos.append("modo apresentação comercial: não consegui ler a página de "
+                          "origem — as especificações saíram do modelo, confira uma a uma")
+        else:
+            avisos.append("modo apresentação comercial: este item não tem link de "
+                          "origem, então não houve fonte nenhuma — as especificações "
+                          "saíram do modelo, confira uma a uma")
+
     return {
         "etapa": "pronto",
+        "modo": modo,
         "precisa_operador": False,
         "identificacao": ident,
         "conteudo": conteudo,

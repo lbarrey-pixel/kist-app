@@ -156,7 +156,7 @@ const MARKETPLACES = [
 ];
 
 // ── Linha de item da revisão ───────────────────────────────────────────────
-function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, cnpj }) {
+function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, cnpj, propostaId, onSalvar }) {
   // ── Alerta ────────────────────────────────────────────────────────────
   const [mostrarAlerta, setMostrarAlerta] = useState(false);
   const [alertaTexto, setAlertaTexto] = useState(() => item.alerta_produto?.texto || "");
@@ -525,7 +525,8 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
             {/* Datasheet: mesma natureza da origem — é DADO do produto, viaja com
                 ele para o banco quando aprovado, e o selo acende vindo de lá. */}
             <DatasheetBotao item={item} index={index} onChange={onChange}
-              token={token} apiUrl={apiUrl} fonteTexto={fonteTexto} />
+              token={token} apiUrl={apiUrl} fonteTexto={fonteTexto}
+              propostaId={propostaId} onSalvar={onSalvar} />
             {onRemove && (
               <button
                 onClick={() => { if (window.confirm(`Excluir "${(item.descricao_final || "este item").slice(0, 50)}" da proposta?`)) onRemove(index); }}
@@ -1668,6 +1669,10 @@ export default function App() {
         preco_custo:          Number(it.preco_custo) || 0,
         frete_vinda:          Number(it.frete_vinda) || 0,
         confianca_match:      it.confianca_match || "nenhuma",
+        // id da linha e datasheet vinculado: SAO persistidos, e sem trazer de
+        // volta o selo morre no reload e o operador regera o mesmo documento.
+        id:                   it.id || null,
+        datasheet_id:         it.datasheet_id || null,
         obs:                  it.obs_interna || "",
         fornecedor:           it.fornecedor || null,
         fornecedor_canal:     it.fornecedor_canal || "",
@@ -2002,7 +2007,8 @@ export default function App() {
                       Salvar rascunho
                     </button>
                     <DatasheetLote itens={prop.itens || []} token={token} apiUrl={API}
-                      fonteTexto={prop.fonte_texto} onChange={atualizarItem} />
+                      fonteTexto={prop.fonte_texto} onChange={atualizarItem}
+                      propostaId={propostaId} onSalvar={salvarRascunho} />
                     <button onClick={() => baixarCSV(propostaIdx)} disabled={loading || salvandoBanco || jaBaixado} className={btnPrimary}>
                       {salvandoBanco
                         ? <><span className="inline-block animate-spin"><IconBolt size={15} /></span> Salvando…</>
@@ -2302,7 +2308,7 @@ export default function App() {
                     </thead>
                     <tbody>
                       {(prop.itens || []).map((item, i) => (
-                        <ItemRow key={i} item={item} index={i} onChange={atualizarItem} onRemove={removerItem} token={token} apiUrl={API} fonteTexto={prop.fonte_texto} cnpj={prop.cnpj} />
+                        <ItemRow key={i} item={item} index={i} onChange={atualizarItem} onRemove={removerItem} token={token} apiUrl={API} fonteTexto={prop.fonte_texto} cnpj={prop.cnpj} propostaId={propostaId} onSalvar={salvarRascunho} />
                       ))}
                     </tbody>
                   </table>

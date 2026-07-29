@@ -18,7 +18,8 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { btnPrimary, btnGhost, IconX, IconCheck, IconDownload, IconBolt } from "./kist-ui.jsx";
 
 // ── Selo do item ─────────────────────────────────────────────────────────
-export function DatasheetBotao({ item, index, onChange, token, apiUrl, fonteTexto }) {
+export function DatasheetBotao({ item, index, onChange, token, apiUrl, fonteTexto,
+  propostaId, onSalvar }) {
   const [aberto, setAberto] = useState(false);
 
   // Três estados visuais, e eles vêm de campos DIFERENTES de propósito:
@@ -46,6 +47,7 @@ export function DatasheetBotao({ item, index, onChange, token, apiUrl, fonteText
       {aberto && (
         <DatasheetPainel item={item} index={index} onChange={onChange}
           token={token} apiUrl={apiUrl} fonteTexto={fonteTexto}
+          propostaId={propostaId} onSalvar={onSalvar}
           onFechar={() => setAberto(false)} />
       )}
     </>
@@ -53,7 +55,12 @@ export function DatasheetBotao({ item, index, onChange, token, apiUrl, fonteText
 }
 
 // ── Painel ───────────────────────────────────────────────────────────────
-function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto, onFechar }) {
+function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto,
+  propostaId, onSalvar, onFechar,
+  // Fila do "gerar todos": mesma tela, um item por vez.
+  //   autoGerar = modo; gera sozinho ao abrir, sem a tela de escolha
+  //   lote      = { posicao, total, onProximo, onPular }
+  autoGerar = "", lote = null }) {
   const [fase, setFase] = useState("carregando");  // carregando|gerando|identificacao|revisao|erro
   const [ds, setDs] = useState(null);
   const [ident, setIdent] = useState(null);
@@ -64,6 +71,9 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto, onF
   const [urlFoto, setUrlFoto] = useState("");
   const [erro, setErro] = useState("");
   const [cache, setCache] = useState(null);
+  // "tecnico" = identifica + busca web + valida · "comercial" = so' o prompt do
+  // Fabio, cru, sem fonte externa. A regeracao herda o modo da versao atual.
+  const [modo, setModo] = useState(autoGerar || "tecnico");
   const arquivoRef = useRef(null);
   const vivo = useRef(true);
 
@@ -83,7 +93,7 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto, onF
         method: "POST", headers: cabecalhos(),
         body: JSON.stringify({
           item, produto_id: produtoId, item_id: item.id || null,
-          fonte_texto: fonteTexto || "", pistas, ...extra,
+          fonte_texto: fonteTexto || "", pistas, modo, ...extra,
         }),
       });
       const d = await res.json().catch(() => ({}));
@@ -99,7 +109,7 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto, onF
       if (!vivo.current) return;
       setErro(String(e.message || e)); setFase("erro");
     }
-  }, [apiUrl, cabecalhos, item, produtoId, fonteTexto, pistas]);
+  }, [apiUrl, cabecalhos, item, produtoId, fonteTexto, pistas, modo]);
 
   // Abertura: vinculado → carrega; senão procura no cache antes de gastar geração.
   useEffect(() => {
@@ -112,7 +122,7 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto, onF
           if (r.ok) {
             const d = await r.json();
             if (cancelado) return;
-            setDs(d); setFase("revisao"); return;
+            setDs(d); setModo(d.modo || "tecnico"); setFase("revisao"); return;
           }
         }
         const p = new URLSearchParams();
@@ -122,10 +132,17 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto, onF
         const r2 = await fetch(`${apiUrl}/datasheets?${p.toString()}`, { headers: cabecalhos() });
         const d2 = r2.ok ? await r2.json() : { achou: false };
         if (cancelado) return;
-        if (d2.achou) { setCache(d2); setDs(d2.datasheet); setFase("revisao"); return; }
+        if (d2.achou) {
+          setCache(d2); setDs(d2.datasheet);
+          setModo(d2.datasheet?.modo || "tecnico"); setFase("revisao"); return;
+        }
+        // Na fila não perguntamos o modo item a item — ele foi escolhido no botão.
+        if (autoGerar) { gerar({ modo: autoGerar }); return; }
         setFase("vazio");
       } catch {
-        if (!cancelado) setFase("vazio");
+        if (cancelado) return;
+        if (autoGerar) { gerar({ modo: autoGerar }); return; }
+        setFase("vazio");
       }
     })();
     return () => { cancelado = true; };
@@ -136,13 +153,26 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto, onF
     try {
       const res = await fetch(`${apiUrl}/datasheets/${ds.id}/aprovar`, {
         method: "POST", headers: cabecalhos(),
-        body: JSON.stringify({ produto_id: produtoId, item_id: item.id || null }),
+        body: JSON.stringify({
+          produto_id: produtoId,
+          item_id: item.id || null,
+          // Sem item.id (item que ainda não virou linha salva), o backend acha
+          // pela posição na proposta. E a descrição deixa ele achar a linha do
+          // banco quando não houve match — é o que faz o vínculo valer para a
+          // PRÓXIMA cotação, não só para esta.
+          proposta_id: propostaId || null,
+          indice: index,
+          descricao: item.descricao_final || item.descricao_original || "",
+        }),
       });
       const d = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(d.detail || "falhou ao aprovar");
       setDs(d);
-      onChange(index, "datasheet_id", ds.id);   // persiste no item
-      onFechar();
+      onChange(index, "datasheet_id", ds.id);
+      // Grava agora, sem esperar o auto-save de 1,5s: o operador aprova e às
+      // vezes fecha a aba em seguida. Perder isto obriga a regerar.
+      if (typeof onSalvar === "function") { try { await onSalvar(true); } catch { /* nao bloqueia */ } }
+      if (lote) lote.onProximo(); else onFechar();
     } catch (e) { setErro(String(e.message || e)); }
   }
 
@@ -180,14 +210,27 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto, onF
         {/* Cabeçalho */}
         <div className="flex items-center justify-between border-b border-line px-4 py-3">
           <div className="min-w-0">
-            <div className="eyebrow text-[9px] font-semibold uppercase text-faint">Datasheet técnico</div>
+            <div className="eyebrow text-[9px] font-semibold uppercase text-faint">
+              {lote ? `Documento ${lote.posicao} de ${lote.total}` : "Datasheet técnico"}
+            </div>
             <div className="truncate text-[14px] font-semibold text-ink">
               {conteudo.nome_produto || item.descricao_final || item.descricao_original}
             </div>
           </div>
-          <button onClick={onFechar} className="rounded-md p-1 text-faint hover:bg-paper hover:text-ink">
-            <IconX size={16} />
-          </button>
+          <div className="flex items-center gap-2">
+            {lote && (
+              <button onClick={lote.onPular}
+                className="text-[11.5px] text-faint hover:text-ink"
+                title="Deixa este item sem documento e vai para o próximo">
+                pular item
+              </button>
+            )}
+            <button onClick={onFechar}
+              className="rounded-md p-1 text-faint hover:bg-paper hover:text-ink"
+              title={lote ? "Encerrar a geração em lote" : "Fechar"}>
+              <IconX size={16} />
+            </button>
+          </div>
         </div>
 
         {/* Corpo */}
@@ -205,15 +248,30 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto, onF
               <div className="flex h-full items-center justify-center text-[13px] text-faint">carregando…</div>
             )}
             {fase === "vazio" && (
-              <div className="flex h-full flex-col items-center justify-center gap-3 px-8 text-center">
-                <div className="text-[13px] text-sub">Este item ainda não tem datasheet.</div>
-                <div className="text-[11.5px] text-faint">
-                  O sistema vai identificar o produto, buscar a ficha técnica e a foto real.
-                  Nada de preço, fornecedor ou link entra no documento.
+              <div className="flex h-full flex-col items-center justify-center gap-4 px-8">
+                <div className="text-center text-[13px] text-sub">Este item ainda não tem documento.</div>
+                <div className="grid w-full max-w-xl grid-cols-2 gap-3">
+                  <button onClick={() => { setModo("tecnico"); gerar({ modo: "tecnico" }); }}
+                    className="rounded-xl border border-line2 bg-surface px-4 py-3 text-left hover:border-kist">
+                    <div className="text-[12.5px] font-semibold text-ink">Datasheet técnico</div>
+                    <div className="mt-1 text-[11px] leading-snug text-faint">
+                      Identifica o produto, busca a ficha técnica na internet e procura a
+                      foto real. Mais lento, e as specs vêm de fonte consultada.
+                    </div>
+                  </button>
+                  <button onClick={() => { setModo("comercial"); gerar({ modo: "comercial" }); }}
+                    className="rounded-xl border border-line2 bg-surface px-4 py-3 text-left hover:border-kist">
+                    <div className="text-[12.5px] font-semibold text-ink">Apresentação comercial</div>
+                    <div className="mt-1 text-[11px] leading-snug text-faint">
+                      Monta usando só a página de origem do item, sem busca na
+                      internet. Mais rápido. Item sem link de origem sai sem fonte —
+                      aí a sua revisão é a única conferência.
+                    </div>
+                  </button>
                 </div>
-                <button onClick={() => gerar()} className={btnPrimary}>
-                  <IconBolt size={15} /> Gerar datasheet
-                </button>
+                <div className="text-center text-[11px] text-faint">
+                  Nos dois, nada de preço, fornecedor, marketplace ou link entra no documento.
+                </div>
               </div>
             )}
             {fase === "identificacao" && (
@@ -269,6 +327,20 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto, onF
                 </span>
                 <span className="font-mono text-[10.5px] text-faint">v{ds.versao}</span>
               </div>
+              <div className="mt-1 text-[11.5px] text-sub">
+                {(ds.modo || "tecnico") === "comercial"
+                  ? "apresentação comercial · só a página de origem"
+                  : "datasheet técnico · com busca na internet"}
+              </div>
+              <button
+                onClick={() => {
+                  const outro = (ds.modo || "tecnico") === "comercial" ? "tecnico" : "comercial";
+                  setModo(outro); gerar({ datasheet_id: ds.id, modo: outro });
+                }}
+                className="mt-1 text-[11px] text-kist hover:opacity-80">
+                gerar como {(ds.modo || "tecnico") === "comercial"
+                  ? "datasheet técnico" : "apresentação comercial"}
+              </button>
 
               <div className="mt-3 eyebrow text-[9px] font-semibold uppercase text-faint">Foto</div>
               <div className={`mt-1 text-[12.5px] ${semFoto ? "text-amber" : "text-ink"}`}>
@@ -320,9 +392,13 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto, onF
 
               <div className="mt-5 space-y-2 border-t border-line pt-3">
                 {ds.pdf_url && (
-                  <a href={ds.pdf_url} download={ds.nome_arquivo || "datasheet.pdf"}
+                  // SEMPRE em aba nova. O `download` sozinho não funciona em URL
+                  // de outro domínio (o link assinado do Storage é), então o
+                  // navegador NAVEGAVA para o PDF na mesma aba e o operador
+                  // perdia a proposta em edição. target="_blank" resolve.
+                  <a href={ds.pdf_url} target="_blank" rel="noopener noreferrer"
                     className={`${btnGhost} w-full justify-center`}>
-                    <IconDownload size={14} /> Baixar PDF
+                    <IconDownload size={14} /> Abrir PDF em nova aba
                   </a>
                 )}
                 {ds.status !== "aprovado" && (
@@ -360,97 +436,80 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto, onF
 }
 
 // ── Lote ─────────────────────────────────────────────────────────────────
-export function DatasheetLote({ itens, token, apiUrl, fonteTexto, onChange }) {
-  const [rodando, setRodando] = useState(false);
-  const [fila, setFila] = useState([]);
-  const [aberto, setAberto] = useState(false);
-  const parar = useRef(false);
+// NÃO é um painel de progresso. É uma FILA que dirige a MESMA tela de revisão,
+// um item por vez: gera → você confere o PDF → aprova (ou corrige, ou pula) →
+// ele já abre o próximo. Um painelzinho listando "gerado / gerado / gerado"
+// não serve para nada: o operador precisa VER o documento para aprovar.
+//
+// Só entram na fila os itens que ainda não têm documento.
+export function DatasheetLote({ itens, token, apiUrl, fonteTexto, onChange,
+  propostaId, onSalvar }) {
+  const [fila, setFila] = useState(null);   // { modo, indices: [], pos, feitos, pulados }
 
   const pendentes = (itens || [])
     .map((it, i) => ({ it, i }))
     .filter(({ it }) => !it.datasheet_id &&
       ((it.descricao_final || "").trim() || (it.descricao_original || "").trim()));
 
-  async function rodar() {
-    setRodando(true); setAberto(true); parar.current = false;
-    const resultado = pendentes.map(({ it, i }) => ({
-      i, nome: it.descricao_final || it.descricao_original, estado: "na fila", ds: null,
-    }));
-    setFila([...resultado]);
-
-    // UM POR VEZ, de propósito. O Render roda com worker único: 20 gerações em
-    // paralelo (cada uma com busca web e visão) afogam o backend e travam a
-    // tela inteira — foi exatamente o incidente de 20/07.
-    for (let k = 0; k < pendentes.length; k++) {
-      if (parar.current) { resultado[k].estado = "cancelado"; setFila([...resultado]); break; }
-      const { it, i } = pendentes[k];
-      resultado[k].estado = "gerando"; setFila([...resultado]);
-      try {
-        const res = await fetch(`${apiUrl}/datasheets/gerar`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-          body: JSON.stringify({
-            item: it, produto_id: it.banco?.produto_id || null,
-            item_id: it.id || null, fonte_texto: fonteTexto || "",
-          }),
-        });
-        const d = await res.json().catch(() => ({}));
-        if (!res.ok) { resultado[k].estado = "erro"; resultado[k].nota = d.detail || "falhou"; }
-        else if (d.precisa_operador) {
-          resultado[k].estado = "precisa de você";
-          resultado[k].nota = (d.identificacao?.perguntas || [])[0] || "item ambíguo";
-        } else {
-          resultado[k].estado = "gerado"; resultado[k].ds = d;
-          if (!d.tem_foto) resultado[k].nota = "saiu sem foto";
-        }
-      } catch (e) {
-        resultado[k].estado = "erro"; resultado[k].nota = String(e.message || e);
-      }
-      setFila([...resultado]);
-    }
-    setRodando(false);
+  function iniciar(modo) {
+    if (pendentes.length === 0) return;
+    // A lista é congelada no início. Se recalculasse a cada aprovação, o item
+    // recém-aprovado sairia dela e a numeração dançaria na frente do operador.
+    setFila({ modo, indices: pendentes.map((p) => p.i), pos: 0, feitos: 0, pulados: 0 });
   }
 
-  if (pendentes.length === 0) return null;
+  function avancar(campo) {
+    setFila((f) => {
+      if (!f) return null;
+      const prox = f.pos + 1;
+      const cont = { ...f, [campo]: (f[campo] || 0) + 1 };
+      if (prox >= f.indices.length) {
+        const total = f.indices.length;
+        const feitos = cont.feitos;
+        setTimeout(() => window.alert(
+          `Fim da fila: ${feitos} de ${total} documento(s) aprovado(s).` +
+          (cont.pulados ? ` ${cont.pulados} pulado(s).` : "")
+        ), 60);
+        return null;
+      }
+      return { ...cont, pos: prox };
+    });
+  }
+
+  if (pendentes.length === 0 && !fila) return null;
+  const atual = fila ? fila.indices[fila.pos] : null;
 
   return (
     <>
-      <button onClick={rodando ? () => { parar.current = true; } : rodar}
-        className={`${btnGhost} text-[12px]`}
-        title="Gera o datasheet de cada item que ainda não tem, um por vez">
-        {rodando ? "parar geração" : `Gerar datasheets (${pendentes.length})`}
-      </button>
+      {!fila && (
+        <>
+          <button onClick={() => iniciar("tecnico")} className={`${btnGhost} text-[12px]`}
+            title="Datasheet técnico: identifica, busca a ficha na internet e a foto real. Um por vez, com sua aprovação.">
+            Gerar datasheets ({pendentes.length})
+          </button>
+          <button onClick={() => iniciar("comercial")} className={`${btnGhost} text-[12px]`}
+            title="Apresentação comercial: monta só com a página de origem do item. Um por vez, com sua aprovação.">
+            Gerar apresentações ({pendentes.length})
+          </button>
+        </>
+      )}
 
-      {aberto && fila.length > 0 && (
-        <div className="fixed bottom-4 right-4 z-40 w-[340px] rounded-xl border border-line bg-surface p-3 shadow-xl">
-          <div className="flex items-center justify-between">
-            <div className="eyebrow text-[9px] font-semibold uppercase text-faint">
-              Datasheets — {fila.filter((f) => f.estado === "gerado").length}/{fila.length}
-            </div>
-            <button onClick={() => setAberto(false)} className="text-faint hover:text-ink">
-              <IconX size={13} />
-            </button>
-          </div>
-          <div className="mt-2 max-h-64 space-y-1 overflow-y-auto">
-            {fila.map((f) => (
-              <div key={f.i} className="text-[11.5px] leading-snug">
-                <span className={
-                  f.estado === "gerado" ? "text-signal"
-                    : f.estado === "gerando" ? "text-kist"
-                    : f.estado === "erro" ? "text-rose"
-                    : f.estado === "precisa de você" ? "text-amber" : "text-faint"}>
-                  {f.estado === "gerado" ? "✓" : f.estado === "gerando" ? "…" : "·"}
-                </span>{" "}
-                <span className="text-ink">{(f.nome || "").slice(0, 38)}</span>{" "}
-                <span className="text-faint">— {f.estado}{f.nota ? `: ${f.nota}` : ""}</span>
-              </div>
-            ))}
-          </div>
-          <div className="mt-2 border-t border-line pt-2 text-[10.5px] leading-snug text-faint">
-            Todos entram como rascunho. Abra item a item pelo selo “datasheet”
-            para conferir e aprovar — nada vai pro cliente sem você olhar.
-          </div>
-        </div>
+      {fila && atual != null && itens[atual] && (
+        // key força remontagem a cada item: estado, crítica e foto do anterior
+        // não podem vazar para o próximo.
+        <DatasheetPainel
+          key={`${atual}-${fila.pos}`}
+          item={itens[atual]} index={atual}
+          onChange={onChange} token={token} apiUrl={apiUrl}
+          fonteTexto={fonteTexto} propostaId={propostaId} onSalvar={onSalvar}
+          autoGerar={fila.modo}
+          lote={{
+            posicao: fila.pos + 1,
+            total: fila.indices.length,
+            onProximo: () => avancar("feitos"),
+            onPular: () => avancar("pulados"),
+          }}
+          onFechar={() => setFila(null)} />
       )}
     </>
   );
