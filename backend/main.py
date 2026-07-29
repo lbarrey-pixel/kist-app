@@ -36,7 +36,7 @@ except Exception:
 # duas divergirem, o agente é avisado de que o conhecimento dele está atrasado.
 # Conhecimento velho não avisa que é velho — ele responde com a mesma confiança
 # e erra. Este número é a única coisa que impede isso.
-VERSAO_BACKEND = "3.21"
+VERSAO_BACKEND = "3.23"
 
 app = FastAPI(title="Kist Cotações API", version=VERSAO_BACKEND)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -2723,24 +2723,107 @@ def _digitos(s):
 def _toks(s):
     return set(re.findall(r"[a-z0-9]+", (s or "").lower()))
 
-def _item_certo(dtok, preco_po, prop_item):
-    """Só consideramos 'mesmo item' (e emprestamos dado de compra) com ALTA certeza:
-    descrição idêntica, OU preço exato + descrição bem parecida. Senão, NÃO carrega."""
-    itoks = _toks(prop_item.get("descricao_final") or prop_item.get("descricao_original"))
-    if not dtok or not itoks:
-        return False
-    inter = len(dtok & itoks); uni = len(dtok | itoks)
-    sim = (inter / uni) if uni else 0.0
-    pv = float(prop_item.get("preco_venda") or 0)
-    preco_bate = preco_po > 0 and pv > 0 and abs(pv - preco_po) < 0.01
-    return (dtok == itoks) or (preco_bate and sim >= 0.6)
+# ══════════════════════════════════════════════════════════════════════════════
+# CERTEZA DE "MESMO ITEM" — PO do cliente x proposta casada (v3.23)
+#
+# A PO não é um documento independente: é o cliente confirmando QUAIS LINHAS da
+# NOSSA proposta ele está comprando. O preço que está na PO saiu do CSV que a
+# Kist mandou pro Tiny. Logo o preço é chave compartilhada, não "bônus".
+#
+# O que quebrou na PO-0000090887 (Igreja Universal, 29/07):
+#   1. a comparação olhava só `descricao_final`. Desde o motor de internet, o
+#      "usar esta" reescreve a final com o título do anúncio — a palavra do
+#      cliente sobrevive só na `descricao_original`, e o matcher não a via.
+#      O FUNDO PREPARADOR era texto IDÊNTICO à original e foi recusado.
+#   2. exigia descrição parecida (>=0.6) mesmo com preço batendo ao centavo.
+#      O cliente emite a PO com a descrição do catálogo INTERNO dele
+#      ("MINI DISJUNTOR BIPOLAR 16A TIPO C"), que nunca vai parecer com o
+#      título do anúncio. Similaridade media: 0.18 a 0.36. Recusava tudo.
+# Resultado: 4 dos 6 itens chegaram na OC sem custo e sem fornecedor, com a
+# origem preenchida e disponível no banco. Isso é falha de regra de negócio.
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _casar_propostas(cnpjs_dig, itens_match):
-    """Casa propostas: CNPJ COMPLETO é o principal; a RAIZ (8 díg.) é filtro extra de confiança."""
+def _norm_preco(v):
+    try:
+        return round(float(v or 0), 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+def _sim_desc(dtok, prop_item):
+    """Similaridade da descrição da PO contra AS DUAS descrições da proposta.
+    Vale a melhor: a `original` é a palavra do cliente, a `final` é o texto
+    comercial. Esconder qualquer uma das duas do matcher perde herança."""
+    melhor, igual = 0.0, False
+    for campo in ("descricao_original", "descricao_final"):
+        itoks = _toks(prop_item.get(campo))
+        if not itoks or not dtok:
+            continue
+        if dtok == itoks:
+            igual = True
+        uni = len(dtok | itoks); inter = len(dtok & itoks)
+        if uni:
+            melhor = max(melhor, inter / uni)
+    return melhor, igual
+
+def _contagem_precos(itens, campo):
+    """Quantas linhas têm cada preço. Preço que aparece 1x só é chave única."""
+    c = {}
+    for it in (itens or []):
+        p = _norm_preco(it.get(campo))
+        if p > 0:
+            c[p] = c.get(p, 0) + 1
+    return c
+
+def _item_certo(dtok, preco_po, prop_item, preco_ancora=False):
+    """'Mesmo item' com ALTA certeza. Três caminhos, todos conservadores:
+       (a) descrição idêntica (contra original OU final);
+       (b) preço exato + ÂNCORA — aquele preço aparece uma única vez na PO E uma
+           única vez na proposta, ou seja o pareamento é 1-para-1 e não há em
+           quem errar. Só o chamador ancorado (a proposta casada) passa True;
+       (c) preço exato + descrição bem parecida (regra histórica, >=0.6).
+    Fora disso NÃO carrega — na dúvida, em branco continua melhor que dado do
+    item errado."""
+    if not dtok:
+        return False
+    sim, igual = _sim_desc(dtok, prop_item)
+    if igual:
+        return True
+    pv = _norm_preco(prop_item.get("preco_venda"))
+    preco_bate = preco_po > 0 and pv > 0 and abs(pv - preco_po) < 0.01
+    if not preco_bate:
+        return False
+    return bool(preco_ancora) or sim >= 0.6
+
+# campos de compra que a proposta empresta pra OC. `fornecedor_canal` e
+# `fornecedor_contato` (v3.20) FALTAVAM aqui — a OC nascia sem o WhatsApp/e-mail
+# do fornecedor, e item cuja origem é contato (sem link) chegava na OC sem lastro
+# e nunca alimentava o banco de preços.
+_CAMPOS_ORIGEM = ("fornecedor", "fornecedor_canal", "fornecedor_contato",
+                  "link_fornecedor", "sku_fornecedor")
+
+def _copiar_origem(destino, prop_item):
+    destino.update({
+        "preco_custo": float(prop_item.get("preco_custo") or 0),
+        "frete_vinda": float(prop_item.get("frete_vinda") or 0),
+    })
+    for c in _CAMPOS_ORIGEM:
+        destino[c] = prop_item.get(c) or ""
+    return destino
+
+def _casar_propostas(cnpjs_dig, itens_match, numeros_prop=None):
+    """Casa propostas: CNPJ COMPLETO é o principal; a RAIZ (8 díg.) é filtro extra
+    de confiança.
+
+    `numeros_prop`: números de proposta lidos do arquivo da PROPOSTA COMERCIAL que
+    o operador anexou junto com a PO. Quando ele anexa a proposta, não há o que
+    adivinhar — aquela é A proposta. Ela entra ANCORADA, no topo, mesmo que o
+    CNPJ da PO venha de filial diferente ou o texto da PO não pareça com nada."""
     sb = get_supabase()
     full = {c for c in cnpjs_dig if len(c) == 14}
     roots = {c[:8] for c in full}
-    if not roots:
+    ancoras = {re.sub(r"\D", "", str(n or "")) for n in (numeros_prop or [])}
+    ancoras = {a for a in ancoras if len(a) >= 4}
+    if not roots and not ancoras:
         return []
     try:
         props = (sb.table("propostas")
@@ -2748,7 +2831,11 @@ def _casar_propostas(cnpjs_dig, itens_match):
                    .order("data_geracao", desc=True).limit(3000).execute().data) or []
     except Exception:
         props = []
-    casadas = [p for p in props if _digitos(p.get("cnpj"))[:8] in roots]
+    def _e_ancora(p):
+        return bool(ancoras) and re.sub(r"\D", "", str(p.get("numero_proposta") or "")) in ancoras
+
+    casadas = [p for p in props
+               if _digitos(p.get("cnpj"))[:8] in roots or _e_ancora(p)]
     if not casadas:
         return []
     ids = [p["id"] for p in casadas]
@@ -2782,7 +2869,12 @@ def _casar_propostas(cnpjs_dig, itens_match):
         cnpj_exato = _digitos(p.get("cnpj")) in full
         if cnpj_exato:
             score += 5.0
-        cands.append({"proposta": p, "score": round(score, 2), "cnpj_exato": cnpj_exato, "itens": lista})
+        # o operador anexou ESTA proposta: não há o que pontuar, ela é a certa
+        ancorada = _e_ancora(p)
+        if ancorada:
+            score += 1000.0
+        cands.append({"proposta": p, "score": round(score, 2), "cnpj_exato": cnpj_exato,
+                      "ancorada": ancorada, "itens": lista})
     cands.sort(key=lambda c: (c["score"], c["proposta"].get("data_geracao") or ""), reverse=True)
     return cands[:8]
 
@@ -2795,70 +2887,117 @@ def _enriquecer_itens_po(itens_po):
         preco_po = float(i.get("preco_unitario") or 0)
         enr = {"descricao": desc, "quantidade": i.get("quantidade") or 1, "preco_unitario": preco_po,
                "preco_venda": preco_po, "preco_custo": 0.0, "frete_vinda": 0.0,
-               "fornecedor": "", "link_fornecedor": "", "sku_fornecedor": "", "match_banco": False}
+               "fornecedor": "", "fornecedor_canal": "", "fornecedor_contato": "",
+               "link_fornecedor": "", "sku_fornecedor": "", "match_banco": False}
         dtok = _toks(desc)
         chave = max(dtok, key=len, default="")
         chave = re.sub(r"[,()*]", "", chave)
         if len(chave) >= 3:
             try:
                 r = (sb.table("itens_proposta")
-                       .select("descricao_final,descricao_original,preco_venda,preco_custo,frete_vinda,fornecedor,link_fornecedor,sku_fornecedor")
+                       .select("id,descricao_final,descricao_original,preco_venda,preco_custo,frete_vinda,"
+                               "fornecedor,fornecedor_canal,fornecedor_contato,link_fornecedor,sku_fornecedor")
                        .or_(f"descricao_final.ilike.*{chave}*,descricao_original.ilike.*{chave}*")
                        .limit(25).execute().data) or []
             except Exception:
                 r = []
-            best, bsim = None, -1.0
+            # sem proposta casada não há âncora de preço: aqui a busca é no
+            # histórico inteiro, então segue a regra conservadora (idêntica ou
+            # preço + descrição parecida).
+            best, bsim, bigual = None, -1.0, False
             for it in r:
-                if _item_certo(dtok, preco_po, it):
-                    itoks = _toks(it.get("descricao_final") or it.get("descricao_original"))
-                    uni = len(dtok | itoks); inter = len(dtok & itoks)
-                    sim = (inter / uni) if uni else 0.0
-                    if sim > bsim:
-                        bsim, best = sim, it
+                if not _item_certo(dtok, preco_po, it):
+                    continue
+                sim, igual = _sim_desc(dtok, it)
+                if (igual, sim) > (bigual, bsim):
+                    bsim, bigual, best = sim, igual, it
             if best:
-                enr.update({
-                    "preco_custo": float(best.get("preco_custo") or 0),
-                    "frete_vinda": float(best.get("frete_vinda") or 0),
-                    "fornecedor": best.get("fornecedor") or "",
-                    "link_fornecedor": best.get("link_fornecedor") or "",
-                    "sku_fornecedor": best.get("sku_fornecedor") or "",
-                    "match_banco": True,
-                })  # preco_venda fica o da PO (preservado)
+                _copiar_origem(enr, best)   # preco_venda fica o da PO (preservado)
+                enr["match_banco"] = True
         out.append(enr)
     return out
 
 def _montar_itens_oc(itens_po, prop_itens):
-    """OC = itens da PO (descrição/qtd/preço PRESERVADOS). A proposta só empresta o dado de compra."""
-    out = []
-    for i in (itens_po or []):
+    """OC = itens da PO (descrição/qtd/preço PRESERVADOS 100%). A proposta só
+    empresta o dado de COMPRA: custo, frete de vinda, fornecedor, canal, contato,
+    link e SKU.
+
+    Pareamento é GLOBAL e 1-para-1, não linha a linha na ordem em que vieram:
+    monta todos os pares possíveis, ordena por força da evidência e casa os mais
+    fortes primeiro. Assim uma linha fraca não rouba o item de uma linha forte só
+    porque apareceu antes na PO — e nenhum item da proposta é herdado duas vezes.
+
+    Quantidade NÃO entra na regra: compra parcial (vendi 10, ele comprou 5) é
+    normal e não pode quebrar a herança."""
+    itens_po = list(itens_po or [])
+    prop_itens = list(prop_itens or [])
+    cont_po = _contagem_precos(itens_po, "preco_unitario")
+    cont_prop = _contagem_precos(prop_itens, "preco_venda")
+
+    base = []
+    for i in itens_po:
         desc = i.get("descricao") or ""
-        dtok = _toks(desc)
-        preco_po = float(i.get("preco_unitario") or 0)
-        oc = {"descricao": desc, "quantidade": i.get("quantidade") or 1,
-              "preco_venda": preco_po,   # PREÇO DA PO
-              "preco_custo": 0.0, "frete_vinda": 0.0,
-              "fornecedor": "", "link_fornecedor": "", "sku_fornecedor": "",
-              "item_proposta_id": None, "match_proposta": False}
-        best, bsim = None, -1.0
-        for it in (prop_itens or []):
-            if _item_certo(dtok, preco_po, it):
-                itoks = _toks(it.get("descricao_final") or it.get("descricao_original"))
-                uni = len(dtok | itoks); inter = len(dtok & itoks)
-                sim = (inter / uni) if uni else 0.0
-                if sim > bsim:
-                    bsim, best = sim, it
-        if best:
-            oc.update({
-                "preco_custo": float(best.get("preco_custo") or 0),
-                "frete_vinda": float(best.get("frete_vinda") or 0),
-                "fornecedor": best.get("fornecedor") or "",
-                "link_fornecedor": best.get("link_fornecedor") or "",
-                "sku_fornecedor": best.get("sku_fornecedor") or "",
-                "item_proposta_id": best.get("id"),
-                "match_proposta": True,
-            })
-        out.append(oc)
-    return out
+        preco_po = _norm_preco(i.get("preco_unitario"))
+        base.append({
+            "descricao": desc, "quantidade": i.get("quantidade") or 1,
+            "preco_venda": float(i.get("preco_unitario") or 0),   # PREÇO DA PO
+            "preco_custo": 0.0, "frete_vinda": 0.0,
+            "fornecedor": "", "fornecedor_canal": "", "fornecedor_contato": "",
+            "link_fornecedor": "", "sku_fornecedor": "",
+            "item_proposta_id": None, "match_proposta": False,
+            "certeza": "", "aviso": "",
+            "_dtok": _toks(desc), "_preco": preco_po,
+        })
+
+    # 1) todos os pares plausíveis, com o peso da evidência
+    pares = []
+    for pi, oc in enumerate(base):
+        preco_po = oc["_preco"]
+        # âncora: esse preço identifica UMA linha da PO e UMA linha da proposta
+        ancora = (preco_po > 0
+                  and cont_po.get(preco_po, 0) == 1
+                  and cont_prop.get(preco_po, 0) == 1)
+        for ii, it in enumerate(prop_itens):
+            if not _item_certo(oc["_dtok"], preco_po, it, preco_ancora=ancora):
+                continue
+            sim, igual = _sim_desc(oc["_dtok"], it)
+            if igual:
+                peso, certeza = 3.0, "descricao_identica"
+            elif ancora:
+                peso, certeza = 2.0, "preco_ancora"
+            else:
+                peso, certeza = 1.0, "preco_e_descricao"
+            pares.append((peso + sim, peso, sim, pi, ii, certeza))
+
+    pares.sort(key=lambda p: (p[0], -p[3], -p[4]), reverse=True)
+
+    # 2) casamento guloso 1-para-1
+    po_usada, prop_usado = set(), set()
+    for _forca, _peso, _sim, pi, ii, certeza in pares:
+        if pi in po_usada or ii in prop_usado:
+            continue
+        it = prop_itens[ii]
+        oc = base[pi]
+        _copiar_origem(oc, it)
+        oc["item_proposta_id"] = it.get("id")
+        oc["match_proposta"] = True
+        oc["certeza"] = certeza
+        po_usada.add(pi); prop_usado.add(ii)
+
+    # 3) quem não casou: se o preço bate mas é ambíguo, avisa em vez de chutar
+    for pi, oc in enumerate(base):
+        if pi in po_usada:
+            continue
+        p = oc["_preco"]
+        if p > 0 and cont_prop.get(p, 0) > 1:
+            oc["aviso"] = ("preço bate com mais de um item da proposta — "
+                           "confirme a origem na mão")
+        elif p > 0 and cont_prop.get(p, 0) == 0 and prop_itens:
+            oc["aviso"] = "esse preço não existe na proposta casada"
+
+    for oc in base:
+        oc.pop("_dtok", None); oc.pop("_preco", None)
+    return base
 
 @app.post("/casar-po")
 async def casar_po(
@@ -2956,6 +3095,7 @@ async def casar_po(
 
     # Propostas do Tiny (opcional, múltiplas) — reforço da busca
     itens_match = list(itens_po)
+    numeros_prop: list[str] = []
     for pt_file in (proposta_tiny or []):
         if not (pt_file and pt_file.filename):
             continue
@@ -2979,10 +3119,15 @@ async def casar_po(
             cnpj_prop = _digitos(prop_tiny.get("cnpj") or "")
             if len(cnpj_prop) == 14 and cnpj_prop not in cnpjs_dig:
                 cnpjs_dig.append(cnpj_prop)
+            # o número da proposta anexada é a âncora mais forte que existe:
+            # o operador está dizendo QUAL proposta essa PO confirma.
+            n_prop = re.sub(r"\D", "", str(prop_tiny.get("numero_proposta") or ""))
+            if len(n_prop) >= 4 and n_prop not in numeros_prop:
+                numeros_prop.append(n_prop)
         except Exception:
             continue
 
-    candidatas = _casar_propostas(cnpjs_dig, itens_match)
+    candidatas = _casar_propostas(cnpjs_dig, itens_match, numeros_prop)
     for c in candidatas:
         c["itens_oc"] = _montar_itens_oc(itens_po, c.get("itens"))
 
@@ -3044,8 +3189,38 @@ async def criar_oc(payload: dict, usuario: str = Depends(verificar_token)):
     # Adicionar itens se fornecidos
     itens = payload.get("itens", [])
     if itens:
+        # ── REDE DE SEGURANÇA DA ORIGEM (v3.23) ───────────────────────────────
+        # Quando o item veio de uma proposta casada (`item_proposta_id`), a origem
+        # é lida AQUI, do banco, e não depende do frontend ter transportado os
+        # campos no payload. Fonte única da verdade: se o dado existe na proposta,
+        # ele chega na OC. O que o operador mandou preenchido sempre vence — ele
+        # é a hierarquia superior, inclusive contra esta rede.
+        origem_por_item = {}
+        ids_prop = [i.get("item_proposta_id") for i in itens if i.get("item_proposta_id")]
+        if ids_prop:
+            try:
+                res_ip = (sb.table("itens_proposta")
+                            .select("id,preco_custo,frete_vinda,fornecedor,fornecedor_canal,"
+                                    "fornecedor_contato,link_fornecedor,sku_fornecedor")
+                            .in_("id", ids_prop).execute().data) or []
+                origem_por_item = {r["id"]: r for r in res_ip}
+            except Exception:
+                origem_por_item = {}
+
         rows = []
         for i in itens:
+            base = dict(origem_por_item.get(i.get("item_proposta_id")) or {})
+
+            def _campo(nome, *alternativos):
+                """payload primeiro (operador manda), banco como rede."""
+                for k in (nome,) + alternativos:
+                    v = i.get(k)
+                    if v not in (None, "", 0, 0.0):
+                        return v
+                return base.get(nome) or ""
+
+            custo = float(i.get("preco_custo") or 0) or float(base.get("preco_custo") or 0)
+            frete = float(i.get("frete_vinda") or 0) or float(base.get("frete_vinda") or 0)
             rows.append({
                 "oc_id":               oc_id,
                 "item_proposta_id":    i.get("item_proposta_id"),
@@ -3054,12 +3229,14 @@ async def criar_oc(payload: dict, usuario: str = Depends(verificar_token)):
                 "quantidade_comprar":  float(i.get("quantidade_comprar") or i.get("quantidade_proposta") or 1),
                 "unidade":             i.get("unidade", "UN"),
                 "preco_venda":         float(i.get("preco_venda") or 0),
-                "preco_custo":         float(i.get("preco_custo") or 0),
-                "frete_vinda":         float(i.get("frete_vinda") or 0),
+                "preco_custo":         custo,
+                "frete_vinda":         frete,
                 # origem do preço herdada da proposta (aceita as duas nomenclaturas):
-                "nome_fornecedor":     i.get("nome_fornecedor") or i.get("fornecedor", ""),
-                "link_fornecedor":     i.get("link_fornecedor", ""),
-                "sku_fornecedor":      i.get("sku_fornecedor", ""),
+                "nome_fornecedor":     _campo("fornecedor", "nome_fornecedor"),
+                "fornecedor_canal":    _campo("fornecedor_canal"),
+                "fornecedor_contato":  _campo("fornecedor_contato"),
+                "link_fornecedor":     _campo("link_fornecedor"),
+                "sku_fornecedor":      _campo("sku_fornecedor"),
             })
         sb.table("oc_itens").insert(rows).execute()
 
