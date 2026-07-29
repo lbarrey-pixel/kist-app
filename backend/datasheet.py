@@ -541,6 +541,25 @@ _BOM_IMAGEM = re.compile(r'produto|product|media|imagens?|images?|photo|foto|upl
                          re.I)
 _RX_TAG = re.compile(r"<(script|style|noscript)[^>]*>.*?</\1>", re.I | re.S)
 
+# PAGINA DE BLOQUEIO — o site respondeu 200, mas com desafio antibot em vez do
+# produto. Achado em 29/07: o Mercado Livre devolveu "Seguridad — Mercado Libre"
+# para o IP do Render. O sistema marcava `ok=true`, extraia zero imagens e ainda
+# mandava o texto do CAPTCHA para o modelo como se fosse a ficha do produto.
+# Pagina bloqueada e' FALHA, nao conteudo.
+_RX_BLOQUEIO = re.compile(
+    r"seguridad\s*[—\-|]\s*mercado\s*libre|"
+    r"<title[^>]*>\s*(seguridad|security|acesso negado|access denied|"
+    r"just a moment|attention required|robot check|verifica[çc][ãa]o de seguran[çc]a|"
+    r"are you a human|checking your browser)\b|"
+    r"cf-browser-verification|cf_chl_opt|__cf_chl|g-recaptcha|hcaptcha|"
+    r"px-captcha|distil_r_captcha|/_Incapsula_Resource",
+    re.I)
+
+
+def pagina_bloqueada(html: str) -> bool:
+    """O site respondeu, mas com desafio antibot em vez da página do produto."""
+    return bool(_RX_BLOQUEIO.search((html or "")[:20000]))
+
 
 def _pontua_imagem(url: str) -> int:
     """Ordena candidatas. Quanto maior, mais cedo entra na fila."""
@@ -760,6 +779,12 @@ def abrir_origem(link: str,
             "a página respondeu vazia (pode estar bloqueando acesso automático)"
         return ficha
 
+    if pagina_bloqueada(html):
+        ficha["falha"] = (ficha["falha"] + " · " if ficha["falha"] else "") + \
+            "o site bloqueou o acesso automático (devolveu página de segurança, " \
+            "não a do produto)"
+        return ficha
+
     ficha["metodo"] = "html"
     for u in urls_de_imagem(html, link):
         if u not in ficha["imagens"]:
@@ -768,7 +793,10 @@ def abrir_origem(link: str,
     m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
     if m:
         ficha["titulo"] = _norm(m.group(1))[:200]
-    ficha["ok"] = bool(ficha["imagens"] or ficha["texto"])
+    # So' e' OK se veio IMAGEM ou ATRIBUTO. Texto sozinho nao basta: pagina de
+    # erro, de login e de captcha tambem tem texto, e foi assim que o CAPTCHA do
+    # ML passou por bom.
+    ficha["ok"] = bool(ficha["imagens"] or ficha["atributos"])
     if ficha["ok"]:
         ficha["falha"] = ""
     elif not ficha["falha"]:
@@ -864,9 +892,80 @@ FERRAMENTA_FOTO = {
 }
 
 
+SYSTEM_CONFERIR = """Voce confere se a IMAGEM mostra o PRODUTO descrito.
+
+Responda `confere=true` so' se a imagem mostra esse produto (ou um exemplar do
+mesmo tipo, quando o item e' generico como um cabo ou um parafuso).
+
+Responda `confere=false` quando for:
+- OUTRO produto, inclusive um parecido, da mesma loja ou da mesma marca;
+- logotipo, banner, icone, selo, bandeira de cartao;
+- embalagem sem o produto, foto de ambiente, brinde, acessorio vendido junto;
+- imagem que voce nao consegue identificar.
+
+Pagina de loja tem carrossel de "produtos relacionados". A imagem pode ser de um
+item vizinho, nao do que estamos ofertando. Na duvida, `false` - este documento
+sai com a marca da KIST na frente do cliente final."""
+
+FERRAMENTA_CONFERIR = {
+    "name": "conferir_foto",
+    "description": "Diz se a imagem e' do produto descrito.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "confere": {"type": "boolean"},
+            "o_que_vejo": {"type": "string"},
+        },
+        "required": ["confere", "o_que_vejo"],
+    },
+}
+
+
+def _b64(dados: bytes) -> str:
+    import base64
+    return base64.b64encode(dados).decode("ascii")
+
+
+def conferir_foto(claude, imagem: bytes, mime: str,
+                  ident: Dict[str, Any]) -> Tuple[bool, str]:
+    """Olha a imagem antes de deixa-la entrar no PDF. Falha de rede = aceita."""
+    descricao = ", ".join(x for x in [ident.get("nome_produto"),
+                                      ident.get("fabricante"),
+                                      ident.get("modelo")] if x)
+    try:
+        resp = claude.messages.create(
+            model=MODELO_VISAO, max_tokens=400, system=SYSTEM_CONFERIR,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64",
+                                             "media_type": mime,
+                                             "data": _b64(imagem)}},
+                {"type": "text", "text": f"Produto esperado: {descricao}"},
+            ]}],
+            tools=[FERRAMENTA_CONFERIR],
+            tool_choice={"type": "tool", "name": "conferir_foto"},
+            temperature=0, timeout=TIMEOUT,
+        )
+    except Exception:
+        return True, "nao consegui conferir (aceitei)"
+    d = _bloco_ferramenta(resp, "conferir_foto") or {}
+    return bool(d.get("confere")), _norm(d.get("o_que_vejo"))
+
+
 def pegar_foto(claude, ident: Dict[str, Any], origem: Dict[str, Any],
                baixar: Callable[..., bytes]) -> Dict[str, Any]:
-    """Devolve a foto do produto da página de origem, se houver."""
+    """Devolve a foto do produto da pagina de origem, se houver.
+
+    O modelo ORDENA as candidatas lendo a pagina; depois cada uma e' baixada e
+    CONFERIDA na visao, e seguimos descendo a lista ate' uma passar.
+
+    Eu tinha tirado a conferencia para nao deixar o documento sem foto. Foi
+    troca errada: sem ela, a pagina da mazer (23 candidatas, com carrossel de
+    relacionados) entregou a foto de OUTRO produto. Documento com a marca da
+    KIST e foto errada e' pior que documento sem foto.
+
+    O que resolve os dois lados nao e' escolher entre conferir e nao conferir:
+    e' conferir E PERCORRER A LISTA INTEIRA em vez de desistir na primeira.
+    """
     brutas = [u for u in (origem.get("imagens") or []) if _norm(u).startswith("http")]
     if not brutas:
         return {"imagem": None, "mime": "", "url": "", "origem": "ausente",
@@ -901,7 +1000,7 @@ def pegar_foto(claude, ident: Dict[str, Any], origem: Dict[str, Any],
         pass
 
     tentadas = []
-    for url in ordem[:8]:
+    for url in ordem[:10]:
         try:
             dados = baixar(url, origem.get("link") or "")
         except TypeError:
@@ -916,13 +1015,17 @@ def pegar_foto(claude, ident: Dict[str, Any], origem: Dict[str, Any],
         # Único critério: dá para abrir como imagem. Sem piso de resolução —
         # era ele que descartava as miniaturas e deixava o item sem nada.
         ok, nota = _imagem_legivel(dados)
-        if ok:
+        if not ok:
+            tentadas.append(f"{url[:60]} ({nota})")
+            continue
+        confere, viu = conferir_foto(claude, dados, _mime_de(dados), ident)
+        if confere:
             return {"imagem": dados, "mime": _mime_de(dados), "url": url,
                     "origem": "anuncio", "nota": nota, "tentadas": tentadas}
-        tentadas.append(f"{url[:60]} ({nota})")
+        tentadas.append(f"{url[:60]} -- nao e' o produto: {viu[:70]}")
 
     return {"imagem": None, "mime": "", "url": "", "origem": "ausente",
-            "nota": "nenhuma das imagens da página abriu como imagem",
+            "nota": "nenhuma imagem da página confere com este produto",
             "tentadas": tentadas}
 
 
