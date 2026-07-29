@@ -36,7 +36,7 @@ except Exception:
 # duas divergirem, o agente é avisado de que o conhecimento dele está atrasado.
 # Conhecimento velho não avisa que é velho — ele responde com a mesma confiança
 # e erra. Este número é a única coisa que impede isso.
-VERSAO_BACKEND = "3.23"
+VERSAO_BACKEND = "3.24"
 
 app = FastAPI(title="Kist Cotações API", version=VERSAO_BACKEND)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -3621,52 +3621,118 @@ async def remover_item_oc(item_id: int, usuario: str = Depends(verificar_token))
     return {"ok": True}
 
 
+# Status de OC que ainda representam compra em aberto. 'enviada' NÃO entra:
+# quando a OC vai pro cliente a compra está encerrada (decisão do Leonardo, 29/07).
+STATUS_OC_CONSOLIDA = ["rascunho", "confirmada", "parcialmente_comprada", "comprada"]
+
+
 @app.get("/ordens-compra/itens-consolidados")
 async def itens_consolidados(
     todos: bool = False,
+    ocs: str = "",
     usuario: str = Depends(verificar_token)
 ):
-    """Visão consolidada de itens a comprar agrupados por descrição"""
+    """Visão consolidada de itens A COMPRAR, agrupados por descrição.
+
+    `ocs` = ids de OC separados por vírgula (as POs que o operador marcou na tela).
+    Vazio = todas as OCs ativas dele (comportamento histórico, nada muda).
+    A marcação é sempre uma INTERSEÇÃO com o que ele já veria: marcar OC nunca
+    amplia visibilidade — quem manda em 'de quem eu vejo' continua sendo `todos`.
+    """
     sb = get_supabase()
 
-    # Buscar OCs ativas (não arquivadas, não disponíveis)
-    q = sb.table("ordens_compra").select("id,titulo,usuario_email,usuario_nome")
+    # Buscar OCs ativas (não arquivadas, não disponíveis, não enviadas)
+    q = sb.table("ordens_compra").select(
+        "id,titulo,numero_po,cliente,status,usuario_email,usuario_nome")
     if not todos:
         q = q.eq("usuario_email", usuario)
-    ocs_ativas = q.in_("status", ["rascunho","confirmada","parcialmente_comprada","comprada"]).execute()
+    ocs_ativas = q.in_("status", STATUS_OC_CONSOLIDA).execute()
 
     if not ocs_ativas.data:
         return []
 
-    oc_ids = [oc["id"] for oc in ocs_ativas.data]
-    oc_map = {oc["id"]: oc for oc in ocs_ativas.data}
+    # Filtro de marcação. Comparação por string: o id é bigint, mas vem da URL
+    # como texto — não quero depender de conversão pra não sumir item calado.
+    marcadas = {p.strip() for p in (ocs or "").split(",") if p.strip()}
+    permitidas = ocs_ativas.data
+    if marcadas:
+        permitidas = [o for o in permitidas if str(o["id"]) in marcadas]
+    if not permitidas:
+        return []
 
-    # Buscar itens pendentes dessas OCs
+    oc_ids = [oc["id"] for oc in permitidas]
+    oc_map = {oc["id"]: oc for oc in permitidas}
+
+    # Só o que ainda está PENDENTE — a lista é do que falta comprar.
     itens_res = sb.table("oc_itens").select("*")\
         .in_("oc_id", oc_ids)\
-        .in_("status_item", ["pendente","comprado"])\
+        .in_("status_item", ["pendente"])\
         .execute()
 
     # Agrupar por descrição
     from collections import defaultdict
     grupos = defaultdict(list)
     for item in (itens_res.data or []):
-        key = item["descricao"].strip().upper()
+        key = (item.get("descricao") or "").strip().upper() or "(SEM DESCRIÇÃO)"
+        oc = oc_map.get(item["oc_id"], {})
         grupos[key].append({
             **item,
-            "oc_titulo": oc_map.get(item["oc_id"], {}).get("titulo", ""),
-            "oc_usuario": oc_map.get(item["oc_id"], {}).get("usuario_nome", ""),
+            "oc_titulo": oc.get("titulo", ""),
+            "oc_numero_po": oc.get("numero_po", ""),
+            "oc_cliente": oc.get("cliente", ""),
+            "oc_usuario": oc.get("usuario_nome", ""),
         })
 
     resultado = []
     for desc, itens in grupos.items():
         total_qty = sum(float(i.get("quantidade_comprar") or 0) for i in itens)
         unidade = itens[0].get("unidade", "UN")
+
+        # ORIGENS distintas do grupo. Mesma regra de rastro do resto do sistema:
+        # quem (nome) · por onde (canal) · contato · link · SKU. Nada é inventado —
+        # item sem origem aparece como sem origem, não herda a do irmão.
+        origens, sem_origem = {}, 0
+        for i in itens:
+            nome    = (i.get("nome_fornecedor") or "").strip()
+            link    = (i.get("link_fornecedor") or "").strip()
+            canal   = (i.get("fornecedor_canal") or "").strip()
+            contato = (i.get("fornecedor_contato") or "").strip()
+            sku     = (i.get("sku_fornecedor") or "").strip()
+            if not (nome or link or contato):
+                sem_origem += 1
+                continue
+            chave = (nome.upper(), link, contato)
+            o = origens.setdefault(chave, {
+                "fornecedor": nome, "canal": canal, "contato": contato,
+                "link": link, "sku": sku, "quantidade": 0.0,
+            })
+            o["quantidade"] += float(i.get("quantidade_comprar") or 0)
+            if not o["sku"] and sku:
+                o["sku"] = sku
+            if not o["canal"] and canal:
+                o["canal"] = canal
+
+        # Quebra por PO — de onde vem cada pedaço da quantidade.
+        por_oc = {}
+        for i in itens:
+            k = i["oc_id"]
+            p = por_oc.setdefault(k, {
+                "oc_id": k, "titulo": i.get("oc_titulo", ""),
+                "numero_po": i.get("oc_numero_po", ""),
+                "cliente": i.get("oc_cliente", ""),
+                "usuario": i.get("oc_usuario", ""), "quantidade": 0.0,
+            })
+            p["quantidade"] += float(i.get("quantidade_comprar") or 0)
+
         resultado.append({
             "descricao": desc,
             "unidade": unidade,
             "total_quantidade": total_qty,
-            "total_ocs": len(itens),
+            "total_ocs": len(por_oc),      # POs distintas
+            "total_itens": len(itens),     # linhas de OC somadas
+            "origens": list(origens.values()),
+            "sem_origem": sem_origem,
+            "ocs": sorted(por_oc.values(), key=lambda x: str(x["numero_po"] or "")),
             "itens": itens,
         })
 

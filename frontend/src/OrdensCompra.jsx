@@ -20,17 +20,23 @@ const LANES = [
   { key: "entrega",    label: "Aguardando entrega", tint: "#0E9AAE", drop: "comprada",              status: ["comprada"] },
   { key: "entrega_p",  label: "Entrega parcial",    tint: "#B7791F", drop: "entregue_parcial",      status: ["entregue_parcial"] },
   { key: "disponivel", label: "Disponível",         tint: "#4FA62E", drop: "disponivel",            status: ["disponivel"] },
+  { key: "enviada",    label: "Enviada",            tint: "#0B1F3A", drop: "enviada",               status: ["enviada"] },
 ];
+// Status de OC que ainda contam como compra em aberto (espelha STATUS_OC_CONSOLIDA
+// no backend). 'enviada' saiu: foi pro cliente, a compra acabou.
+const STATUS_CONSOLIDA = ["rascunho", "confirmada", "parcialmente_comprada", "comprada"];
 const laneDe = (status) => LANES.find((l) => l.status.includes(status)) || LANES[0];
 const STATUS_OPCOES = [
   ["rascunho", "Rascunho"], ["confirmada", "Aguardando compra"],
   ["parcialmente_comprada", "Comprado parcial"], ["comprada", "Aguardando entrega"],
-  ["entregue_parcial", "Entrega parcial"], ["disponivel", "Disponível"], ["arquivada", "Arquivada"],
+  ["entregue_parcial", "Entrega parcial"], ["disponivel", "Disponível"],
+  ["enviada", "Enviada"], ["arquivada", "Arquivada"],
 ];
 const STATUS_LABEL = {
   rascunho: "rascunho", confirmada: "aguardando compra",
   parcialmente_comprada: "comprado parcial", comprada: "aguardando entrega",
-  entregue_parcial: "entrega parcial", disponivel: "disponível", arquivada: "arquivada",
+  entregue_parcial: "entrega parcial", disponivel: "disponível",
+  enviada: "enviada", arquivada: "arquivada",
 };
 
 export default function OrdensCompra({ token, usuario, novaOC, onNovaOCProcessada }) {
@@ -172,7 +178,7 @@ export default function OrdensCompra({ token, usuario, novaOC, onNovaOCProcessad
       ) : vista === "lista" ? (
         <Lista ocs={filtrados} onSelect={setSel} />
       ) : (
-        <Consolidados token={token} todos={equipeToda} />
+        <Consolidados token={token} todos={equipeToda} ocs={ocs} />
       )}
     </div>
   );
@@ -193,7 +199,7 @@ function OperadorTag({ nome }) {
 function Kanban({ ocs, onSelect, onMove }) {
   const [over, setOver] = useState(null);
   return (
-    <div className="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+    <div className="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
       {LANES.map((lane) => {
         const cards = ocs.filter((o) => laneDe(o.status).key === lane.key);
         const ativo = over === lane.key;
@@ -310,49 +316,157 @@ function Lista({ ocs, onSelect }) {
 }
 
 /* ── Itens consolidados ──────────────────────────────────────────────────── */
-function Consolidados({ token, todos }) {
+// Lista de compra: o operador MARCA as POs e vê o que falta comprar, agrupado
+// por produto, com quantidade somada e a origem de cada pedaço. Só exibição —
+// nada aqui edita OC, item ou banco.
+function Consolidados({ token, todos, ocs }) {
   const [itens, setItens] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [marcadas, setMarcadas] = useState([]);
+
+  const elegiveis = (ocs || []).filter((o) => STATUS_CONSOLIDA.includes(o.status));
+  const marcada = (id) => marcadas.some((x) => String(x) === String(id));
+
+  // OC que mudou de status (ex.: foi pra "Enviada") não pode ficar marcada num
+  // filtro invisível. Solta a marcação — mas só quando de fato mudou, senão o
+  // array novo re-dispara a busca a cada render.
+  useEffect(() => {
+    setMarcadas((m) => {
+      const ok = m.filter((id) => elegiveis.some((o) => String(o.id) === String(id)));
+      return ok.length === m.length ? m : ok;
+    });
+    // eslint-disable-next-line
+  }, [ocs]);
+
   useEffect(() => {
     setLoading(true);
-    fetch(`${API}/ordens-compra/itens-consolidados?todos=${todos}`, { headers: { Authorization: `Bearer ${token}` } })
+    const sel = marcadas.length ? `&ocs=${marcadas.join(",")}` : "";
+    fetch(`${API}/ordens-compra/itens-consolidados?todos=${todos}${sel}`, { headers: { Authorization: `Bearer ${token}` } })
       .then((r) => r.json())
       .then((d) => setItens(Array.isArray(d) ? d : d.itens || []))
       .catch(() => setItens([]))
       .finally(() => setLoading(false));
-  }, [token, todos]);
-  if (loading) return <div className="mt-8 text-center text-[13px] text-faint">Carregando…</div>;
+  }, [token, todos, marcadas]);
+
+  const totalLinhas = itens.length;
+  const chip = "inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11.5px] transition-colors";
+
   return (
-    <div className="mt-6 overflow-hidden rounded-xl border border-line bg-surface">
-      <table className="w-full">
-        <thead>
-          <tr className="border-b border-line bg-paper/70">
-            {["Produto", "Qtd total", "Em OCs", "Operadores"].map((h, i) => (
-              <th key={i} className={`px-4 py-2.5 text-[10.5px] font-semibold uppercase eyebrow text-faint ${i === 1 ? "text-right" : "text-left"}`}>{h}</th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {itens.map((it, i) => {
-            const ops = [...new Set((it.itens || []).map((x) => x.oc_usuario).filter(Boolean))];
+    <>
+      {/* Painel de marcação das POs */}
+      <div className="mt-6 rounded-xl border border-line bg-surface p-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="text-[12px] text-sub">
+            <span className="font-semibold text-ink">Marcar POs</span>{" "}
+            {marcadas.length
+              ? `· ${marcadas.length} de ${elegiveis.length} marcada${marcadas.length > 1 ? "s" : ""}`
+              : `· nenhuma marcada — mostrando as ${elegiveis.length} OCs em aberto`}
+          </div>
+          <div className="flex gap-2">
+            <button onClick={() => setMarcadas(elegiveis.map((o) => o.id))} className={btnGhost}>Marcar todas</button>
+            <button onClick={() => setMarcadas([])} className={btnGhost}>Limpar</button>
+          </div>
+        </div>
+        <div className="mt-2.5 flex flex-wrap gap-1.5">
+          {elegiveis.map((o) => {
+            const on = marcada(o.id);
             return (
-              <tr key={i} className="border-b border-line/70 last:border-0">
-                <td className="px-4 py-3 text-[13px] text-ink">{it.descricao}</td>
-                <td className="px-4 py-3 text-right font-mono text-[13px] text-ink">{it.total_quantidade} {it.unidade}</td>
-                <td className="px-4 py-3 font-mono text-[12px] text-sub">{it.total_ocs ?? "—"}</td>
-                <td className="px-4 py-3">
-                  <div className="flex flex-wrap gap-1">
-                    {ops.map((nome, j) => <OperadorTag key={j} nome={nome} />)}
-                    {ops.length === 0 && <span className="text-[12px] text-faint">—</span>}
-                  </div>
-                </td>
-              </tr>
+              <button key={o.id} title={`${STATUS_LABEL[o.status] || o.status} · ${o.usuario_nome || "—"}`}
+                onClick={() => setMarcadas((m) => (on ? m.filter((x) => String(x) !== String(o.id)) : [...m, o.id]))}
+                className={`${chip} ${on ? "border-kist bg-kist/10 text-kist" : "border-line2 text-sub hover:text-ink"}`}>
+                {on && <IconCheck size={11} />}
+                <span className="font-mono">{o.numero_po || o.titulo || `OC ${o.id}`}</span>
+                <span className="text-faint">· {o.cliente || o.titulo || "—"}</span>
+              </button>
             );
           })}
-          {itens.length === 0 && <tr><td colSpan={4} className="px-4 py-10 text-center text-[13px] text-faint">Nada consolidado.</td></tr>}
-        </tbody>
-      </table>
-    </div>
+          {elegiveis.length === 0 && <span className="text-[12px] text-faint">Nenhuma OC em aberto.</span>}
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="mt-8 text-center text-[13px] text-faint">Carregando…</div>
+      ) : (
+        <>
+          <div className="mt-3 px-1 text-[11.5px] text-faint">
+            {totalLinhas} produto{totalLinhas === 1 ? "" : "s"} a comprar · itens pendentes das POs
+            {marcadas.length ? " marcadas" : " em aberto"}
+          </div>
+          <div className="mt-2 overflow-hidden rounded-xl border border-line bg-surface">
+            <table className="w-full">
+              <thead>
+                <tr className="border-b border-line bg-paper/70">
+                  {["Produto", "Qtd total", "POs", "Origem"].map((h, i) => (
+                    <th key={i} className={`px-4 py-2.5 text-[10.5px] font-semibold uppercase eyebrow text-faint ${i === 1 ? "text-right" : "text-left"}`}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {itens.map((it, i) => {
+                  const linhas = it.ocs || [];
+                  const origens = it.origens || [];
+                  return (
+                    <tr key={i} className="border-b border-line/70 align-top last:border-0">
+                      <td className="px-4 py-3 text-[13px] leading-snug text-ink">{it.descricao}</td>
+                      <td className="whitespace-nowrap px-4 py-3 text-right font-mono text-[13px] text-ink">
+                        {it.total_quantidade} <span className="text-faint">{it.unidade}</span>
+                      </td>
+                      <td className="px-4 py-3">
+                        <div className="flex flex-col gap-1">
+                          {linhas.map((o, j) => (
+                            <div key={j} className="flex items-center gap-1.5 text-[11.5px] text-sub" title={o.titulo || ""}>
+                              {o.numero_po ? <PoChip po={o.numero_po} /> : <span className="text-faint">{o.titulo || `OC ${o.oc_id}`}</span>}
+                              <span className="font-mono text-faint">{o.quantidade} {it.unidade}</span>
+                              <OperadorTag nome={o.usuario} />
+                            </div>
+                          ))}
+                          {linhas.length === 0 && <span className="text-[12px] text-faint">—</span>}
+                        </div>
+                      </td>
+                      <td className="px-4 py-3">
+                        <div className="flex flex-col gap-1.5">
+                          {origens.map((o, j) => {
+                            const url = (o.link || "").match(/^https?:\/\//i) ? o.link : "";
+                            return (
+                              <div key={j} className="text-[11.5px] leading-snug">
+                                <span className="text-ink">
+                                  {url ? (
+                                    <a href={url} target="_blank" rel="noreferrer"
+                                      className="inline-flex items-center gap-1 text-kist hover:underline">
+                                      <IconLink size={11} />{o.fornecedor || "ver anúncio"}
+                                    </a>
+                                  ) : (o.fornecedor || "—")}
+                                </span>
+                                {(o.canal || o.contato) && (
+                                  <span className="text-faint">
+                                    {" · "}{o.canal || "—"}{o.contato ? ` · ${o.contato}` : ""}
+                                  </span>
+                                )}
+                                {o.sku && <span className="ml-1 font-mono text-faint">#{o.sku}</span>}
+                                {origens.length > 1 && (
+                                  <span className="ml-1 font-mono text-faint">({o.quantidade} {it.unidade})</span>
+                                )}
+                              </div>
+                            );
+                          })}
+                          {it.sem_origem > 0 && (
+                            <div className="text-[11.5px] text-amber">
+                              ⚠ {it.sem_origem} {it.sem_origem === 1 ? "item sem origem" : "itens sem origem"}
+                            </div>
+                          )}
+                          {origens.length === 0 && !it.sem_origem && <span className="text-[12px] text-faint">—</span>}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+                {itens.length === 0 && <tr><td colSpan={4} className="px-4 py-10 text-center text-[13px] text-faint">Nada a comprar nas POs selecionadas.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </>
   );
 }
 
