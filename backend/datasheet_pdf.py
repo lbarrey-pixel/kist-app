@@ -244,7 +244,10 @@ class _CaixaImagem(Flowable):
         pad = 12.0
         cx_l, cx_a = self.width - 2 * pad, self.height - 2 * pad
         iw, ih = self.imagem.getSize()
-        esc = min(cx_l / iw, cx_a / ih)          # CONTAIN: nunca distorce
+        # CONTAIN: nunca distorce. E nunca AMPLIA alem do nativo — miniatura de
+        # 100px esticada para 225pt vira borrao; pequena e nitida e' melhor, e
+        # e' o preco de aceitar a miniatura em vez de sair sem foto.
+        esc = min(cx_l / iw, cx_a / ih, 1.0)
         lw, lh = iw * esc, ih * esc
         c.drawImage(self.imagem, (self.width - lw) / 2.0, (self.height - lh) / 2.0,
                     width=lw, height=lh, mask="auto")

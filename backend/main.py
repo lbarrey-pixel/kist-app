@@ -4913,13 +4913,15 @@ def _ds_json(url: str):
     return r.json()
 
 
-def _ds_baixar(url: str) -> bytes:
-    # Referer ajuda em CDN que barra hotlink de imagem.
+def _ds_baixar(url: str, referer: str = "") -> bytes:
+    # CDN que barra hotlink olha o Referer e espera a PAGINA DO PRODUTO, nao o
+    # dominio da propria imagem. Eu mandava o dominio do CDN — inutil.
     _h = {"User-Agent": _DS_UA, "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
           "Accept-Language": "pt-BR,pt;q=0.9"}
-    _m = re.match(r"(https?://[^/]+)", url or "")
+    _base = referer or url or ""
+    _m = re.match(r"(https?://[^/]+)", _base)
     if _m:
-        _h["Referer"] = _m.group(1) + "/"
+        _h["Referer"] = (referer or (_m.group(1) + "/"))
     r = requests.get(url, timeout=_DS_TIMEOUT_HTTP, stream=True, headers=_h)
     r.raise_for_status()
     dados, teto = b"", 8 * 1024 * 1024
@@ -5082,6 +5084,11 @@ async def datasheet_gerar(payload: DatasheetGerarIn, usuario: str = Depends(veri
             "versao": ds_row.get("versao"),
             "critica": payload.critica or "",
             "conteudo": (ds_row.get("payload") or {}).get("conteudo") or {},
+            # O diagnostico da foto TEM que viajar no historico. Sem ele, quando
+            # o operador regera informando a imagem na mao, o motivo da falha
+            # original some — e some justamente o dado que conserta a busca.
+            "foto": (ds_row.get("payload") or {}).get("foto") or {},
+            "origem": (ds_row.get("payload") or {}).get("origem") or {},
             "pdf_path": ds_row.get("pdf_path") or "",
         })
         historico = historico[-10:]
@@ -5095,7 +5102,8 @@ async def datasheet_gerar(payload: DatasheetGerarIn, usuario: str = Depends(veri
         "fabricante": ident.get("fabricante") or "",
         "modelo": conteudo.get("modelo") or ident.get("modelo") or "",
         "payload": {"conteudo": conteudo, "identificacao": ident,
-                    "foto": r.get("foto") or {}, "avisos": r.get("avisos") or [],
+                    "foto": r.get("foto") or {}, "origem": r.get("origem") or {},
+                    "avisos": r.get("avisos") or [],
                     "nome_arquivo": r.get("nome_arquivo") or "",
                     "modo": _modo},
         "imagem_path": img_path or None,

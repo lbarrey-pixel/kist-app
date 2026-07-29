@@ -632,9 +632,12 @@ def urls_de_imagem(html: str, base_url: str = "") -> List[str]:
                     brutas.append(u)
                 break
 
-    limpas = [u for u in brutas if not _LIXO_IMAGEM.search(u)]
-    limpas.sort(key=_pontua_imagem, reverse=True)
-    achadas.extend(limpas[:12])
+    # O filtro de lixo ORDENA, nao elimina. Quem decide o que e' foto de
+    # produto e' o modelo, que le' a pagina. Eliminar aqui ja' custou caro:
+    # basta a minha regex errar uma vez e o documento sai sem foto tendo foto.
+    brutas.sort(key=lambda u: (0 if _LIXO_IMAGEM.search(u) else 1, _pontua_imagem(u)),
+                reverse=True)
+    achadas.extend(brutas[:30])
     return achadas
 
 
@@ -760,8 +763,14 @@ def abrir_origem(link: str,
     return ficha
 
 
-def _imagem_utilizavel(dados: bytes) -> Tuple[bool, str]:
-    """Rejeita o que não serve: quebrado, pequeno demais, ou pesado demais."""
+
+def _imagem_legivel(dados: bytes) -> Tuple[bool, str]:
+    """Serve? Único critério: abre como imagem e não é absurdamente grande.
+
+    NÃO há piso de resolução. Era ele que descartava as miniaturas que muita
+    loja publica no HTML, deixando o documento sem foto tendo foto na página.
+    Miniatura entra no PDF no tamanho nativo, centralizada — pequena, mas certa.
+    """
     if not dados:
         return False, "vazio"
     if len(dados) > MAX_IMAGEM_BYTES:
@@ -774,75 +783,10 @@ def _imagem_utilizavel(dados: bytes) -> Tuple[bool, str]:
         im = Image.open(_io.BytesIO(dados))
         w, h = im.size
     except Exception as e:
-        return False, f"não é imagem legível ({type(e).__name__})"
-    if min(w, h) < MIN_LADO_IMAGEM:
-        return False, f"resolução baixa ({w}x{h})"
+        return False, f"não abre como imagem ({type(e).__name__})"
+    if w < 24 or h < 24:
+        return False, f"é um ícone ({w}x{h})"
     return True, f"{w}x{h}"
-
-
-SYSTEM_CONFIRMAR_FOTO = """Você confere se uma FOTO corresponde ao PRODUTO descrito.
-
-Responda `confere=true` apenas se a imagem mostra, claramente, o produto
-descrito (ou um exemplar do mesmo tipo, quando o item é genérico).
-
-Responda `confere=false` quando:
-- a imagem mostra outro produto, ou uma categoria diferente;
-- é banner, logotipo de marca, selo, ícone, embalagem sem o produto,
-  imagem de site quebrado, placeholder ou foto de ambiente sem o item;
-- você não consegue determinar o que é.
-
-Na dúvida, `false`. Um datasheet sem foto é aceitável;
-um datasheet com a foto errada é um erro na frente do cliente final."""
-
-FERRAMENTA_CONFIRMAR = {
-    "name": "conferir_foto",
-    "description": "Diz se a foto corresponde ao produto.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "confere": {"type": "boolean"},
-            "o_que_vejo": {"type": "string"},
-            "motivo": {"type": "string"},
-        },
-        "required": ["confere", "o_que_vejo"],
-    },
-}
-
-
-def confirmar_foto(claude, imagem: bytes, mime: str,
-                   ident: Dict[str, Any]) -> Tuple[bool, str]:
-    """Olha a foto antes de deixá-la entrar no PDF.
-
-    É o único passo de 'controle de qualidade visual' que sobrou do prompt
-    original — e sobrou porque o layout a gente controla, mas a foto vem da
-    internet e ninguém garante o que ela mostra.
-    """
-    descricao = ", ".join(x for x in [ident.get("nome_produto"),
-                                      ident.get("fabricante"),
-                                      ident.get("modelo")] if x)
-    try:
-        resp = claude.messages.create(
-            model=MODELO_VISAO, max_tokens=500, system=SYSTEM_CONFIRMAR_FOTO,
-            messages=[{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64",
-                                             "media_type": mime,
-                                             "data": _b64(imagem)}},
-                {"type": "text", "text": f"Produto esperado: {descricao}"},
-            ]}],
-            tools=[FERRAMENTA_CONFIRMAR],
-            tool_choice={"type": "tool", "name": "conferir_foto"},
-            temperature=0, timeout=TIMEOUT,
-        )
-    except Exception as e:
-        return False, f"não consegui conferir a foto ({type(e).__name__})"
-    d = _bloco_ferramenta(resp, "conferir_foto") or {}
-    ok = bool(d.get("confere"))
-    return ok, _norm(d.get("motivo")) or _norm(d.get("o_que_vejo"))
-
-
-def _b64(dados: bytes) -> str:
-    import base64
-    return base64.b64encode(dados).decode("ascii")
 
 
 def _mime_de(dados: bytes) -> str:
@@ -857,74 +801,116 @@ def _mime_de(dados: bytes) -> str:
     return "image/png"
 
 
-def achar_foto(claude, ident: Dict[str, Any],
-               origem: Dict[str, Any],
-               baixar: Callable[[str], bytes],
-               buscar_pagina: Callable[[str], str],
-               paginas_oficiais: Optional[List[str]] = None,
-               imagens_web: Optional[List[str]] = None,
-               tentativas: int = 8) -> Dict[str, Any]:
-    """Escolhe a foto entre as que a ORIGEM ja' entregou, e confirma na visao.
+# ══════════════════════════════════════════════════════════════════════════
+# PEGAR A FOTO
+#
+#     abrir o link  ->  o modelo lê a página e diz qual é a foto  ->  baixar
+#
+# Três passos. Sem pontuação por palavra-chave, sem piso de resolução, sem
+# veto separado de visão. Quem escolhe é o modelo, que lê a página inteira
+# com contexto — do mesmo jeito que uma IA de chat faz quando você cola um
+# link e pede a foto do produto.
+#
+# O que eu tinha antes era um funil de peneiras minhas (regex -> pontuação ->
+# tamanho mínimo -> visão), e bastava UMA peneira errar para o documento sair
+# sem foto tendo foto boa na página. Foi o que aconteceu.
+#
+# Se a página tem foto do produto, o documento sai com foto. O operador revisa
+# antes de aprovar e troca em um clique se não gostar — essa é a garantia,
+# não uma peneira minha.
+# ══════════════════════════════════════════════════════════════════════════
+SYSTEM_FOTO = """Você recebe as imagens de uma página de produto e diz qual é a FOTO DO PRODUTO.
 
-    Nao busca de novo: `abrir_origem` ja' abriu o link pelo metodo certo e
-    trouxe as imagens. Aqui so' filtramos, ordenamos e confirmamos.
+Devolva as URLs em ordem de preferência, da melhor para a pior.
 
-    ORDEM — a origem primeiro, sempre. O site do fabricante e' reforco.
-    Eu tinha invertido isso, colocando o fabricante na frente quando a marca
-    era conhecida. O caso da memoria ADATA mostrou o erro: o fabricante
-    devolveu o LOGOTIPO como og:image, a visao recusou (certo), e o item ficou
-    sem foto tendo foto boa na origem. A origem e' do ITEM EXATO; o fabricante
-    e' da linha de produtos.
+QUERO: a foto do produto em si, na maior resolução disponível.
+NÃO QUERO: logotipo, banner, ícone, selo de pagamento, bandeira de cartão,
+avatar, foto de categoria, imagem de ambiente sem o produto, placeholder.
 
-    Sem candidata confirmada, devolve `imagem=None` e o motivo — nunca uma foto
-    parecida. O endpoint pede a foto ao operador em vez de inventar.
-    """
-    recusadas: List[str] = []
-    candidatas: List[Tuple[str, str]] = [(u, "anuncio") for u in (origem.get("imagens") or [])]
+MUITA LOJA PUBLICA SÓ A MINIATURA no HTML, e a imagem grande é a MESMA URL com
+outro sufixo de tamanho. Quando reconhecer esse padrão, devolva primeiro a
+variante grande derivada da URL recebida.
+Exemplo: `.../I/71ABC._AC_SS40_.jpg` costuma ter irmã grande em
+`.../I/71ABC._AC_SL1500_.jpg` — mesmo arquivo, sufixo diferente.
 
-    # A origem nao rendeu foto? Registra POR QUE, antes de partir pro fabricante.
-    if not candidatas:
-        recusadas.append(f"origem ({origem.get('fonte') or 'link'}): "
-                         f"{origem.get('falha') or 'nenhuma imagem na página'}")
+Só transforme URLs que você RECEBEU. Nunca invente domínio, caminho ou nome de
+arquivo novo. Se não reconhecer o padrão, devolva a URL como veio.
+Se nenhuma for foto de produto, devolva a lista vazia."""
 
-    for u in [x for x in (imagens_web or []) if _norm(x).startswith("http")][:4]:
-        candidatas.append((u, "busca"))
+FERRAMENTA_FOTO = {
+    "name": "foto_do_produto",
+    "description": "Diz quais URLs são a foto do produto, em ordem.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "urls": {"type": "array", "items": {"type": "string"},
+                     "description": "Da melhor para a pior. Até 8. Vazia se nenhuma serve."},
+        },
+        "required": ["urls"],
+    },
+}
 
-    for pagina_url in [u for u in (paginas_oficiais or []) if _norm(u).startswith("http")][:3]:
+
+def pegar_foto(claude, ident: Dict[str, Any], origem: Dict[str, Any],
+               baixar: Callable[..., bytes]) -> Dict[str, Any]:
+    """Devolve a foto do produto da página de origem, se houver."""
+    brutas = [u for u in (origem.get("imagens") or []) if _norm(u).startswith("http")]
+    if not brutas:
+        return {"imagem": None, "mime": "", "url": "", "origem": "ausente",
+                "nota": origem.get("falha") or "a página não trouxe imagem"}
+
+    # O modelo lê a página e escolhe. Falhou o modelo? Segue a ordem da página.
+    ordem = brutas
+    try:
+        descricao = ", ".join(x for x in [ident.get("nome_produto"),
+                                          ident.get("fabricante"),
+                                          ident.get("modelo")] if x)
+        partes = [f"PRODUTO: {descricao or origem.get('titulo') or '(sem nome)'}",
+                  f"PÁGINA: {origem.get('link')}", "", "IMAGENS DA PÁGINA:"]
+        partes += [f"{i + 1}. {u}" for i, u in enumerate(brutas[:30])]
+        if origem.get("texto"):
+            partes += ["", "TRECHO DA PÁGINA:", str(origem["texto"])[:1500]]
+        resp = claude.messages.create(
+            model=MODELO_TEXTO, max_tokens=1000, system=SYSTEM_FOTO,
+            messages=[{"role": "user", "content": "\n".join(partes)}],
+            tools=[FERRAMENTA_FOTO],
+            tool_choice={"type": "tool", "name": "foto_do_produto"},
+            temperature=0, timeout=TIMEOUT,
+        )
+        escolhidas = [_norm(u) for u in
+                      ((_bloco_ferramenta(resp, "foto_do_produto") or {}).get("urls") or [])
+                      if _norm(u).startswith("http")]
+        if escolhidas:
+            # As da página entram atrás: se a variante grande não existir, a
+            # original ainda serve. Foto pequena é melhor que documento sem foto.
+            ordem = escolhidas + [u for u in brutas if u not in escolhidas]
+    except Exception:
+        pass
+
+    tentadas = []
+    for url in ordem[:8]:
         try:
-            html = buscar_pagina(pagina_url)
+            dados = baixar(url, origem.get("link") or "")
+        except TypeError:
+            try:
+                dados = baixar(url)
+            except Exception as e:
+                tentadas.append(f"{url[:60]} ({type(e).__name__})")
+                continue
         except Exception as e:
-            recusadas.append(f"{pagina_url[:60]} — não abriu ({type(e).__name__})")
+            tentadas.append(f"{url[:60]} ({type(e).__name__})")
             continue
-        for u in urls_de_imagem(html or "", pagina_url):
-            candidatas.append((u, "fabricante"))
-
-    vistas, fila = set(), []
-    for u, de_onde in candidatas:
-        if u not in vistas:
-            vistas.add(u)
-            fila.append((u, de_onde))
-
-    for url, de_onde in fila[:tentativas]:
-        try:
-            dados = baixar(url)
-        except Exception as e:
-            recusadas.append(f"{url[:70]} — download falhou ({type(e).__name__})")
-            continue
-        ok, nota = _imagem_utilizavel(dados)
-        if not ok:
-            recusadas.append(f"{url[:70]} — {nota}")
-            continue
-        mime = _mime_de(dados)
-        confere, motivo = confirmar_foto(claude, dados, mime, ident)
-        if confere:
-            return {"imagem": dados, "mime": mime, "url": url,
-                    "origem": de_onde, "recusadas": recusadas, "nota": nota}
-        recusadas.append(f"{url[:70]} — não confere: {motivo}")
+        # Único critério: dá para abrir como imagem. Sem piso de resolução —
+        # era ele que descartava as miniaturas e deixava o item sem nada.
+        ok, nota = _imagem_legivel(dados)
+        if ok:
+            return {"imagem": dados, "mime": _mime_de(dados), "url": url,
+                    "origem": "anuncio", "nota": nota, "tentadas": tentadas}
+        tentadas.append(f"{url[:60]} ({nota})")
 
     return {"imagem": None, "mime": "", "url": "", "origem": "ausente",
-            "recusadas": recusadas,
-            "nota": "nenhuma foto confirmada — peça o link ou o arquivo ao operador"}
+            "nota": "nenhuma das imagens da página abriu como imagem",
+            "tentadas": tentadas}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -983,16 +969,30 @@ def gerar(claude, item: Dict[str, Any], logo_bytes: bytes,
 
     # ── Foto ───────────────────────────────────────────────────────────────
     if imagem_operador:
-        ok, nota = _imagem_utilizavel(imagem_operador)
+        ok, nota = _imagem_legivel(imagem_operador)
         foto = ({"imagem": imagem_operador, "mime": _mime_de(imagem_operador),
                  "url": "", "origem": "operador", "recusadas": [], "nota": nota}
                 if ok else
                 {"imagem": None, "mime": "", "url": "", "origem": "ausente",
                  "recusadas": [f"arquivo do operador: {nota}"], "nota": nota})
     else:
-        foto = achar_foto(claude, ident, origem, baixar, buscar_pagina,
-                          paginas_oficiais=conteudo.get("paginas_oficiais") or [],
-                          imagens_web=conteudo.get("imagens_encontradas") or [])
+        foto = pegar_foto(claude, ident, origem, baixar)
+
+        # Sem foto na origem, o TECNICO ainda tem a pagina do fabricante e as
+        # fotos que o modelo viu na busca. O comercial nao — ele e' so' a origem.
+        if foto.get("imagem") is None and not comercial:
+            extras = list(conteudo.get("imagens_encontradas") or [])
+            for pag in (conteudo.get("paginas_oficiais") or [])[:2]:
+                try:
+                    extras += urls_de_imagem(buscar_pagina(pag) or "", pag)
+                except Exception:
+                    pass
+            if extras:
+                reforco = pegar_foto(claude, ident,
+                                     dict(origem, imagens=extras), baixar)
+                if reforco.get("imagem") is not None:
+                    reforco["origem"] = "fabricante"
+                    foto = reforco
 
     # ── Regra 6: varredura determinística antes de desenhar ────────────────
     problemas = validar_dados(conteudo)
@@ -1041,6 +1041,8 @@ def gerar(claude, item: Dict[str, Any], logo_bytes: bytes,
         "identificacao": ident,
         "conteudo": conteudo,
         "foto": {k: v for k, v in foto.items() if k != "imagem"},
+        # Ficha da origem sem o texto (pesa e nao serve pra diagnostico).
+        "origem": {k: v for k, v in origem.items() if k != "texto"},
         "tem_foto": foto.get("imagem") is not None,
         "imagem_bytes": foto.get("imagem"),
         "pdf_bytes": pdf,
