@@ -4969,14 +4969,32 @@ def _ds_campo(modo: str) -> str:
     return DS_CAMPO.get((modo or "tecnico").strip().lower(), "datasheet_id")
 
 
+# Link que NAO identifica um produto: e' resultado de busca, listagem ou
+# categoria. Serve para o operador achar o item, nao para identificar o item.
+_RX_LINK_BUSCA = re.compile(
+    r"/sch/|/search|/busca|/procura|/s\?|/b\?|[?&](_nkw|q|query|busca|search|k)=",
+    re.I)
+
+
+def _ds_link_e_busca(link: str) -> bool:
+    return bool(_RX_LINK_BUSCA.search(link or ""))
+
+
 def _ds_chave_link(link: str) -> str:
     """Normaliza o link para servir de chave de cache.
 
-    Tira querystring de rastreamento e barra final — o mesmo anúncio chega com
+    Tira querystring de rastreamento e barra final — o mesmo anuncio chega com
     `?utm_source=` diferente toda vez e viraria um datasheet novo a cada busca.
+
+    LINK DE BUSCA NAO VIRA CHAVE. Achado no backtest de 29/07: tres itens
+    diferentes com link `ebay.com/sch/i.html?_nkw=SIGA-CC1`, `...SIGA-CT1` e
+    `...CABO HDMI` colapsavam todos para `ebay.com/sch/i.html` depois de tirar a
+    querystring — a MESMA chave. Aprovar o documento de um faria os outros
+    puxarem ele do cache: documento errado na frente do cliente, em silencio.
+    Sem chave, cada um gera o seu; a busca por descricao continua valendo.
     """
     l = (link or "").strip().lower()
-    if not l:
+    if not l or _ds_link_e_busca(l):
         return ""
     l = re.sub(r"[?#].*$", "", l)
     l = re.sub(r"/+$", "", l)

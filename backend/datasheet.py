@@ -641,11 +641,23 @@ def urls_de_imagem(html: str, base_url: str = "") -> List[str]:
     return achadas
 
 
+_RX_BUSCA = re.compile(
+    r"/sch/|/search|/busca|/procura|/s\?|/b\?|[?&](_nkw|q|query|busca|search|k)=", re.I)
+
+
 def identificar_fonte(link: str) -> Dict[str, str]:
     """Diz QUE fonte e' o link e COMO ela se abre. Deterministico, sem rede."""
     l = _norm(link)
     if not l.startswith("http"):
-        return {"fonte": "nenhuma", "metodo": "nenhum", "ident": "", "url_api": ""}
+        return {"fonte": "nenhuma", "metodo": "nenhum", "ident": "", "url_api": "",
+                "busca": ""}
+
+    # Pagina de BUSCA nao e' pagina de produto: tem dezenas de itens diferentes,
+    # e a foto pode ser de qualquer um deles. Abrimos assim mesmo (o operador
+    # colou aquilo por algum motivo), mas o documento sai com aviso.
+    if _RX_BUSCA.search(l):
+        return {"fonte": "busca", "metodo": "html", "ident": "", "url_api": "",
+                "busca": "1"}
 
     if re.search(r"mercadolivre\.com|mercadolibre\.com", l, re.I):
         m = _RX_MLB.search(l)
@@ -691,14 +703,15 @@ def abrir_origem(link: str,
     ficha: Dict[str, Any] = {
         "link": _norm(link), "fonte": "nenhuma", "metodo": "nenhum",
         "ok": False, "falha": "", "titulo": "", "descricao": "",
-        "atributos": [], "imagens": [], "texto": "",
+        "atributos": [], "imagens": [], "texto": "", "e_busca": False,
     }
     if not _norm(link):
         ficha["falha"] = "o item não tem link de origem"
         return ficha
 
     alvo = identificar_fonte(link)
-    ficha.update({"fonte": alvo["fonte"], "metodo": alvo["metodo"]})
+    ficha.update({"fonte": alvo["fonte"], "metodo": alvo["metodo"],
+                  "e_busca": bool(alvo.get("busca"))})
 
     # ── Mercado Livre: API oficial, endpoint escolhido pelo formato da URL ──
     if alvo["metodo"] in ("api_item", "api_catalogo"):
@@ -1018,6 +1031,11 @@ def gerar(claude, item: Dict[str, Any], logo_bytes: bytes,
     # operador precisa saber ANTES de aprovar — e precisa saber POR QUE, nao
     # so' que "nao deu". Silencio aqui foi o que escondeu o 404 do Mercado
     # Livre por duas rodadas de teste.
+    if origem.get("e_busca"):
+        avisos.append("o link de origem é uma página de BUSCA, não a do produto — "
+                      "a foto e as specs podem ser de outro item da lista; "
+                      "confira com atenção ou troque o link")
+
     if origem.get("ok"):
         detalhe = []
         if origem.get("imagens"):
