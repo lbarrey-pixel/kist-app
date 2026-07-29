@@ -766,7 +766,17 @@ def abrir_origem(link: str,
                 return ficha
             ficha["falha"] = ficha["falha"] or "a API do Mercado Livre não trouxe dados do item"
 
-    # ── Loja / fabricante / ML sem id: ler a pagina ────────────────────────
+    # ML e' o unico caso em que o HTML NAO e' alternativa: o site devolve
+    # antibot para servidor. Se a API nao serviu, para aqui e diz o que falta,
+    # em vez de gastar uma requisicao para receber CAPTCHA.
+    if ficha["fonte"] == "mercadolivre" and not ficha["ok"]:
+        ficha["falha"] = (ficha["falha"] or
+                          "a API do Mercado Livre não devolveu dados deste item")
+        ficha["falha"] += (" · o site do ML bloqueia leitura automática, então "
+                           "não há como cair na página")
+        return ficha
+
+    # ── Loja / fabricante: ler a pagina ────────────────────────────────────
     # Mecanismo DIFERENTE, nao segunda tentativa do mesmo.
     try:
         html = buscar_pagina(link) or ""

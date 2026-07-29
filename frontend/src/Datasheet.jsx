@@ -438,6 +438,68 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto,
   );
 }
 
+
+// ── Baixar todos (um botão por tipo) ─────────────────────────────────────
+// Um ZIP, não uma aba por item: o navegador bloqueia janelas a partir da
+// segunda, e ninguém quer catar 12 downloads soltos na pasta.
+export function DatasheetBaixarTodos({ itens, token, apiUrl, modo = "tecnico",
+  nomeProposta = "" }) {
+  const cfg = DOC[modo] || DOC.tecnico;
+  const [baixando, setBaixando] = useState(false);
+  const [erro, setErro] = useState("");
+
+  const ids = [...new Set((itens || []).map((it) => it[cfg.campo]).filter(Boolean))];
+  if (ids.length === 0) return null;
+
+  async function baixar() {
+    setBaixando(true); setErro("");
+    try {
+      const res = await fetch(`${apiUrl}/datasheets/zip`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          ids,
+          nome: `${cfg.curto}s_${nomeProposta || "kist"}`.replace(/\s+/g, "_"),
+        }),
+      });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        throw new Error(d.detail || "falhou ao montar o arquivo");
+      }
+      const faltaram = Number(res.headers.get("X-Faltaram") || 0);
+      const blob = await res.blob();
+      // Download por blob, não navegação: a proposta em edição não se perde.
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${cfg.curto}s_${nomeProposta || "kist"}.zip`.replace(/\s+/g, "_");
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+      if (faltaram > 0) {
+        setErro(`${faltaram} não entraram — veja o _NAO_ENTRARAM.txt dentro do zip`);
+      }
+    } catch (e) {
+      setErro(String(e.message || e));
+    } finally {
+      setBaixando(false);
+    }
+  }
+
+  return (
+    <>
+      <button onClick={baixar} disabled={baixando}
+        className={`${btnGhost} text-[12px] disabled:opacity-50`}
+        title={`Baixa num único zip ${cfg.curto}s de ${ids.length} item(ns) desta proposta`}>
+        <IconDownload size={14} />
+        {baixando ? "montando…" : `Baixar ${cfg.curto}s (${ids.length})`}
+      </button>
+      {erro && <span className="text-[11px] text-amber">{erro}</span>}
+    </>
+  );
+}
+
 // ── Lote (um por modo) ───────────────────────────────────────────────────
 // NÃO é um painel de progresso. É uma FILA que dirige a MESMA tela de revisão,
 // um item por vez: gera → você confere o PDF → aprova (ou corrige, ou pula) →

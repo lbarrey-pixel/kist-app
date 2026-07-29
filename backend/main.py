@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 import anthropic
 from supabase import create_client
 from datetime import date
@@ -4906,9 +4906,87 @@ def _ds_pagina(url: str) -> str:
     return texto
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# MERCADO LIVRE — token de aplicacao
+#
+# O ML passou a exigir access token em TODA chamada, inclusive nos recursos
+# publicos, e o token vale ~6h. Sem ele a API responde 401 e a pagina HTML cai
+# no antibot ("Seguridad - Mercado Libre") — foi o que derrubou 36% da base.
+#
+# Credenciais por env var no Render (nenhuma no codigo):
+#   ML_CLIENT_ID / ML_CLIENT_SECRET   -> obrigatorias
+#   ML_REFRESH_TOKEN                  -> opcional; se houver, usa refresh_token
+#                                        (mais duravel). Sem ela, tenta
+#                                        client_credentials.
+#
+# Sem credencial configurada o motor NAO tenta a API e NAO tenta o HTML do ML:
+# avisa que falta credencial. Bater na porta trancada e' so' gastar tempo.
+# ══════════════════════════════════════════════════════════════════════════
+ML_CLIENT_ID = os.environ.get("ML_CLIENT_ID", "").strip()
+ML_CLIENT_SECRET = os.environ.get("ML_CLIENT_SECRET", "").strip()
+ML_REFRESH_TOKEN = os.environ.get("ML_REFRESH_TOKEN", "").strip()
+
+_ML_TOKEN = {"valor": "", "expira": 0.0, "erro": ""}
+
+
+def ml_configurado() -> bool:
+    return bool(ML_CLIENT_ID and ML_CLIENT_SECRET)
+
+
+def _ml_token(forcar: bool = False) -> str:
+    """Token do ML, em cache ate' 5 min antes de expirar."""
+    if not ml_configurado():
+        _ML_TOKEN["erro"] = ("credenciais do Mercado Livre não configuradas "
+                             "(ML_CLIENT_ID / ML_CLIENT_SECRET no Render)")
+        return ""
+    if not forcar and _ML_TOKEN["valor"] and time.time() < _ML_TOKEN["expira"]:
+        return _ML_TOKEN["valor"]
+
+    corpo = {"client_id": ML_CLIENT_ID, "client_secret": ML_CLIENT_SECRET}
+    if ML_REFRESH_TOKEN:
+        corpo.update({"grant_type": "refresh_token", "refresh_token": ML_REFRESH_TOKEN})
+    else:
+        corpo["grant_type"] = "client_credentials"
+    try:
+        r = requests.post("https://api.mercadolibre.com/oauth/token", data=corpo,
+                          timeout=_DS_TIMEOUT_HTTP,
+                          headers={"Accept": "application/json",
+                                   "Content-Type": "application/x-www-form-urlencoded"})
+        d = r.json() if r.content else {}
+        if r.status_code >= 400 or not d.get("access_token"):
+            _ML_TOKEN["erro"] = (f"o Mercado Livre recusou as credenciais "
+                                 f"(HTTP {r.status_code}: "
+                                 f"{str(d.get('message') or d.get('error') or '')[:90]})")
+            _ML_TOKEN["valor"] = ""
+            return ""
+        _ML_TOKEN["valor"] = d["access_token"]
+        _ML_TOKEN["expira"] = time.time() + max(60, int(d.get("expires_in") or 21600) - 300)
+        _ML_TOKEN["erro"] = ""
+        return _ML_TOKEN["valor"]
+    except Exception as e:
+        _ML_TOKEN["erro"] = f"não consegui falar com o Mercado Livre ({type(e).__name__})"
+        _ML_TOKEN["valor"] = ""
+        return ""
+
+
 def _ds_json(url: str):
-    r = requests.get(url, timeout=_DS_TIMEOUT_HTTP,
-                     headers={"User-Agent": _DS_UA, "Accept": "application/json"})
+    cab = {"User-Agent": _DS_UA, "Accept": "application/json"}
+    e_ml = "api.mercadolibre.com" in (url or "")
+
+    if e_ml:
+        tok = _ml_token()
+        if not tok:
+            raise RuntimeError(_ML_TOKEN["erro"] or "sem token do Mercado Livre")
+        cab["Authorization"] = f"Bearer {tok}"
+
+    r = requests.get(url, timeout=_DS_TIMEOUT_HTTP, headers=cab)
+    # 401 = token venceu antes da hora (troca de senha, secret girado). Renova
+    # UMA vez e repete. Se falhar de novo, e' credencial, nao expiracao.
+    if e_ml and r.status_code == 401:
+        tok = _ml_token(forcar=True)
+        if tok:
+            cab["Authorization"] = f"Bearer {tok}"
+            r = requests.get(url, timeout=_DS_TIMEOUT_HTTP, headers=cab)
     r.raise_for_status()
     return r.json()
 
@@ -5309,6 +5387,73 @@ async def datasheet_buscar(produto_id: Optional[int] = None,
             return {"achou": True, "por": "descricao", "modo": _m,
                     "datasheet": _ds_para_front(r.data[0])}
     return {"achou": False, "modo": _m, "datasheet": None}
+
+
+class DatasheetZipIn(BaseModel):
+    ids: List[int]
+    nome: Optional[str] = ""
+
+
+@app.post("/datasheets/zip")
+async def datasheet_zip(payload: DatasheetZipIn, usuario: str = Depends(verificar_token)):
+    """Baixa varios documentos de uma vez, num ZIP.
+
+    Um botao por tipo (datasheets / apresentacoes). Sem isto o operador abriria
+    uma aba por item e o navegador bloquearia as janelas depois da segunda.
+    """
+    import zipfile
+    from fastapi.responses import StreamingResponse
+
+    ids = [int(i) for i in (payload.ids or []) if i]
+    if not ids:
+        raise HTTPException(400, "Nenhum documento para baixar.")
+
+    sb = get_supabase()
+    r = sb.table("datasheets").select("id,nome_produto,modelo,pdf_path,payload,modo")\
+        .in_("id", ids).execute()
+    linhas = r.data or []
+    if not linhas:
+        raise HTTPException(404, "Documentos não encontrados.")
+
+    buf = io.BytesIO()
+    dentro, faltaram = 0, []
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        usados = set()
+        for linha in linhas:
+            caminho = linha.get("pdf_path") or ""
+            if not caminho:
+                faltaram.append(linha.get("nome_produto") or linha.get("id"))
+                continue
+            try:
+                dados = _ds_storage().download(caminho)
+            except Exception:
+                faltaram.append(linha.get("nome_produto") or linha.get("id"))
+                continue
+            nome = ((linha.get("payload") or {}).get("nome_arquivo")
+                    or f"datasheet_{linha.get('id')}.pdf")
+            # Dois itens com o mesmo nome de arquivo se sobrescreveriam no ZIP.
+            base = nome
+            n = 2
+            while nome in usados:
+                nome = base.replace(".pdf", f"_{n}.pdf")
+                n += 1
+            usados.add(nome)
+            z.writestr(nome, dados)
+            dentro += 1
+        if faltaram:
+            z.writestr("_NAO_ENTRARAM.txt",
+                       "Estes documentos não puderam ser incluídos:\n" +
+                       "\n".join(f"- {x}" for x in faltaram))
+
+    if dentro == 0:
+        raise HTTPException(502, "Não consegui baixar nenhum dos PDFs.")
+
+    buf.seek(0)
+    apelido = re.sub(r"[^A-Za-z0-9_.-]+", "_", (payload.nome or "documentos_kist"))[:60]
+    return StreamingResponse(
+        buf, media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{apelido}.zip"',
+                 "X-Documentos": str(dentro), "X-Faltaram": str(len(faltaram))})
 
 
 @app.delete("/datasheets/{ds_id}")

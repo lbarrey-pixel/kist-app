@@ -4,7 +4,7 @@ import Propostas from "./Propostas.jsx";
 import OrdensCompra from "./OrdensCompra.jsx";
 import Analista from "./Analista.jsx";
 import ChamadosAdmin from "./ChamadosAdmin.jsx";
-import { DatasheetBotao, DatasheetLote } from "./Datasheet.jsx";
+import { DatasheetBotao, DatasheetLote, DatasheetBaixarTodos } from "./Datasheet.jsx";
 import {
   CONF, brl, btnPrimary, btnGhost, Eyebrow, StateLabel, PageHeader,
   CertaintyStrip, Sidebar,
@@ -2019,6 +2019,10 @@ export default function App() {
                     <DatasheetLote itens={prop.itens || []} token={token} apiUrl={API}
                       fonteTexto={prop.fonte_texto} onChange={atualizarItem}
                       propostaId={propostaId} onSalvar={salvarRascunho} modo="comercial" />
+                    <DatasheetBaixarTodos itens={prop.itens || []} token={token} apiUrl={API}
+                      modo="tecnico" nomeProposta={prop.proposta || numeroProposta} />
+                    <DatasheetBaixarTodos itens={prop.itens || []} token={token} apiUrl={API}
+                      modo="comercial" nomeProposta={prop.proposta || numeroProposta} />
                     <button onClick={() => baixarCSV(propostaIdx)} disabled={loading || salvandoBanco || jaBaixado} className={btnPrimary}>
                       {salvandoBanco
                         ? <><span className="inline-block animate-spin"><IconBolt size={15} /></span> Salvando…</>
