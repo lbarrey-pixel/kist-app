@@ -5389,6 +5389,34 @@ async def datasheet_buscar(produto_id: Optional[int] = None,
     return {"achou": False, "modo": _m, "datasheet": None}
 
 
+@app.post("/ml/notificacoes")
+@app.get("/ml/notificacoes")
+async def ml_notificacoes(request: Request):
+    """Webhook do Mercado Livre. Recebe e devolve 200. So' isso, de proposito.
+
+    O cadastro da aplicacao no ML EXIGE uma URL de notificacao, mas a Kist nao
+    vende nem publica por la' — a integracao so' LE ficha de produto. Nao ha'
+    nada a processar.
+
+    Precisa existir mesmo assim: sem endpoint no ar, o ML tenta entregar,
+    acumula falha e acaba desativando as notificacoes (e reclamando da
+    aplicacao). Um 200 rapido encerra o assunto.
+
+    SEM autenticacao de propriedade: quem chama e' o ML, nao um operador, e
+    portanto nao tem Bearer. Como nada e' lido nem gravado, nao ha' o que
+    proteger — no maximo alguem gasta um 200 a toa.
+    """
+    try:
+        corpo = await request.json()
+    except Exception:
+        corpo = None
+    # Log leve, so' para saber que chegou. Nao guarda em banco.
+    if isinstance(corpo, dict) and corpo.get("topic"):
+        print(f"[ml] notificacao ignorada · topic={corpo.get('topic')} "
+              f"resource={str(corpo.get('resource'))[:80]}")
+    return {"ok": True}
+
+
 class DatasheetZipIn(BaseModel):
     ids: List[int]
     nome: Optional[str] = ""
