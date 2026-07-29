@@ -4870,15 +4870,40 @@ def _ds_logo(sb) -> Optional[bytes]:
 # ── Rede ──────────────────────────────────────────────────────────────────
 # Funções pequenas e injetadas no módulo do datasheet, para ele continuar
 # testável sem rede. Toda falha vira exceção que o `datasheet.py` já trata.
+# Cabecalho de navegador de verdade. Loja grande (Mercado Livre, Amazon,
+# distribuidor com WAF) devolve 403 para requisicao "pelada" com so' o
+# User-Agent. Sem isto, a pagina volta vazia, nao ha' imagem para extrair, e o
+# item sai sem foto — foi o que aconteceu com a mazer e com o ML.
+_DS_CABECALHOS = {
+    "User-Agent": _DS_UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+              "image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
+
+
 def _ds_pagina(url: str) -> str:
-    r = requests.get(url, timeout=_DS_TIMEOUT_HTTP,
-                     headers={"User-Agent": _DS_UA,
-                              "Accept-Language": "pt-BR,pt;q=0.9"})
+    r = requests.get(url, timeout=_DS_TIMEOUT_HTTP, headers=_DS_CABECALHOS,
+                     allow_redirects=True)
     r.raise_for_status()
+    if not r.encoding or r.encoding.lower() == "iso-8859-1":
+        r.encoding = r.apparent_encoding or "utf-8"
+    texto = r.text[:400000]
+    # O content-type NAO decide sozinho. Servidor mal configurado manda
+    # "application/octet-stream" ou "text/plain" servindo HTML — e a pagina era
+    # descartada sem ninguem olhar. Se o CORPO parece HTML, e' HTML.
     ct = (r.headers.get("content-type") or "").lower()
-    if "html" not in ct and "xml" not in ct and "json" not in ct:
+    parece_html = bool(re.search(r"<html|<meta|<body|<!doctype", texto[:4000], re.I))
+    if not parece_html and ("html" not in ct and "xml" not in ct and "json" not in ct):
         return ""
-    return r.text[:400000]
+    return texto
 
 
 def _ds_json(url: str):
@@ -4889,8 +4914,13 @@ def _ds_json(url: str):
 
 
 def _ds_baixar(url: str) -> bytes:
-    r = requests.get(url, timeout=_DS_TIMEOUT_HTTP, stream=True,
-                     headers={"User-Agent": _DS_UA})
+    # Referer ajuda em CDN que barra hotlink de imagem.
+    _h = {"User-Agent": _DS_UA, "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+          "Accept-Language": "pt-BR,pt;q=0.9"}
+    _m = re.match(r"(https?://[^/]+)", url or "")
+    if _m:
+        _h["Referer"] = _m.group(1) + "/"
+    r = requests.get(url, timeout=_DS_TIMEOUT_HTTP, stream=True, headers=_h)
     r.raise_for_status()
     dados, teto = b"", 8 * 1024 * 1024
     for pedaco in r.iter_content(64 * 1024):

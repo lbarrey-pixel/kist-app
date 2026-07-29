@@ -127,7 +127,7 @@ def _norm(s: Any) -> str:
 
 
 def contexto_do_item(item: Dict[str, Any], fonte_texto: str = "",
-                     pagina: str = "") -> str:
+                     origem: Optional[Dict[str, Any]] = None) -> str:
     """Monta o texto que o modelo lê. Mesma espinha do /conferir.
 
     A origem (link, fornecedor) entra como INSUMO de identificação e nunca
@@ -150,9 +150,25 @@ def contexto_do_item(item: Dict[str, Any], fonte_texto: str = "",
         p.append(f"Página de origem (INSUMO INTERNO — nunca citar no documento): "
                  f"{item['link_fornecedor']}")
 
-    if pagina:
-        p.append("\n### CONTEÚDO LIDO DA PÁGINA DE ORIGEM")
-        p.append(pagina[:12000])
+    o = origem or {}
+    if o.get("ok"):
+        p.append("\n### O QUE A PÁGINA DE ORIGEM DIZ SOBRE ESTE ITEM")
+        p.append("(fonte primária — use isto antes de qualquer outra coisa)")
+        if o.get("titulo"):
+            p.append(f"Título na origem: {o['titulo']}")
+        if o.get("atributos"):
+            p.append("Atributos publicados na origem:")
+            for a in o["atributos"][:40]:
+                p.append(f"  - {a.get('nome')}: {a.get('valor')}")
+        if o.get("descricao"):
+            p.append(f"Descrição na origem: {str(o['descricao'])[:3000]}")
+        if o.get("texto"):
+            p.append("Texto da página:")
+            p.append(str(o["texto"])[:12000])
+    elif o.get("falha"):
+        p.append(f"\n### PÁGINA DE ORIGEM INDISPONÍVEL\n{o['falha']}")
+        p.append("Não invente para cobrir o buraco: descreva só o que a "
+                 "descrição do cliente permite afirmar.")
     if fonte_texto:
         p.append("\n### E-MAIL / ANEXOS ORIGINAIS DO CLIENTE")
         p.append(fonte_texto[:10000])
@@ -160,9 +176,10 @@ def contexto_do_item(item: Dict[str, Any], fonte_texto: str = "",
 
 
 def identificar(claude, item: Dict[str, Any], fonte_texto: str = "",
-                pagina: str = "", pistas: str = "") -> Dict[str, Any]:
+                origem: Optional[Dict[str, Any]] = None,
+                pistas: str = "") -> Dict[str, Any]:
     """Descobre QUAL item é. Não busca specs ainda — só identidade."""
-    ctx = contexto_do_item(item, fonte_texto, pagina)
+    ctx = contexto_do_item(item, fonte_texto, origem)
     if pistas:
         ctx += f"\n\n### CORREÇÃO DO OPERADOR (vale mais que tudo acima)\n{pistas}"
 
@@ -193,7 +210,11 @@ def identificar(claude, item: Dict[str, Any], fonte_texto: str = "",
     fonte_toda = " ".join([
         _norm(item.get("descricao_original")), _norm(item.get("descricao_final")),
         _norm(item.get("specs_complementares")), _norm(item.get("sku_fornecedor")),
-        pagina or "", fonte_texto or "", pistas or "",
+        _norm((origem or {}).get("titulo")), _norm((origem or {}).get("texto")),
+        _norm((origem or {}).get("descricao")),
+        " ".join(f"{a.get('nome')} {a.get('valor')}"
+                 for a in ((origem or {}).get("atributos") or [])),
+        fonte_texto or "", pistas or "",
     ]).lower()
     ident["descartado"] = []
     for campo in ("fabricante", "modelo"):
@@ -274,6 +295,12 @@ FERRAMENTA_CONTEUDO = {
                                "catálogo oficial que você consultou. É de onde "
                                "sai a melhor foto. Só URLs que você realmente viu.",
             },
+            "imagens_encontradas": {
+                "type": "array", "items": {"type": "string"},
+                "description": "URLs de FOTOS do produto que você encontrou na "
+                               "busca. Só URLs que apareceram de fato nos "
+                               "resultados — nunca monte uma URL por dedução.",
+            },
             "incertezas": {"type": "array", "items": {"type": "string"},
                            "description": "O que não deu para confirmar"},
         },
@@ -353,6 +380,8 @@ def montar_conteudo(claude, ident: Dict[str, Any], contexto: str,
         "fontes": [_norm(f) for f in (dados.get("fontes") or []) if _norm(f)],
         "paginas_oficiais": [_norm(u) for u in (dados.get("paginas_oficiais") or [])
                              if _norm(u).startswith("http")],
+        "imagens_encontradas": [_norm(u) for u in (dados.get("imagens_encontradas") or [])
+                                if _norm(u).startswith("http")],
         "incertezas": [_norm(i) for i in (dados.get("incertezas") or []) if _norm(i)],
         "buscas": [b.input.get("query", "") for b in (getattr(resp, "content", []) or [])
                    if getattr(b, "type", "") == "server_tool_use"
@@ -461,7 +490,28 @@ def prompt_comercial(sb=None) -> str:
 # ══════════════════════════════════════════════════════════════════════════
 # 3. FOTO REAL
 # ══════════════════════════════════════════════════════════════════════════
-_RX_MLB = re.compile(r"(MLB)-?(\d{6,})", re.I)
+# ══════════════════════════════════════════════════════════════════════════
+# ABRIR A ORIGEM
+#
+# O link de origem e' a fonte primaria: e' a pagina do ITEM EXATO que a Kist
+# esta' ofertando. Dela sai o titulo, os atributos tecnicos, a descricao e as
+# fotos.
+#
+# ARQUITETURA — identificar, depois abrir pelo metodo DAQUELA fonte:
+#
+#     link -> identificar_fonte() -> adaptador -> FichaOrigem
+#
+# Nao e' cascata cega nem "tenta um, tenta outro". Cada fonte tem UM metodo
+# certo, escolhido pelo formato da URL. O que existe de fallback e' outro
+# MECANISMO (ler o HTML), nao uma segunda tentativa do mesmo.
+#
+# O que motivou: o leitor de codigo de barras tinha link
+# `.../p/mlb23124285`. O codigo antigo chamava `/items/MLB23124285` para
+# qualquer URL do ML — e catalogo nao esta' em /items, esta' em /products.
+# Devolvia 404, o log registrava "nenhuma candidata", e o item saia sem foto
+# tendo foto boa no anuncio.
+# ══════════════════════════════════════════════════════════════════════════
+_RX_MLB = re.compile(r"\b(MLB[UP]?)-?(\d{6,})", re.I)
 _RX_META = re.compile(
     r'<meta[^>]+(?:property|name)\s*=\s*["\'](?:og:image(?::secure_url)?|twitter:image)["\']'
     r'[^>]*content\s*=\s*["\']([^"\']+)["\']', re.I)
@@ -477,19 +527,19 @@ _RX_ATRIB = re.compile(
 _RX_LINK_IMG = re.compile(
     r'<link[^>]+rel=["\']image_src["\'][^>]*href=["\']([^"\']+)["\']', re.I)
 
-# Nao e' foto de produto. Filtro DETERMINISTICO, antes de gastar chamada de visao.
-# Nasceu de um caso real: a pagina do fabricante ADATA devolvia
-# `adata_logo_1200_630.png` como og:image; a visao recusou certo, mas era a unica
-# candidata e o item ficou sem foto.
+# Nao e' foto de produto. Filtro DETERMINISTICO, antes de gastar chamada de
+# visao. Nasceu de um caso real: a pagina do fabricante ADATA devolvia
+# `adata_logo_1200_630.png` como og:image; a visao recusou certo, mas era a
+# unica candidata e o item ficou sem foto.
 _LIXO_IMAGEM = re.compile(
     r'logo|logotipo|brand|marca[-_]|icon|sprite|placeholder|banner|bandeira|'
     r'avatar|selo|pixel|spacer|blank|loading|spinner|whatsapp|facebook|instagram|'
     r'youtube|twitter|linkedin|pagamento|payment|boleto|pix[-_]|cartao|visa|master|'
     r'carrinho|cart[-_]|favicon|thumb[-_]?nail[-_]?default|sem[-_]imagem|no[-_]image',
     re.I)
-# Ao contrario, isto CHEIRA a foto de produto.
 _BOM_IMAGEM = re.compile(r'produto|product|media|imagens?|images?|photo|foto|upload|catalog',
                          re.I)
+_RX_TAG = re.compile(r"<(script|style|noscript)[^>]*>.*?</\1>", re.I | re.S)
 
 
 def _pontua_imagem(url: str) -> int:
@@ -521,31 +571,25 @@ def _absoluta(url: str, base: str) -> str:
 
 
 def urls_de_imagem(html: str, base_url: str = "") -> List[str]:
-    """Candidatas a foto do produto numa página de loja/fabricante.
-
-    Regex em vez de BeautifulSoup de propósito: evita mais uma dependência de
-    produção para ganhar pouco.
+    """Candidatas a foto do produto no HTML de uma loja ou fabricante.
 
     TRES CAMADAS, nesta ordem de confianca:
-      1. og:image / twitter:image — convencao estavel, quem publica produto quer
-         que o link fique bonito no WhatsApp;
+      1. og:image / twitter:image — convencao estavel;
       2. JSON-LD (schema.org/Product) — dado estruturado;
       3. as tags <img> da pagina — a rede de baixo.
 
     A camada 3 nasceu de um caso real: a memoria ADATA da mazer.com.br nao tem
-    og:image nem JSON-LD; a foto do produto e' um <img> comum, e o item saiu sem
-    imagem nos dois modos. Sem esta camada, toda loja que nao preenche meta tag
-    fica de fora — e sao muitas.
+    og:image nem JSON-LD; a foto e' um <img> comum. Sem ela, toda loja que nao
+    preenche meta tag fica de fora — e sao muitas.
     """
     achadas: List[str] = []
     for rx in (_RX_META, _RX_META_INV):
         for m in rx.finditer(html or ""):
             u = _absoluta(_norm(m.group(1)), base_url)
             # og:image de site de FABRICANTE costuma ser o logo institucional.
-            # Recusar aqui poupa uma chamada de visao e, mais importante, nao
-            # deixa a unica vaga da fila ser gasta com um logotipo.
             if u and u not in achadas and not _LIXO_IMAGEM.search(u):
                 achadas.append(u)
+
     for m in _RX_LDJSON.finditer(html or ""):
         try:
             dado = json.loads(m.group(1))
@@ -556,21 +600,16 @@ def urls_de_imagem(html: str, base_url: str = "") -> List[str]:
             no = pilha.pop()
             if isinstance(no, dict):
                 img = no.get("image")
-                if isinstance(img, str):
-                    u = _absoluta(_norm(img), base_url)
-                    if u and u not in achadas:
-                        achadas.append(u)
-                elif isinstance(img, list):
-                    for i in img:
-                        if isinstance(i, str):
-                            u = _absoluta(_norm(i), base_url)
-                            if u and u not in achadas:
-                                achadas.append(u)
+                alvos = [img] if isinstance(img, str) else (img if isinstance(img, list) else [])
+                for i in alvos:
+                    if isinstance(i, str):
+                        u = _absoluta(_norm(i), base_url)
+                        if u and u not in achadas:
+                            achadas.append(u)
                 pilha.extend(v for v in no.values() if isinstance(v, (dict, list)))
             elif isinstance(no, list):
                 pilha.extend(no)
 
-    # ── Camada 3: <img> da pagina ──────────────────────────────────────────
     for m in _RX_LINK_IMG.finditer(html or ""):
         u = _absoluta(_norm(m.group(1)), base_url)
         if u and u not in achadas:
@@ -578,15 +617,13 @@ def urls_de_imagem(html: str, base_url: str = "") -> List[str]:
 
     brutas: List[str] = []
     for m in _RX_IMG.finditer(html or ""):
-        atrs = m.group(1)
-        for _a, valor in _RX_ATRIB.findall(atrs):
-            # data-uri e' imagem embutida (placeholder de lazy-load). Testar ANTES
-            # de partir por virgula: "data:image/gif;base64,R0lGOD" TEM virgula, e
-            # o split fazia a metade final virar URL candidata.
+        for _a, valor in _RX_ATRIB.findall(m.group(1)):
+            # data-uri e' imagem embutida (placeholder de lazy-load). Testar
+            # ANTES de partir por virgula: "data:image/gif;base64,R0lGOD" TEM
+            # virgula, e o split fazia a metade final virar URL candidata.
             if _norm(valor).lower().startswith("data:"):
                 continue
-            # srcset traz "url 1x, url 2x": fica com a ultima (maior)
-            for pedaco in reversed(valor.split(",")):
+            for pedaco in reversed(valor.split(",")):     # srcset: a maior
                 cru = _norm(pedaco.split()[0]) if pedaco.strip() else ""
                 if not cru or cru.startswith("data:"):
                     continue
@@ -595,38 +632,132 @@ def urls_de_imagem(html: str, base_url: str = "") -> List[str]:
                     brutas.append(u)
                 break
 
-    # Descarta o obvio (logo, icone, selo de pagamento) SEM gastar visao, e
-    # ordena o resto pelo que cheira a foto de produto.
     limpas = [u for u in brutas if not _LIXO_IMAGEM.search(u)]
     limpas.sort(key=_pontua_imagem, reverse=True)
     achadas.extend(limpas[:12])
     return achadas
 
 
-def urls_imagem_mercadolivre(link: str, buscar_json: Callable[[str], Any]) -> List[str]:
-    """API oficial do ML: o item traz `pictures` em alta, sem scraping.
+def identificar_fonte(link: str) -> Dict[str, str]:
+    """Diz QUE fonte e' o link e COMO ela se abre. Deterministico, sem rede."""
+    l = _norm(link)
+    if not l.startswith("http"):
+        return {"fonte": "nenhuma", "metodo": "nenhum", "ident": "", "url_api": ""}
 
-    Cobre a maior fatia dos links da base (287 de 823 itens com origem, dos
-    quais 255 carregam o ID MLB na URL).
+    if re.search(r"mercadolivre\.com|mercadolibre\.com", l, re.I):
+        m = _RX_MLB.search(l)
+        if m:
+            ident = f"{m.group(1).upper()}{m.group(2)}"
+            # O FORMATO DA URL decide o endpoint. Nao e' palpite:
+            #   /p/MLB…  e  /up/MLB…  sao catalogo  -> /products
+            #   MLB-123… e' anuncio                 -> /items
+            catalogo = bool(re.search(r"/(p|up)/\s*MLB", l, re.I)) or \
+                ident.upper().startswith(("MLBU", "MLBP"))
+            rota = "products" if catalogo else "items"
+            return {"fonte": "mercadolivre",
+                    "metodo": "api_catalogo" if catalogo else "api_item",
+                    "ident": ident,
+                    "url_api": f"https://api.mercadolibre.com/{rota}/{ident}"}
+        return {"fonte": "mercadolivre", "metodo": "html", "ident": "", "url_api": ""}
+
+    return {"fonte": "loja", "metodo": "html", "ident": "", "url_api": ""}
+
+
+def _texto_da_pagina(html: str, teto: int = 14000) -> str:
+    """HTML -> texto corrido, para o modelo ler sem gastar token com marcacao."""
+    if not html:
+        return ""
+    limpo = _RX_TAG.sub(" ", html)
+    limpo = re.sub(r"<[^>]+>", " ", limpo)
+    limpo = (limpo.replace("&nbsp;", " ").replace("&amp;", "&")
+                  .replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"'))
+    return re.sub(r"\s+", " ", limpo).strip()[:teto]
+
+
+def abrir_origem(link: str,
+                 buscar_pagina: Callable[[str], str],
+                 buscar_json: Callable[[str], Any]) -> Dict[str, Any]:
+    """Abre o link de origem e devolve TUDO que a pagina tem sobre o item.
+
+    E' a fonte primaria dos dois documentos: alimenta o conteudo (titulo,
+    atributos, descricao) E a foto. Uma leitura, nao varias.
+
+    Devolve sempre um dicionario. `ok=False` + `falha` quando nao deu — nunca
+    silencio, porque foi o silencio que escondeu o 404 do Mercado Livre.
     """
-    m = _RX_MLB.search(link or "")
-    if not m:
-        return []
-    item_id = f"{m.group(1).upper()}{m.group(2)}"
+    ficha: Dict[str, Any] = {
+        "link": _norm(link), "fonte": "nenhuma", "metodo": "nenhum",
+        "ok": False, "falha": "", "titulo": "", "descricao": "",
+        "atributos": [], "imagens": [], "texto": "",
+    }
+    if not _norm(link):
+        ficha["falha"] = "o item não tem link de origem"
+        return ficha
+
+    alvo = identificar_fonte(link)
+    ficha.update({"fonte": alvo["fonte"], "metodo": alvo["metodo"]})
+
+    # ── Mercado Livre: API oficial, endpoint escolhido pelo formato da URL ──
+    if alvo["metodo"] in ("api_item", "api_catalogo"):
+        try:
+            dado = buscar_json(alvo["url_api"])
+        except Exception as e:
+            dado = None
+            ficha["falha"] = f"API do Mercado Livre não respondeu ({type(e).__name__})"
+        if isinstance(dado, dict):
+            for foto in (dado.get("pictures") or []):
+                if isinstance(foto, dict):
+                    u = _norm(foto.get("secure_url") or foto.get("url"))
+                    if u and u not in ficha["imagens"]:
+                        ficha["imagens"].append(u)
+            if not ficha["imagens"] and _norm(dado.get("thumbnail")):
+                ficha["imagens"].append(_norm(dado["thumbnail"]))
+            ficha["titulo"] = _norm(dado.get("name") or dado.get("title"))
+            ficha["descricao"] = _norm(dado.get("short_description")
+                                       or (dado.get("description") or {}).get("plain_text")
+                                       if isinstance(dado.get("description"), dict)
+                                       else dado.get("short_description"))
+            for a in (dado.get("attributes") or []):
+                if not isinstance(a, dict):
+                    continue
+                nome = _norm(a.get("name"))
+                valor = _norm(a.get("value_name") or a.get("value_struct")
+                              or a.get("values") and "")
+                if nome and valor:
+                    ficha["atributos"].append({"nome": nome, "valor": valor})
+            ficha["ok"] = bool(ficha["imagens"] or ficha["atributos"] or ficha["titulo"])
+            if ficha["ok"]:
+                ficha["falha"] = ""
+                return ficha
+            ficha["falha"] = ficha["falha"] or "a API do Mercado Livre não trouxe dados do item"
+
+    # ── Loja / fabricante / ML sem id: ler a pagina ────────────────────────
+    # Mecanismo DIFERENTE, nao segunda tentativa do mesmo.
     try:
-        dado = buscar_json(f"https://api.mercadolibre.com/items/{item_id}")
-    except Exception:
-        return []
-    if not isinstance(dado, dict):
-        return []
-    urls = []
-    for p in (dado.get("pictures") or []):
-        u = _norm(p.get("secure_url") or p.get("url"))
-        if u:
-            urls.append(u)
-    if not urls and _norm(dado.get("thumbnail")):
-        urls.append(_norm(dado["thumbnail"]))
-    return urls
+        html = buscar_pagina(link) or ""
+    except Exception as e:
+        ficha["falha"] = (ficha["falha"] + " · " if ficha["falha"] else "") + \
+            f"não consegui abrir a página ({type(e).__name__})"
+        return ficha
+    if not html.strip():
+        ficha["falha"] = (ficha["falha"] + " · " if ficha["falha"] else "") + \
+            "a página respondeu vazia (pode estar bloqueando acesso automático)"
+        return ficha
+
+    ficha["metodo"] = "html"
+    for u in urls_de_imagem(html, link):
+        if u not in ficha["imagens"]:
+            ficha["imagens"].append(u)
+    ficha["texto"] = _texto_da_pagina(html)
+    m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+    if m:
+        ficha["titulo"] = _norm(m.group(1))[:200]
+    ficha["ok"] = bool(ficha["imagens"] or ficha["texto"])
+    if ficha["ok"]:
+        ficha["falha"] = ""
+    elif not ficha["falha"]:
+        ficha["falha"] = "abri a página mas não encontrei nem foto nem texto de produto"
+    return ficha
 
 
 def _imagem_utilizavel(dados: bytes) -> Tuple[bool, str]:
@@ -726,71 +857,47 @@ def _mime_de(dados: bytes) -> str:
     return "image/png"
 
 
-def achar_foto(claude, ident: Dict[str, Any], link: str,
+def achar_foto(claude, ident: Dict[str, Any],
+               origem: Dict[str, Any],
                baixar: Callable[[str], bytes],
                buscar_pagina: Callable[[str], str],
-               buscar_json: Callable[[str], Any],
                paginas_oficiais: Optional[List[str]] = None,
-               html_origem: str = "",
+               imagens_web: Optional[List[str]] = None,
                tentativas: int = 8) -> Dict[str, Any]:
-    """Procura a foto real, na ordem de confiança, e CONFIRMA antes de aceitar.
+    """Escolhe a foto entre as que a ORIGEM ja' entregou, e confirma na visao.
 
-    ORDEM DAS FONTES — depende de conhecermos o fabricante:
-      • com fabricante  → página oficial primeiro. A foto do fabricante é limpa,
-        em fundo branco e sem marca d'água de vendedor. É a que combina com um
-        documento que leva o logo da KIST.
-      • sem fabricante (item genérico) → anúncio/loja primeiro, porque não
-        existe página oficial para procurar.
+    Nao busca de novo: `abrir_origem` ja' abriu o link pelo metodo certo e
+    trouxe as imagens. Aqui so' filtramos, ordenamos e confirmamos.
 
-    Item SEM link também procura: as páginas oficiais vêm da busca web feita no
-    levantamento das specs. Antes disso, item sem link saía sempre sem foto —
-    e a maioria dos itens sem link é perfeitamente encontrável.
+    ORDEM — a origem primeiro, sempre. O site do fabricante e' reforco.
+    Eu tinha invertido isso, colocando o fabricante na frente quando a marca
+    era conhecida. O caso da memoria ADATA mostrou o erro: o fabricante
+    devolveu o LOGOTIPO como og:image, a visao recusou (certo), e o item ficou
+    sem foto tendo foto boa na origem. A origem e' do ITEM EXATO; o fabricante
+    e' da linha de produtos.
 
-    Sem candidata confirmada, devolve `imagem=None` e o motivo. O endpoint pede
-    a foto ao operador em vez de inventar.
+    Sem candidata confirmada, devolve `imagem=None` e o motivo — nunca uma foto
+    parecida. O endpoint pede a foto ao operador em vez de inventar.
     """
-    oficiais = [u for u in (paginas_oficiais or []) if _norm(u).startswith("http")]
+    recusadas: List[str] = []
+    candidatas: List[Tuple[str, str]] = [(u, "anuncio") for u in (origem.get("imagens") or [])]
 
-    def _do_anuncio() -> List[Tuple[str, str]]:
-        saida: List[Tuple[str, str]] = []
-        for u in urls_imagem_mercadolivre(link, buscar_json):
-            saida.append((u, "anuncio"))
-        if link and not saida:
-            # `gerar()` ja' leu esta pagina. Reusar evita a segunda requisicao e
-            # garante que a extracao veja exatamente o mesmo HTML.
-            html = html_origem
-            if not html:
-                try:
-                    html = buscar_pagina(link)
-                except Exception:
-                    html = ""
-            for u in urls_de_imagem(html or "", link):
-                saida.append((u, "anuncio"))
-        return saida
+    # A origem nao rendeu foto? Registra POR QUE, antes de partir pro fabricante.
+    if not candidatas:
+        recusadas.append(f"origem ({origem.get('fonte') or 'link'}): "
+                         f"{origem.get('falha') or 'nenhuma imagem na página'}")
 
-    def _do_fabricante() -> List[Tuple[str, str]]:
-        saida: List[Tuple[str, str]] = []
-        for pagina_url in oficiais[:3]:
-            try:
-                html = buscar_pagina(pagina_url)
-            except Exception:
-                continue
-            for u in urls_de_imagem(html or "", pagina_url):
-                saida.append((u, "fabricante"))
-        return saida
+    for u in [x for x in (imagens_web or []) if _norm(x).startswith("http")][:4]:
+        candidatas.append((u, "busca"))
 
-    # ORDEM — o ANUNCIO DO PROPRIO ITEM vem primeiro, sempre.
-    #
-    # Eu tinha colocado o fabricante na frente quando a marca era conhecida,
-    # argumentando que a foto dele e' mais limpa. O caso da memoria ADATA
-    # mostrou o contrario: o site do fabricante devolveu o logotipo
-    # institucional como og:image, a visao recusou (certo), e o item ficou sem
-    # foto mesmo tendo foto boa na pagina de origem.
-    #
-    # A pagina de origem e' a do ITEM EXATO que estamos ofertando. O site do
-    # fabricante e' da linha de produtos. Origem primeiro, fabricante como
-    # reforco.
-    candidatas = _do_anuncio() + _do_fabricante()
+    for pagina_url in [u for u in (paginas_oficiais or []) if _norm(u).startswith("http")][:3]:
+        try:
+            html = buscar_pagina(pagina_url)
+        except Exception as e:
+            recusadas.append(f"{pagina_url[:60]} — não abriu ({type(e).__name__})")
+            continue
+        for u in urls_de_imagem(html or "", pagina_url):
+            candidatas.append((u, "fabricante"))
 
     vistas, fila = set(), []
     for u, de_onde in candidatas:
@@ -798,7 +905,6 @@ def achar_foto(claude, ident: Dict[str, Any], link: str,
             vistas.add(u)
             fila.append((u, de_onde))
 
-    recusadas: List[str] = []
     for url, de_onde in fila[:tentativas]:
         try:
             dados = baixar(url)
@@ -844,17 +950,11 @@ def gerar(claude, item: Dict[str, Any], logo_bytes: bytes,
     comercial = (modo == "comercial")
 
     link = _norm(item.get("link_fornecedor"))
-    pagina = ""
-    # OS DOIS MODOS leem a pagina de origem. A diferenca esta' no RESTO:
-    #   tecnico   -> pagina + busca web (fabricante, catalogos, fontes tecnicas)
-    #   comercial -> SOMENTE a pagina de origem. Nada de busca web.
-    # Ler a origem no comercial nao e' "buscar em outra fonte": e' ler o anuncio
-    # do proprio item. E' o que impede o modelo de escrever a spec de memoria.
-    if link:
-        try:
-            pagina = (buscar_pagina(link) or "")[:20000]
-        except Exception:
-            pagina = ""
+
+    # UMA leitura da origem, usada por tudo: conteudo E foto.
+    #   tecnico   -> origem + busca web (fabricante, catalogos)
+    #   comercial -> SOMENTE a origem
+    origem = abrir_origem(link, buscar_pagina, buscar_json)
 
     if comercial:
         # Sem etapa de identificação: o prompt do Fábio parte da descrição do
@@ -869,12 +969,12 @@ def gerar(claude, item: Dict[str, Any], logo_bytes: bytes,
         }
     else:
         ident = identificar(claude, item, fonte_texto=fonte_texto,
-                            pagina=pagina, pistas=pistas)
+                            origem=origem, pistas=pistas)
         if ident.get("precisa_operador"):
             return {"etapa": "identificacao", "precisa_operador": True,
                     "identificacao": ident, "avisos": ident.get("descartado") or []}
 
-    contexto = contexto_do_item(item, fonte_texto, pagina)
+    contexto = contexto_do_item(item, fonte_texto, origem)
     if comercial and _norm(pistas):
         contexto += f"\n\n### ORIENTAÇÃO DO OPERADOR\n{pistas}"
     conteudo = montar_conteudo(claude, ident, contexto,
@@ -890,9 +990,9 @@ def gerar(claude, item: Dict[str, Any], logo_bytes: bytes,
                 {"imagem": None, "mime": "", "url": "", "origem": "ausente",
                  "recusadas": [f"arquivo do operador: {nota}"], "nota": nota})
     else:
-        foto = achar_foto(claude, ident, link, baixar, buscar_pagina, buscar_json,
+        foto = achar_foto(claude, ident, origem, baixar, buscar_pagina,
                           paginas_oficiais=conteudo.get("paginas_oficiais") or [],
-                          html_origem=pagina)
+                          imagens_web=conteudo.get("imagens_encontradas") or [])
 
     # ── Regra 6: varredura determinística antes de desenhar ────────────────
     problemas = validar_dados(conteudo)
@@ -914,17 +1014,25 @@ def gerar(claude, item: Dict[str, Any], logo_bytes: bytes,
     avisos += [f"⚠ ainda proibido após limpeza: {p}" for p in problemas_restantes]
     avisos += [f"não confirmado: {i}" for i in (conteudo.get("incertezas") or [])]
 
-    if comercial:
-        if pagina:
-            avisos.append("modo apresentação comercial: montado SÓ com a página de "
-                          "origem do item, sem busca na internet")
-        elif link:
-            avisos.append("modo apresentação comercial: não consegui ler a página de "
-                          "origem — as especificações saíram do modelo, confira uma a uma")
-        else:
-            avisos.append("modo apresentação comercial: este item não tem link de "
-                          "origem, então não houve fonte nenhuma — as especificações "
-                          "saíram do modelo, confira uma a uma")
+    # A ORIGEM e' a fonte primaria dos dois documentos. Quando ela falha, o
+    # operador precisa saber ANTES de aprovar — e precisa saber POR QUE, nao
+    # so' que "nao deu". Silencio aqui foi o que escondeu o 404 do Mercado
+    # Livre por duas rodadas de teste.
+    if origem.get("ok"):
+        detalhe = []
+        if origem.get("imagens"):
+            detalhe.append(f"{len(origem['imagens'])} imagem(ns)")
+        if origem.get("atributos"):
+            detalhe.append(f"{len(origem['atributos'])} atributo(s)")
+        if comercial:
+            avisos.append("apresentação montada SÓ com a página de origem"
+                          + (f" ({' e '.join(detalhe)})" if detalhe else "")
+                          + ", sem busca na internet")
+    else:
+        avisos.append(f"não consegui usar a página de origem: {origem.get('falha')}")
+        if comercial:
+            avisos.append("sem a origem, as especificações saíram do modelo — "
+                          "confira uma a uma antes de aprovar")
 
     return {
         "etapa": "pronto",
