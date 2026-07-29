@@ -1,53 +1,85 @@
 // ─────────────────────────────────────────────────────────────────────────
-// DATASHEET (chamado #6 — Fábio)
+// DOCUMENTOS DO ITEM (chamado #6 — Fábio)
 //
-// O cliente pede a ficha técnica dos itens ofertados. Antes disso o operador
-// copiava link por link no ChatGPT, esperava e baixava cada PDF na mão.
+// DOIS documentos IRMÃOS, nunca o mesmo em dois modos:
 //
-// Vive em arquivo próprio de propósito: o App.jsx tem 2.450 linhas, e feature
-// nova enfiada lá dentro é retrabalho caro na próxima. Aqui o App só monta
-// <DatasheetBotao/> e <DatasheetLote/>.
+//   • DATASHEET TÉCNICO      — identifica o produto, lê a página de origem E
+//                              busca ficha técnica na internet (fabricante,
+//                              catálogos). Mais lento, spec de fonte consultada.
+//   • APRESENTAÇÃO COMERCIAL — o prompt do Fábio, cru, usando SOMENTE a página
+//                              de origem do item. Sem busca web. Mais rápido.
 //
-// FLUXO (decidido com o Leonardo):
-//   selo → gerar → [identificação, se ambígua] → revisão → aprovar
-//   Aprovado = dado do produto. Não regera, não repede aprovação.
-//   Reprovar SEMPRE pede um texto: sem a crítica escrita, a regeração é
-//   sorteio novo em vez de correção.
+// Cada um tem a sua linha em `datasheets`, o seu vínculo no item
+// (`datasheet_id` / `apresentacao_id`), o seu cache e a sua aprovação.
+// Pedir apresentação nunca devolve o datasheet — foi o bug que o Leonardo
+// pegou testando, porque eu tinha modelado como um documento só com dois modos.
+//
+// Cada modo tem geração individual (selo no item) e em lote (barra de ações).
+//
+// Vive em arquivo próprio: o App.jsx tem 2.450 linhas e feature nova enfiada
+// lá dentro é retrabalho caro na próxima.
 // ─────────────────────────────────────────────────────────────────────────
 import { useState, useRef, useEffect, useCallback } from "react";
 import { btnPrimary, btnGhost, IconX, IconCheck, IconDownload, IconBolt } from "./kist-ui.jsx";
 
-// ── Selo do item ─────────────────────────────────────────────────────────
+// Tudo que difere entre os dois irmãos mora aqui. Um lugar só — duas cópias
+// divergem em três meses (a lição do `lerContato`).
+const DOC = {
+  tecnico: {
+    campo: "datasheet_id",
+    curto: "datasheet",
+    titulo: "Datasheet técnico",
+    verbo: "Gerar datasheet",
+    lote: "Gerar datasheets",
+    fonte: "página de origem + busca na internet",
+    ajuda: "Identifica o produto, lê a página de origem e busca a ficha técnica " +
+           "na internet. Mais lento, e as specs vêm de fonte consultada.",
+  },
+  comercial: {
+    campo: "apresentacao_id",
+    curto: "apresentação",
+    titulo: "Apresentação comercial",
+    verbo: "Gerar apresentação",
+    lote: "Gerar apresentações",
+    fonte: "só a página de origem",
+    ajuda: "Monta usando só a página de origem do item, sem busca na internet. " +
+           "Mais rápido. Item sem link de origem sai sem fonte — aí a sua " +
+           "revisão é a única conferência.",
+  },
+};
+
+// ── Selo do item (um por modo) ───────────────────────────────────────────
 export function DatasheetBotao({ item, index, onChange, token, apiUrl, fonteTexto,
-  propostaId, onSalvar }) {
+  propostaId, onSalvar, modo = "tecnico" }) {
   const [aberto, setAberto] = useState(false);
+  const cfg = DOC[modo] || DOC.tecnico;
 
-  // Três estados visuais, e eles vêm de campos DIFERENTES de propósito:
-  //  • datasheet_id            → vinculado (persistido; sobrevive ao reload)
-  //  • datasheet_disponivel    → o produto do banco tem um, mas o veredito não
-  //                              foi "mesmo", então o operador decide
-  //  • nada                    → oferece gerar
-  const vinculado = item.datasheet_id || null;
-  const disponivel = item.datasheet_disponivel || item.banco?.datasheet_id || null;
+  // Três estados, de campos DIFERENTES de propósito:
+  //  • <campo>              → vinculado (persistido; sobrevive ao reload)
+  //  • <campo>_disponivel   → o produto do banco tem um, mas o veredito não foi
+  //                           "mesmo", então quem decide é o operador
+  //  • nada                 → oferece gerar
+  const vinculado = item[cfg.campo] || null;
+  const disponivel = item[`${cfg.campo}_disponivel`] || item.banco?.[cfg.campo] || null;
 
-  const rotulo = vinculado ? "✓ datasheet"
-    : disponivel ? "datasheet do banco"
-    : "+ datasheet";
+  const rotulo = vinculado ? `✓ ${cfg.curto}`
+    : disponivel ? `${cfg.curto} do banco`
+    : `+ ${cfg.curto}`;
   const cor = vinculado ? "text-kist" : disponivel ? "text-amber" : "text-faint";
 
   return (
     <>
       <button onClick={() => setAberto(true)}
-        title={vinculado ? "Ver / baixar o datasheet deste item"
-          : disponivel ? "O produto do banco tem datasheet — conferir se serve para este item"
-          : "Gerar datasheet técnico deste item"}
+        title={vinculado ? `Ver / baixar: ${cfg.titulo}`
+          : disponivel ? `O produto do banco tem ${cfg.curto} — conferir se serve para este item`
+          : `${cfg.verbo} deste item · ${cfg.fonte}`}
         className={`text-[11px] hover:text-sub ${cor}`}>
         {rotulo}
       </button>
       {aberto && (
         <DatasheetPainel item={item} index={index} onChange={onChange}
           token={token} apiUrl={apiUrl} fonteTexto={fonteTexto}
-          propostaId={propostaId} onSalvar={onSalvar}
+          propostaId={propostaId} onSalvar={onSalvar} modo={modo}
           onFechar={() => setAberto(false)} />
       )}
     </>
@@ -56,12 +88,14 @@ export function DatasheetBotao({ item, index, onChange, token, apiUrl, fonteText
 
 // ── Painel ───────────────────────────────────────────────────────────────
 function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto,
-  propostaId, onSalvar, onFechar,
+  propostaId, onSalvar, onFechar, modo = "tecnico",
   // Fila do "gerar todos": mesma tela, um item por vez.
-  //   autoGerar = modo; gera sozinho ao abrir, sem a tela de escolha
+  //   autoGerar = true; gera sozinho ao abrir, sem tela de confirmação
   //   lote      = { posicao, total, onProximo, onPular }
-  autoGerar = "", lote = null }) {
-  const [fase, setFase] = useState("carregando");  // carregando|gerando|identificacao|revisao|erro
+  autoGerar = false, lote = null }) {
+  const cfg = DOC[modo] || DOC.tecnico;
+
+  const [fase, setFase] = useState("carregando");  // carregando|vazio|gerando|identificacao|revisao|erro
   const [ds, setDs] = useState(null);
   const [ident, setIdent] = useState(null);
   const [pistas, setPistas] = useState("");
@@ -71,9 +105,6 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto,
   const [urlFoto, setUrlFoto] = useState("");
   const [erro, setErro] = useState("");
   const [cache, setCache] = useState(null);
-  // "tecnico" = identifica + busca web + valida · "comercial" = so' o prompt do
-  // Fabio, cru, sem fonte externa. A regeracao herda o modo da versao atual.
-  const [modo, setModo] = useState(autoGerar || "tecnico");
   const arquivoRef = useRef(null);
   const vivo = useRef(true);
 
@@ -85,7 +116,6 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto,
 
   const produtoId = item.banco?.produto_id || null;
 
-  // ── Chamadas ───────────────────────────────────────────────────────────
   const gerar = useCallback(async (extra = {}) => {
     setFase("gerando"); setErro("");
     try {
@@ -100,9 +130,7 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto,
       if (!res.ok) throw new Error(d.detail || "falhou ao gerar");
       if (!vivo.current) return;
       if (d.precisa_operador) {
-        setIdent(d.identificacao || {});
-        setFase("identificacao");
-        return;
+        setIdent(d.identificacao || {}); setFase("identificacao"); return;
       }
       setDs(d); setCritica(""); setMostrarCritica(false); setFase("revisao");
     } catch (e) {
@@ -111,37 +139,35 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto,
     }
   }, [apiUrl, cabecalhos, item, produtoId, fonteTexto, pistas, modo]);
 
-  // Abertura: vinculado → carrega; senão procura no cache antes de gastar geração.
+  // Abertura: vinculado → carrega; senão procura no cache DESTE MODO antes de
+  // gastar geração. O `modo` no cache é o que impede a apresentação de abrir
+  // mostrando o datasheet.
   useEffect(() => {
     let cancelado = false;
     (async () => {
-      const id = item.datasheet_id || item.datasheet_disponivel || item.banco?.datasheet_id;
+      const id = item[cfg.campo] || item[`${cfg.campo}_disponivel`] || item.banco?.[cfg.campo];
       try {
         if (id) {
           const r = await fetch(`${apiUrl}/datasheets/${id}`, { headers: cabecalhos() });
           if (r.ok) {
             const d = await r.json();
             if (cancelado) return;
-            setDs(d); setModo(d.modo || "tecnico"); setFase("revisao"); return;
+            setDs(d); setFase("revisao"); return;
           }
         }
-        const p = new URLSearchParams();
+        const p = new URLSearchParams({ modo });
         if (produtoId) p.set("produto_id", produtoId);
         if (item.link_fornecedor) p.set("link", item.link_fornecedor);
         if (item.descricao_final) p.set("descricao", item.descricao_final);
         const r2 = await fetch(`${apiUrl}/datasheets?${p.toString()}`, { headers: cabecalhos() });
         const d2 = r2.ok ? await r2.json() : { achou: false };
         if (cancelado) return;
-        if (d2.achou) {
-          setCache(d2); setDs(d2.datasheet);
-          setModo(d2.datasheet?.modo || "tecnico"); setFase("revisao"); return;
-        }
-        // Na fila não perguntamos o modo item a item — ele foi escolhido no botão.
-        if (autoGerar) { gerar({ modo: autoGerar }); return; }
+        if (d2.achou) { setCache(d2); setDs(d2.datasheet); setFase("revisao"); return; }
+        if (autoGerar) { gerar(); return; }
         setFase("vazio");
       } catch {
         if (cancelado) return;
-        if (autoGerar) { gerar({ modo: autoGerar }); return; }
+        if (autoGerar) { gerar(); return; }
         setFase("vazio");
       }
     })();
@@ -168,7 +194,7 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto,
       const d = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(d.detail || "falhou ao aprovar");
       setDs(d);
-      onChange(index, "datasheet_id", ds.id);
+      onChange(index, cfg.campo, ds.id);
       // Grava agora, sem esperar o auto-save de 1,5s: o operador aprova e às
       // vezes fecha a aba em seguida. Perder isto obriga a regerar.
       if (typeof onSalvar === "function") { try { await onSalvar(true); } catch { /* nao bloqueia */ } }
@@ -207,11 +233,10 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto,
       onClick={(e) => { if (e.target === e.currentTarget) onFechar(); }}>
       <div className="flex h-[88vh] w-full max-w-5xl flex-col overflow-hidden rounded-xl border border-line bg-surface shadow-xl">
 
-        {/* Cabeçalho */}
         <div className="flex items-center justify-between border-b border-line px-4 py-3">
           <div className="min-w-0">
             <div className="eyebrow text-[9px] font-semibold uppercase text-faint">
-              {lote ? `Documento ${lote.posicao} de ${lote.total}` : "Datasheet técnico"}
+              {cfg.titulo}{lote ? ` · ${lote.posicao} de ${lote.total}` : ""}
             </div>
             <div className="truncate text-[14px] font-semibold text-ink">
               {conteudo.nome_produto || item.descricao_final || item.descricao_original}
@@ -233,44 +258,36 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto,
           </div>
         </div>
 
-        {/* Corpo */}
         <div className="flex min-h-0 flex-1">
-          {/* Preview */}
           <div className="min-w-0 flex-1 bg-paper/60">
             {fase === "gerando" && (
               <div className="flex h-full flex-col items-center justify-center gap-2 text-sub">
                 <span className="inline-block animate-spin"><IconBolt size={20} /></span>
-                <div className="text-[13px]">Identificando o item, levantando a ficha e procurando a foto…</div>
-                <div className="text-[11.5px] text-faint">costuma levar de 20 a 60 segundos</div>
+                <div className="text-[13px]">
+                  {modo === "comercial"
+                    ? "Lendo a página de origem e montando a apresentação…"
+                    : "Identificando o item, levantando a ficha e procurando a foto…"}
+                </div>
+                <div className="text-[11.5px] text-faint">
+                  {modo === "comercial" ? "costuma levar de 10 a 30 segundos"
+                    : "costuma levar de 20 a 60 segundos"}
+                </div>
               </div>
             )}
             {fase === "carregando" && (
               <div className="flex h-full items-center justify-center text-[13px] text-faint">carregando…</div>
             )}
             {fase === "vazio" && (
-              <div className="flex h-full flex-col items-center justify-center gap-4 px-8">
-                <div className="text-center text-[13px] text-sub">Este item ainda não tem documento.</div>
-                <div className="grid w-full max-w-xl grid-cols-2 gap-3">
-                  <button onClick={() => { setModo("tecnico"); gerar({ modo: "tecnico" }); }}
-                    className="rounded-xl border border-line2 bg-surface px-4 py-3 text-left hover:border-kist">
-                    <div className="text-[12.5px] font-semibold text-ink">Datasheet técnico</div>
-                    <div className="mt-1 text-[11px] leading-snug text-faint">
-                      Identifica o produto, busca a ficha técnica na internet e procura a
-                      foto real. Mais lento, e as specs vêm de fonte consultada.
-                    </div>
-                  </button>
-                  <button onClick={() => { setModo("comercial"); gerar({ modo: "comercial" }); }}
-                    className="rounded-xl border border-line2 bg-surface px-4 py-3 text-left hover:border-kist">
-                    <div className="text-[12.5px] font-semibold text-ink">Apresentação comercial</div>
-                    <div className="mt-1 text-[11px] leading-snug text-faint">
-                      Monta usando só a página de origem do item, sem busca na
-                      internet. Mais rápido. Item sem link de origem sai sem fonte —
-                      aí a sua revisão é a única conferência.
-                    </div>
-                  </button>
+              <div className="flex h-full flex-col items-center justify-center gap-3 px-10 text-center">
+                <div className="text-[13px] text-sub">
+                  Este item ainda não tem {cfg.curto}.
                 </div>
-                <div className="text-center text-[11px] text-faint">
-                  Nos dois, nada de preço, fornecedor, marketplace ou link entra no documento.
+                <div className="max-w-md text-[11.5px] leading-snug text-faint">{cfg.ajuda}</div>
+                <button onClick={() => gerar()} className={btnPrimary}>
+                  <IconBolt size={15} /> {cfg.verbo}
+                </button>
+                <div className="text-[11px] text-faint">
+                  Nada de preço, fornecedor, marketplace ou link entra no documento.
                 </div>
               </div>
             )}
@@ -305,16 +322,15 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto,
               </div>
             )}
             {fase === "revisao" && ds?.pdf_url && (
-              <iframe title="datasheet" src={ds.pdf_url} className="h-full w-full border-0" />
+              <iframe title={cfg.titulo} src={ds.pdf_url} className="h-full w-full border-0" />
             )}
           </div>
 
-          {/* Lateral */}
           {fase === "revisao" && ds && (
             <div className="w-[300px] flex-shrink-0 overflow-y-auto border-l border-line px-4 py-3">
               {cache && (
                 <div className="mb-3 rounded-lg border border-kist/30 bg-kist/5 px-3 py-2 text-[11.5px] text-sub">
-                  Já existia um datasheet aprovado para este produto
+                  Já existia {cfg.curto} aprovada para este produto
                   {cache.por === "link" ? " (mesmo link de origem)"
                     : cache.por === "descricao" ? " (mesma descrição)" : ""}. Não gerei de novo.
                 </div>
@@ -327,20 +343,7 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto,
                 </span>
                 <span className="font-mono text-[10.5px] text-faint">v{ds.versao}</span>
               </div>
-              <div className="mt-1 text-[11.5px] text-sub">
-                {(ds.modo || "tecnico") === "comercial"
-                  ? "apresentação comercial · só a página de origem"
-                  : "datasheet técnico · com busca na internet"}
-              </div>
-              <button
-                onClick={() => {
-                  const outro = (ds.modo || "tecnico") === "comercial" ? "tecnico" : "comercial";
-                  setModo(outro); gerar({ datasheet_id: ds.id, modo: outro });
-                }}
-                className="mt-1 text-[11px] text-kist hover:opacity-80">
-                gerar como {(ds.modo || "tecnico") === "comercial"
-                  ? "datasheet técnico" : "apresentação comercial"}
-              </button>
+              <div className="mt-1 text-[11.5px] text-sub">{cfg.titulo} · {cfg.fonte}</div>
 
               <div className="mt-3 eyebrow text-[9px] font-semibold uppercase text-faint">Foto</div>
               <div className={`mt-1 text-[12.5px] ${semFoto ? "text-amber" : "text-ink"}`}>
@@ -395,7 +398,7 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto,
                   // SEMPRE em aba nova. O `download` sozinho não funciona em URL
                   // de outro domínio (o link assinado do Storage é), então o
                   // navegador NAVEGAVA para o PDF na mesma aba e o operador
-                  // perdia a proposta em edição. target="_blank" resolve.
+                  // perdia a proposta em edição.
                   <a href={ds.pdf_url} target="_blank" rel="noopener noreferrer"
                     className={`${btnGhost} w-full justify-center`}>
                     <IconDownload size={14} /> Abrir PDF em nova aba
@@ -435,27 +438,27 @@ function DatasheetPainel({ item, index, onChange, token, apiUrl, fonteTexto,
   );
 }
 
-// ── Lote ─────────────────────────────────────────────────────────────────
+// ── Lote (um por modo) ───────────────────────────────────────────────────
 // NÃO é um painel de progresso. É uma FILA que dirige a MESMA tela de revisão,
 // um item por vez: gera → você confere o PDF → aprova (ou corrige, ou pula) →
-// ele já abre o próximo. Um painelzinho listando "gerado / gerado / gerado"
-// não serve para nada: o operador precisa VER o documento para aprovar.
-//
-// Só entram na fila os itens que ainda não têm documento.
+// abre o próximo. Um painelzinho listando "gerado / gerado / gerado" não serve
+// para nada: o operador precisa VER o documento para aprovar.
 export function DatasheetLote({ itens, token, apiUrl, fonteTexto, onChange,
-  propostaId, onSalvar }) {
-  const [fila, setFila] = useState(null);   // { modo, indices: [], pos, feitos, pulados }
+  propostaId, onSalvar, modo = "tecnico" }) {
+  const cfg = DOC[modo] || DOC.tecnico;
+  const [fila, setFila] = useState(null);   // { indices, pos, feitos, pulados }
 
+  // Só entram os que não têm ESTE documento. O item pode já ter o irmão.
   const pendentes = (itens || [])
     .map((it, i) => ({ it, i }))
-    .filter(({ it }) => !it.datasheet_id &&
+    .filter(({ it }) => !it[cfg.campo] &&
       ((it.descricao_final || "").trim() || (it.descricao_original || "").trim()));
 
-  function iniciar(modo) {
+  function iniciar() {
     if (pendentes.length === 0) return;
     // A lista é congelada no início. Se recalculasse a cada aprovação, o item
     // recém-aprovado sairia dela e a numeração dançaria na frente do operador.
-    setFila({ modo, indices: pendentes.map((p) => p.i), pos: 0, feitos: 0, pulados: 0 });
+    setFila({ indices: pendentes.map((p) => p.i), pos: 0, feitos: 0, pulados: 0 });
   }
 
   function avancar(campo) {
@@ -467,7 +470,7 @@ export function DatasheetLote({ itens, token, apiUrl, fonteTexto, onChange,
         const total = f.indices.length;
         const feitos = cont.feitos;
         setTimeout(() => window.alert(
-          `Fim da fila: ${feitos} de ${total} documento(s) aprovado(s).` +
+          `Fim da fila: ${feitos} de ${total} ${cfg.curto}(s) aprovada(s).` +
           (cont.pulados ? ` ${cont.pulados} pulado(s).` : "")
         ), 60);
         return null;
@@ -482,27 +485,21 @@ export function DatasheetLote({ itens, token, apiUrl, fonteTexto, onChange,
   return (
     <>
       {!fila && (
-        <>
-          <button onClick={() => iniciar("tecnico")} className={`${btnGhost} text-[12px]`}
-            title="Datasheet técnico: identifica, busca a ficha na internet e a foto real. Um por vez, com sua aprovação.">
-            Gerar datasheets ({pendentes.length})
-          </button>
-          <button onClick={() => iniciar("comercial")} className={`${btnGhost} text-[12px]`}
-            title="Apresentação comercial: monta só com a página de origem do item. Um por vez, com sua aprovação.">
-            Gerar apresentações ({pendentes.length})
-          </button>
-        </>
+        <button onClick={iniciar} className={`${btnGhost} text-[12px]`}
+          title={`${cfg.ajuda} Um por vez, com sua aprovação.`}>
+          {cfg.lote} ({pendentes.length})
+        </button>
       )}
 
       {fila && atual != null && itens[atual] && (
         // key força remontagem a cada item: estado, crítica e foto do anterior
         // não podem vazar para o próximo.
         <DatasheetPainel
-          key={`${atual}-${fila.pos}`}
-          item={itens[atual]} index={atual}
+          key={`${modo}-${atual}-${fila.pos}`}
+          item={itens[atual]} index={atual} modo={modo}
           onChange={onChange} token={token} apiUrl={apiUrl}
           fonteTexto={fonteTexto} propostaId={propostaId} onSalvar={onSalvar}
-          autoGerar={fila.modo}
+          autoGerar
           lote={{
             posicao: fila.pos + 1,
             total: fila.indices.length,

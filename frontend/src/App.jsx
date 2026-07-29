@@ -522,11 +522,15 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
               className={`text-[11px] hover:text-sub ${temOrigem ? "text-kist" : "text-faint"}`}>
               {mostrarOrigem ? "− origem do preço" : temOrigem ? "✓ origem do preço" : "+ origem do preço"}
             </button>
-            {/* Datasheet: mesma natureza da origem — é DADO do produto, viaja com
-                ele para o banco quando aprovado, e o selo acende vindo de lá. */}
+            {/* Os dois documentos do item, irmãos e independentes. Mesma natureza
+                da origem — são DADO do produto, viajam com ele para o banco
+                quando aprovados, e os selos acendem vindo de lá. */}
             <DatasheetBotao item={item} index={index} onChange={onChange}
               token={token} apiUrl={apiUrl} fonteTexto={fonteTexto}
-              propostaId={propostaId} onSalvar={onSalvar} />
+              propostaId={propostaId} onSalvar={onSalvar} modo="tecnico" />
+            <DatasheetBotao item={item} index={index} onChange={onChange}
+              token={token} apiUrl={apiUrl} fonteTexto={fonteTexto}
+              propostaId={propostaId} onSalvar={onSalvar} modo="comercial" />
             {onRemove && (
               <button
                 onClick={() => { if (window.confirm(`Excluir "${(item.descricao_final || "este item").slice(0, 50)}" da proposta?`)) onRemove(index); }}
@@ -1672,7 +1676,10 @@ export default function App() {
         // id da linha e datasheet vinculado: SAO persistidos, e sem trazer de
         // volta o selo morre no reload e o operador regera o mesmo documento.
         id:                   it.id || null,
+        // Os dois documentos irmãos. São persistidos; sem trazer de volta,
+        // os selos morrem no reload e o operador regera o que já aprovou.
         datasheet_id:         it.datasheet_id || null,
+        apresentacao_id:      it.apresentacao_id || null,
         obs:                  it.obs_interna || "",
         fornecedor:           it.fornecedor || null,
         fornecedor_canal:     it.fornecedor_canal || "",
@@ -2008,7 +2015,10 @@ export default function App() {
                     </button>
                     <DatasheetLote itens={prop.itens || []} token={token} apiUrl={API}
                       fonteTexto={prop.fonte_texto} onChange={atualizarItem}
-                      propostaId={propostaId} onSalvar={salvarRascunho} />
+                      propostaId={propostaId} onSalvar={salvarRascunho} modo="tecnico" />
+                    <DatasheetLote itens={prop.itens || []} token={token} apiUrl={API}
+                      fonteTexto={prop.fonte_texto} onChange={atualizarItem}
+                      propostaId={propostaId} onSalvar={salvarRascunho} modo="comercial" />
                     <button onClick={() => baixarCSV(propostaIdx)} disabled={loading || salvandoBanco || jaBaixado} className={btnPrimary}>
                       {salvandoBanco
                         ? <><span className="inline-block animate-spin"><IconBolt size={15} /></span> Salvando…</>

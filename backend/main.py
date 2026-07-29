@@ -1708,12 +1708,13 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
         # O datasheet aprovado e' dado do produto, igual a origem: viaja pro banco
         # junto com o preco. Sem isto, o documento fica preso na proposta e o
         # mesmo item precisa ser regerado na proxima cotacao.
-        try:
-            _dsid = item.get("datasheet_id")
-            if _dsid not in (None, "", 0, "0", False):
-                origem["datasheet_id"] = int(_dsid)
-        except (TypeError, ValueError):
-            pass
+        for _campo in ("datasheet_id", "apresentacao_id"):
+            try:
+                _v = item.get(_campo)
+                if _v not in (None, "", 0, "0", False):
+                    origem[_campo] = int(_v)
+            except (TypeError, ValueError):
+                pass
 
         # IDENTIDADE (A) — quando o item CASOU (idêntico) com uma linha do banco na
         # geração, o front devolve o `banco_id`. Atualiza ELA — sem procurar por texto
@@ -2307,6 +2308,7 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
             "sku_fornecedor":       i.get("sku_fornecedor", ""),
             "obs_interna":          i.get("obs_interna", ""),
             "datasheet_id":         i.get("datasheet_id") or None,
+            "apresentacao_id":      i.get("apresentacao_id") or None,
         } for i in itens]
         sb.table("itens_proposta").insert(rows).execute()
 
@@ -4917,11 +4919,22 @@ def _ds_para_front(row: dict, com_url: bool = True) -> dict:
         "foto": payload.get("foto") or {},
         "avisos": payload.get("avisos") or [],
         "nome_arquivo": payload.get("nome_arquivo") or "",
-        "modo": payload.get("modo") or "tecnico",
+        "modo": row.get("modo") or payload.get("modo") or "tecnico",
         "aprovado_por": row.get("aprovado_por") or "",
         "aprovado_em": str(row.get("aprovado_em") or ""),
         "pdf_url": _ds_signed(row.get("pdf_path") or "") if com_url else "",
     }
+
+
+# Datasheet tecnico e apresentacao comercial sao DOCUMENTOS IRMAOS do mesmo
+# item — nao dois modos do mesmo documento. Cada um tem a sua linha em
+# `datasheets`, o seu vinculo no item e no produto, e o seu proprio cache.
+# Pedir apresentacao nunca pode devolver o datasheet, e vice-versa.
+DS_CAMPO = {"tecnico": "datasheet_id", "comercial": "apresentacao_id"}
+
+
+def _ds_campo(modo: str) -> str:
+    return DS_CAMPO.get((modo or "tecnico").strip().lower(), "datasheet_id")
 
 
 def _ds_chave_link(link: str) -> str:
@@ -5058,6 +5071,7 @@ async def datasheet_gerar(payload: DatasheetGerarIn, usuario: str = Depends(veri
         "imagem_path": img_path or None,
         "imagem_origem": (r.get("foto") or {}).get("origem") or "ausente",
         "pdf_path": pdf_path,
+        "modo": _modo,
         "status": "rascunho",
         "versao": versao,
         "critica": payload.critica or "",
@@ -5126,11 +5140,13 @@ async def datasheet_aprovar(ds_id: int, payload: DatasheetAprovarIn,
 
     # Vínculo nos dois lados. Falhar aqui não derruba a aprovação — o PDF já
     # existe e o operador já pode baixar.
-    vinculos = {"produto": False, "item": False}
+    # O campo depende do MODO da linha aprovada: datasheet e apresentacao sao
+    # irmaos e nunca ocupam a mesma coluna.
+    _campo = _ds_campo(r.data[0].get("modo") or "tecnico")
+    vinculos = {"produto": False, "item": False, "campo": _campo}
     if _pid:
         try:
-            sb.table("produtos").update({"datasheet_id": ds_id})\
-              .eq("id", _pid).execute()
+            sb.table("produtos").update({_campo: ds_id}).eq("id", _pid).execute()
             vinculos["produto"] = True
         except Exception:
             pass
@@ -5140,7 +5156,7 @@ async def datasheet_aprovar(ds_id: int, payload: DatasheetAprovarIn,
     # conferencia nao persistia nada e o operador regerava o mesmo documento.
     if payload.item_id:
         try:
-            sb.table("itens_proposta").update({"datasheet_id": ds_id})\
+            sb.table("itens_proposta").update({_campo: ds_id})\
               .eq("id", payload.item_id).execute()
             vinculos["item"] = True
         except Exception:
@@ -5153,7 +5169,7 @@ async def datasheet_aprovar(ds_id: int, payload: DatasheetAprovarIn,
             _linhas = _it.data or []
             if 0 <= payload.indice < len(_linhas):
                 sb.table("itens_proposta")\
-                  .update({"datasheet_id": ds_id})\
+                  .update({_campo: ds_id})\
                   .eq("id", _linhas[payload.indice]["id"]).execute()
                 vinculos["item"] = True
         except Exception:
@@ -5200,29 +5216,43 @@ async def datasheet_ver(ds_id: int, usuario: str = Depends(verificar_token)):
 async def datasheet_buscar(produto_id: Optional[int] = None,
                            link: Optional[str] = None,
                            descricao: Optional[str] = None,
+                           modo: Optional[str] = "tecnico",
                            usuario: str = Depends(verificar_token)):
-    """Cache: existe datasheet APROVADO para este produto?
+    """Cache: existe documento APROVADO DESTE MODO para este item?
 
-    Ordem das chaves: produto do banco → link normalizado → descrição
-    normalizada. É o que evita regerar (e repagar) o mesmo documento.
+    O `modo` e' filtro obrigatorio. Sem ele, pedir apresentacao devolvia o
+    datasheet tecnico que ja' existia — foi exatamente o que o Leonardo viu.
+
+    Ordem das chaves: produto do banco → link normalizado → descricao
+    normalizada. E' o que evita regerar (e repagar) o mesmo documento.
     """
     sb = get_supabase()
-    q = sb.table("datasheets").select("*").eq("status", "aprovado")
+    _m = (modo or "tecnico").strip().lower()
+    if _m not in DS_CAMPO:
+        _m = "tecnico"
+
+    def _q():
+        return sb.table("datasheets").select("*")\
+                 .eq("status", "aprovado").eq("modo", _m)
+
     if produto_id:
-        r = q.eq("produto_id", produto_id).order("id", desc=True).limit(1).execute()
+        r = _q().eq("produto_id", produto_id).order("id", desc=True).limit(1).execute()
         if r.data:
-            return {"achou": True, "por": "produto", "datasheet": _ds_para_front(r.data[0])}
+            return {"achou": True, "por": "produto", "modo": _m,
+                    "datasheet": _ds_para_front(r.data[0])}
     if link:
-        r = sb.table("datasheets").select("*").eq("status", "aprovado")\
-            .eq("chave_link", _ds_chave_link(link)).order("id", desc=True).limit(1).execute()
+        r = _q().eq("chave_link", _ds_chave_link(link))\
+                .order("id", desc=True).limit(1).execute()
         if r.data:
-            return {"achou": True, "por": "link", "datasheet": _ds_para_front(r.data[0])}
+            return {"achou": True, "por": "link", "modo": _m,
+                    "datasheet": _ds_para_front(r.data[0])}
     if descricao:
-        r = sb.table("datasheets").select("*").eq("status", "aprovado")\
-            .eq("chave_desc", _norm_entrada(descricao)).order("id", desc=True).limit(1).execute()
+        r = _q().eq("chave_desc", _norm_entrada(descricao))\
+                .order("id", desc=True).limit(1).execute()
         if r.data:
-            return {"achou": True, "por": "descricao", "datasheet": _ds_para_front(r.data[0])}
-    return {"achou": False, "datasheet": None}
+            return {"achou": True, "por": "descricao", "modo": _m,
+                    "datasheet": _ds_para_front(r.data[0])}
+    return {"achou": False, "modo": _m, "datasheet": None}
 
 
 @app.delete("/datasheets/{ds_id}")
@@ -5254,7 +5284,8 @@ def _ds_marcar_aprovados(sb, itens):
 
     Nao sobrescreve o que o primeiro caminho ja' resolveu.
     """
-    alvos = [it for it in (itens or []) if not it.get("datasheet_id")]
+    alvos = [it for it in (itens or [])
+             if not (it.get("datasheet_id") and it.get("apresentacao_id"))]
     if not alvos:
         return
     descs, links = [], []
@@ -5268,28 +5299,34 @@ def _ds_marcar_aprovados(sb, itens):
     if not descs and not links:
         return
 
+    # Indexado por (modo, chave): datasheet e apresentacao do MESMO item tem a
+    # mesma chave_desc e a mesma chave_link — so' o modo os separa.
     por_desc, por_link = {}, {}
     try:
         if descs:
-            r = sb.table("datasheets").select("id,chave_desc")\
+            r = sb.table("datasheets").select("id,chave_desc,modo")\
                 .eq("status", "aprovado").in_("chave_desc", descs[:200]).execute()
             for x in (r.data or []):
-                por_desc.setdefault(x.get("chave_desc"), x["id"])
+                por_desc.setdefault((x.get("modo") or "tecnico", x.get("chave_desc")), x["id"])
         if links:
-            r = sb.table("datasheets").select("id,chave_link")\
+            r = sb.table("datasheets").select("id,chave_link,modo")\
                 .eq("status", "aprovado").in_("chave_link", links[:200]).execute()
             for x in (r.data or []):
-                por_link.setdefault(x.get("chave_link"), x["id"])
+                por_link.setdefault((x.get("modo") or "tecnico", x.get("chave_link")), x["id"])
     except Exception:
         return                  # selo e' conforto, nao derruba a extracao
 
     for it in alvos:
-        # Link primeiro: e' identidade mais forte que texto.
-        ds_id = por_link.get(_ds_chave_link(it.get("link_fornecedor") or "")) or \
-                por_desc.get(_norm_entrada(it.get("descricao_final")
-                                           or it.get("descricao_original") or ""))
-        if ds_id:
-            it["datasheet_id"] = ds_id
+        chave_l = _ds_chave_link(it.get("link_fornecedor") or "")
+        chave_d = _norm_entrada(it.get("descricao_final")
+                                or it.get("descricao_original") or "")
+        for modo, campo in DS_CAMPO.items():
+            if it.get(campo):
+                continue
+            # Link primeiro: e' identidade mais forte que texto.
+            ds_id = por_link.get((modo, chave_l)) or por_desc.get((modo, chave_d))
+            if ds_id:
+                it[campo] = ds_id
 
 
 def _ds_marcar_itens(sb, itens):
@@ -5316,17 +5353,21 @@ def _ds_marcar_itens(sb, itens):
     if not ids:
         return
     try:
-        r = sb.table("produtos").select("id,datasheet_id").in_("id", ids).execute()
+        r = sb.table("produtos").select("id,datasheet_id,apresentacao_id")\
+              .in_("id", ids).execute()
     except Exception:
         return                      # selo e' conforto, nao pode derrubar extracao
-    mapa = {x["id"]: x.get("datasheet_id") for x in (r.data or []) if x.get("datasheet_id")}
+    mapa = {x["id"]: x for x in (r.data or [])}
     for it in itens or []:
         ficha = it.get("banco") or {}
-        ds_id = mapa.get(ficha.get("produto_id"))
-        if not ds_id:
-            continue
-        ficha["datasheet_id"] = ds_id
-        if (ficha.get("veredito") or "") == "mesmo":
-            it["datasheet_id"] = ds_id          # identidade tecnica confirmada
-        else:
-            it["datasheet_disponivel"] = ds_id  # existe, mas o operador decide
+        linha = mapa.get(ficha.get("produto_id")) or {}
+        confirmado = (ficha.get("veredito") or "") == "mesmo"
+        for campo in ("datasheet_id", "apresentacao_id"):
+            ds_id = linha.get(campo)
+            if not ds_id:
+                continue
+            ficha[campo] = ds_id
+            if confirmado:
+                it[campo] = ds_id                       # identidade tecnica confirmada
+            else:
+                it[f"{campo}_disponivel"] = ds_id       # existe, mas o operador decide
