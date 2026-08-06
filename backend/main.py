@@ -32,6 +32,25 @@ except Exception:
     _mp_tem_no_internet = None
     _MOTOR_PRECOS_OK = False
 
+# ── Ingestão canônica (v3.25) ────────────────────────────────────────────────
+# Protegido igual ao motor: se o módulo faltar, o boot NÃO quebra e o /extrair
+# cai no caminho antigo. Produção não pode ficar de pé só se um arquivo novo
+# subiu junto.
+try:
+    from ingestao import (
+        ler_msg as _ing_ler_msg,
+        ler_email as _ing_ler_email,
+        documento_de_texto as _ing_doc_texto,
+        documento_de_arquivo as _ing_doc_arquivo,
+        montar_payload as _ing_montar_payload,
+        consolidar_itens as _ing_consolidar,
+    )
+    _INGESTAO_OK = True
+except Exception:
+    _ing_ler_msg = _ing_ler_email = _ing_doc_texto = None
+    _ing_doc_arquivo = _ing_montar_payload = _ing_consolidar = None
+    _INGESTAO_OK = False
+
 # Versão do backend. O núcleo do Analista guarda a versão que ele descreve; se as
 # duas divergirem, o agente é avisado de que o conhecimento dele está atrasado.
 # Conhecimento velho não avisa que é velho — ele responde com a mesma confiança
@@ -178,6 +197,13 @@ REGRAS DE CNPJ (o campo mais negligenciado — leia com atenção):
 
 REGRAS GERAIS:
 - Extraia TODOS os itens, inclusive de imagens/prints
+- IMAGENS EMBUTIDAS NO E-MAIL: muitos clientes colam a tabela de itens como IMAGEM no
+  corpo, e não como texto. Leia cada imagem. Junto delas vêm logo, banner e faixa de
+  assinatura, que não têm item nenhum — ignore essas sem comentar. Nunca invente item a
+  partir de logo, telefone, slogan ou selo de rodapé.
+- Quando uma imagem vier precedida de "[imagem de: <assunto>]", ela pertence AQUELE
+  e-mail. Com vários e-mails na mesma leitura, use esse rótulo para saber de quem é
+  cada tabela — o assunto costuma trazer o cliente e o CNPJ.
 - quantidade = número, nunca string
 - Em tabelas com coluna Qtd/Quantidade/QTDE: leia a célula exata da coluna. A quantidade NÃO
   é o número da linha nem o código do item. Verifique cada linha antes de confirmar.
@@ -400,6 +426,89 @@ def _media_type_img(b: bytes) -> str:
     if b[:6] in (b"GIF87a", b"GIF89a"):          return "image/gif"
     if b[:4] == b"RIFF" and b[8:12] == b"WEBP":  return "image/webp"
     return "image/png"
+
+
+def _img_dim(b: bytes) -> tuple:
+    """(largura, altura) lendo SÓ o cabeçalho — sem Pillow, sem decodificar.
+
+    Serve para orçar o custo em tokens e descartar espaçador/pixel de rastreio.
+    Não conhece o formato → (0, 0), e quem chama trata como "não sei" (mantém a
+    imagem). Preferir errar mandando a imagem a errar descartando a cotação.
+    """
+    b = b or b""
+    try:
+        if b[:8] == b"\x89PNG\r\n\x1a\n" and b[12:16] == b"IHDR":
+            return (int.from_bytes(b[16:20], "big"), int.from_bytes(b[20:24], "big"))
+        if b[:6] in (b"GIF87a", b"GIF89a"):
+            return (int.from_bytes(b[6:8], "little"), int.from_bytes(b[8:10], "little"))
+        if b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+            if b[12:16] == b"VP8X":
+                return (int.from_bytes(b[24:27], "little") + 1,
+                        int.from_bytes(b[27:30], "little") + 1)
+            if b[12:16] == b"VP8 ":
+                return (int.from_bytes(b[26:28], "little") & 0x3FFF,
+                        int.from_bytes(b[28:30], "little") & 0x3FFF)
+            if b[12:16] == b"VP8L":
+                n = int.from_bytes(b[21:25], "little")
+                return ((n & 0x3FFF) + 1, ((n >> 14) & 0x3FFF) + 1)
+        if b[:3] == b"\xff\xd8\xff":
+            i, n = 2, len(b)
+            while i + 9 < n:
+                if b[i] != 0xFF:
+                    i += 1
+                    continue
+                marc = b[i + 1]
+                if marc in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                            0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    return (int.from_bytes(b[i + 7:i + 9], "big"),
+                            int.from_bytes(b[i + 5:i + 7], "big"))
+                if marc in (0xD8, 0xD9) or 0xD0 <= marc <= 0xD7:
+                    i += 2
+                    continue
+                i += 2 + int.from_bytes(b[i + 2:i + 4], "big")
+    except Exception:
+        pass
+    return (0, 0)
+
+
+# Orçamento de imagem na extração. O teto ANTIGO era "4 imagens, maior primeiro"
+# — heurística que se inverte: no e-mail do Grupo Cesari a assinatura pesa 27 KB e
+# a tabela de itens pesa 1,4 KB. Agora o teto é por TOKEN (o que de fato custa) e a
+# ORDEM vem da posição no HTML do e-mail (corpo antes da assinatura).
+_IMG_MAX_N       = 16     # teto duro de imagens por chamada
+_IMG_MAX_TOKENS  = 6000   # ~US$ 0,018 de entrada no Sonnet, por extração
+_IMG_MIN_ALTURA  = 12     # px — abaixo disso é faixa/espaçador, nunca tabela
+_IMG_MIN_LARGURA = 40     # px — abaixo disso é bullet/ícone
+_IMG_MIN_AREA    = 1500   # px² — pixel de rastreio
+
+
+def _img_tokens(b: bytes) -> int:
+    """Estimativa de tokens de uma imagem (~ área/750, com o teto de 1568px da API).
+
+    Dimensão desconhecida → estimativa conservadora pelo tamanho em bytes, para o
+    orçamento não ser burlado por um formato que o _img_dim não lê.
+    """
+    w, h = _img_dim(b)
+    if not w or not h:
+        return max(300, min(1600, len(b or b"") // 40))
+    maior = max(w, h)
+    if maior > 1568:                      # a API redimensiona antes de tokenizar
+        fator = 1568 / maior
+        w, h = w * fator, h * fator
+    return max(50, int((w * h) / 750))
+
+
+def _img_descartavel(b: bytes) -> bool:
+    """True só para o que NÃO PODE ser conteúdo: espaçador, filete, pixel.
+
+    Deliberadamente estreito. Não tenta separar banner de tabela por geometria —
+    no Cesari o banner da assinatura é 385x33 e a tabela de itens é 388x38. Não há
+    corte geométrico entre os dois, e chutar aqui é o que apagava a cotação.
+    """
+    w, h = _img_dim(b)
+    if not w or not h:
+        return False
+    return h < _IMG_MIN_ALTURA or w < _IMG_MIN_LARGURA or (w * h) < _IMG_MIN_AREA
 
 
 _PROD_COLS = ("id,descricao,preco_un,proposta_tiny,data_ref,alerta,"
@@ -1195,21 +1304,89 @@ async def extrair_email(
 
     propostas_raw: list = []   # acumulador — declarado aqui para estar disponível
     #                              durante o loop de arquivos (parser det. insere direto)
+    avisos_ingestao: list = [] # falhas ao abrir arquivo; migram para avisos_extracao
 
     # ── Processar cada arquivo enviado ──────────────────────────────────────
+    # Os bytes crus ficam guardados: a ingestão canônica (v3.25) monta o
+    # DOCUMENTO a partir deles. O laço abaixo segue existindo pelo parser
+    # determinístico de Excel, que funciona e não se mexe.
+    _brutos: list = []
     for arq in (arquivos or []):
         if not (arq and arq.filename):
             continue
         fname = arq.filename
         flo = fname.lower()
         dados = await arq.read()
+        _brutos.append((fname, dados))
+
+        # ── Com a ingestão ativa, este laço só existe para o parser
+        # determinístico de Excel. Rodar o corpo antigo junto abria cada .msg
+        # DUAS vezes e convertia cada PDF DUAS vezes — custo e latência
+        # dobrados — e um arquivo corrompido estourava aqui, antes do try da
+        # ingestão, derrubando a requisição inteira.
+        if _INGESTAO_OK:
+            try:
+                _planilhas = []
+                if flo.endswith(".msg"):
+                    _tmp_x = f"/tmp/xls_{abs(hash(fname)) % 10**9}_{len(dados)}.msg"
+                    _mx = None
+                    # O temporário é criado ANTES do try de propósito não: se o
+                    # openMsg falhava fora do try/finally, o arquivo ficava em
+                    # /tmp para sempre. Num serviço de longa duração isso vaza
+                    # disco a cada .msg corrompido.
+                    try:
+                        with open(_tmp_x, "wb") as _f:
+                            _f.write(dados)
+                        _mx = extract_msg.openMsg(_tmp_x)
+                        for _att in (_mx.attachments or []):
+                            _an = (getattr(_att, "longFilename", None)
+                                   or getattr(_att, "shortFilename", None) or "").lower()
+                            if _an.endswith((".xlsx", ".xls", ".xlsm")) and _att.data:
+                                _planilhas.append(_att.data)
+                    finally:
+                        try:
+                            if _mx is not None:
+                                _mx.close()
+                        except Exception:
+                            pass
+                        try:
+                            os.remove(_tmp_x)
+                        except Exception:
+                            pass
+                elif flo.endswith((".xlsx", ".xls", ".xlsm")):
+                    _planilhas.append(dados)
+                for _pl in _planilhas:
+                    _det = _parsear_excel_estruturado(_pl)
+                    if _det:
+                        propostas_raw.extend(_det)
+            except Exception:
+                # Falha aqui NÃO é fatal: a planilha ainda vai ao modelo pelo
+                # bloco de anexo do Documento. O determinístico é atalho, não
+                # única via.
+                pass
+            continue
 
         if flo.endswith(".msg"):
             # Email: extrai corpo (contexto) + anexos do email
-            with open("/tmp/ext_upload.msg", "wb") as _f:
+            # INVARIANTE: os bytes vão pra /tmp antes do extract_msg (o mount de
+            # upload é read-only e dá I/O error em acesso aleatório). Caminho ÚNICO
+            # por arquivo: com dois .msg na mesma extração, o caminho fixo era
+            # truncado pelo segundo enquanto o handle OLE do primeiro seguia aberto.
+            _tmp_msg = f"/tmp/ext_upload_{abs(hash(fname)) % 10**9}_{len(dados)}.msg"
+            with open(_tmp_msg, "wb") as _f:
                 _f.write(dados)
-            _msg = extract_msg.openMsg("/tmp/ext_upload.msg")
+            _msg = extract_msg.openMsg(_tmp_msg)
             corpo = (_msg.body or "").strip()
+            # O HTML é a única fonte que diz ONDE cada imagem estava no e-mail.
+            # É por ele que a tabela de itens (corpo) vem antes da assinatura.
+            try:
+                _html = _msg.htmlBody
+                if isinstance(_html, (bytes, bytearray)):
+                    _html = _html.decode("utf-8", "ignore")
+            except Exception:
+                _html = ""
+            _html = _html or ""
+            _imgs_deste: list = []
             # O remetente identifica de quem é a demanda (o domínio é o sinal mais
             # confiável quando há várias empresas no material) e a assinatura dele é
             # onde o CNPJ costuma estar. O /casar-po já mandava isso; aqui era
@@ -1255,9 +1432,45 @@ async def extrair_email(
                     pt = _pdf_po_texto(att.data)
                     if pt.strip():
                         conteudo_files.append((att.longFilename or att.shortFilename, pt, "pdf"))
-                elif afn.endswith((".png", ".jpg", ".jpeg", ".webp")):
-                    if not _IMG_SKIP_EXT.search(afn) and len(att.data) >= 5000:
-                        imgs_msg.append((afn, att.data))
+                elif afn.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+                    # O piso de 5.000 bytes que existia aqui era o bug: uma tabela
+                    # de 1 linha (388x38) comprime pra 1,4 KB e era descartada como
+                    # se fosse enfeite. Tamanho em bytes não distingue conteúdo de
+                    # decoração. Agora só cai fora o que não pode ser tabela.
+                    if _IMG_SKIP_EXT.search(afn) or _img_descartavel(att.data):
+                        continue
+                    _cid = (getattr(att, "cid", "") or "").strip("<> ")
+                    _imgs_deste.append((att.longFilename or att.shortFilename or afn,
+                                        att.data, _cid))
+
+            # ── Ordem = posição no HTML do e-mail ────────────────────────────
+            # A tabela de itens fica no CORPO (topo); logo e banners ficam na
+            # ASSINATURA (fim). Ordenar por posição faz a cotação sempre entrar
+            # antes do enfeite no orçamento de tokens. Sem HTML → cai no critério
+            # antigo (maior primeiro), que é o que resolvia o caso da Universal.
+            def _pos_no_html(t):
+                _n, _b, _c = t
+                for _alvo in (_c, _n):
+                    if not _alvo:
+                        continue
+                    _p = _html.find(f"cid:{_alvo}")
+                    if _p < 0:
+                        _p = _html.find(_alvo)
+                    if _p >= 0:
+                        return _p
+                return 10 ** 9          # não referenciada no corpo → por último
+            if _html:
+                _imgs_deste.sort(key=_pos_no_html)
+            else:
+                _imgs_deste.sort(key=lambda t: len(t[1]), reverse=True)
+            # O 4º campo é a POSIÇÃO da imagem dentro do PRÓPRIO e-mail. Com dois
+            # e-mails na mesma extração, ordenar a lista achatada faria a assinatura
+            # do primeiro (5 banners) empurrar a tabela do segundo pra fora do teto.
+            # Ordenando por posição relativa, o corpo de TODOS vem antes de qualquer
+            # rodapé. Foi exatamente o caso CEINSPEC + CESLOG.
+            _origem_msg = (_msg.subject or fname or "").strip()[:120]
+            for _i, (_n, _b, _c) in enumerate(_imgs_deste):
+                imgs_msg.append((_n, _b, _origem_msg, _i))
 
         elif flo.endswith((".xlsx", ".xls", ".xlsm")):
             _props_det = _parsear_excel_estruturado(dados)
@@ -1282,9 +1495,11 @@ async def extrair_email(
             if pt.strip():
                 conteudo_files.append((fname, pt, "pdf"))
 
-        elif flo.endswith((".png", ".jpg", ".jpeg", ".webp")):
-            if not _IMG_SKIP_EXT.search(flo):
-                imgs_msg.append((flo, dados))
+        elif flo.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+            if not _IMG_SKIP_EXT.search(flo) and not _img_descartavel(dados):
+                # Posição 0: imagem que o operador anexou de propósito é conteúdo,
+                # nunca rodapé — disputa o teto em pé de igualdade com a tabela.
+                imgs_msg.append((fname, dados, fname, 0))
 
         else:
             try:
@@ -1294,6 +1509,48 @@ async def extrair_email(
 
     if texto:
         contexto_email += texto
+
+    # ── DOCUMENTO CANÔNICO (v3.25) ──────────────────────────────────────────
+    # O norte: se o operador joga o e-mail num chatbot e pergunta "quais itens
+    # devo cotar", ele responde — porque não há máquina entre o arquivo e o
+    # modelo. Aqui é a mesma coisa: o e-mail vira uma lista ORDENADA de blocos
+    # (texto, tabela, imagem, anexo) e vai inteiro, numa chamada só.
+    #
+    # O que morre com isto, tudo medido no corpus real de 264 cotações:
+    #   · piso de 5 KB por imagem     → tabela de 1,4 KB era descartada
+    #   · teto de 4 imagens por byte  → assinatura de 27 KB tomava a vaga
+    #   · "anexo vence o corpo"       → PDF cadastral sequestrava o e-mail
+    #   · corpo cortado em 3.000      → 36 de 46 itens perdidos (Universal)
+    #   · 1 chamada por anexo         → e-mail com 6 PDFs virava 6 propostas
+    documentos: list = []
+    if _INGESTAO_OK:
+        _conv = {"pdf": lambda b: _pdf_po_texto(b) if len(b) <= _PDF_MAX_BYTES else "",
+                 "planilha": lambda b: _extrair_excel_bytes(b, "anexo"),
+                 "word": lambda b: _ler_docx(b) if "_ler_docx" in globals() else ""}
+        for _fn, _dd in _brutos:
+            _fl = _fn.lower()
+            try:
+                if _fl.endswith(".msg"):
+                    documentos.append(_ing_ler_msg(_dd, _conv))
+                elif _fl.endswith(".eml"):
+                    documentos.append(_ing_ler_email(_dd, _conv))
+                else:
+                    documentos.append(_ing_doc_arquivo(_fn, _dd, _conv))
+            except Exception as _e:
+                avisos_ingestao.append({
+                    "tipo": "busca_falhou", "etapa": "ingestao",
+                    "assinatura": f"ingestao:{type(_e).__name__}",
+                    "mensagem": (f"Não consegui abrir “{_fn}”. Os itens não foram "
+                                 f"perdidos no e-mail — foi falha do sistema."),
+                    "detalhe": f"{type(_e).__name__}: {_e}"[:400],
+                })
+        for _img in (imagens or []):
+            if _img and _img.filename:
+                try:
+                    documentos.append(_ing_doc_arquivo(
+                        _img.filename, await _img.read(), _conv))
+                except Exception:
+                    pass
 
     # ── Avisos e notas (declarados aqui: o filtro abaixo já escreve neles) ───
     # avisos_extracao = FALHA do sistema (abre chamado automático).
@@ -1341,6 +1598,10 @@ async def extrair_email(
     # Sem arquivos de conteúdo = tudo junto em uma chamada (body + imagens)
     imgs_validas = [img for img in (imagens or []) if img and img.filename]
     todas_imgs_len = len(imgs_validas) + len(imgs_msg)
+    if _INGESTAO_OK and documentos:
+        # 91% das cotações reais trazem imagem embutida — quem manda no modelo é
+        # o DOCUMENTO, não a contagem antiga de anexos soltos.
+        todas_imgs_len = sum(len(d.imagens()) for d in documentos)
     modelo_extracao = "claude-sonnet-4-6" if todas_imgs_len > 0 else "claude-haiku-4-5-20251001"
     claude = get_claude()
 
@@ -1350,20 +1611,63 @@ async def extrair_email(
         if payload_txt.strip():
             msg_content.append({"type": "text", "text": payload_txt[:20000]})
         if imgs_inline:
-            # Só cabem 4. O filtro por NOME não separa banner de print, porque o
-            # Outlook nomeia tudo de "image.png" — no e-mail da Universal vieram dois
-            # banners de assinatura (6 KB e 14 KB) e dois prints da tabela (105 KB e
-            # 122 KB), todos com o mesmo nome. Maior primeiro: banner de assinatura é
-            # faixa fina e leve, print de tabela é pesado. Assim o print nunca perde
-            # a vaga para a logo quando o e-mail tem muita imagem.
-            imgs_inline = sorted(imgs_inline, key=lambda p: len(p[1]), reverse=True)
-            msg_content.append({"type": "text", "text": f"Analise também {len(imgs_inline[:4])} imagem(ns):"})
-            for _, img_bytes in (imgs_inline or [])[:4]:
+            # O teto ANTIGO era "4 imagens, maior primeiro". A ordem por tamanho
+            # nasceu do e-mail da Universal (banners leves, prints pesados) e se
+            # INVERTE no Grupo Cesari: assinatura de 27 KB, tabela de itens de
+            # 1,4 KB — as 4 vagas iam todas pro rodapé e a cotação chegava vazia.
+            # Agora a ordem vem de onde a imagem estava no e-mail (corpo antes da
+            # assinatura, resolvido na leitura do .msg) e o teto é o que custa de
+            # verdade: TOKEN. Imagem de e-mail é pequena; 12 delas cabem no mesmo
+            # orçamento que 1 print de tela.
+            # Sort ESTÁVEL pela posição dentro do e-mail de origem: corpo de todos
+            # os e-mails primeiro, rodapé de todos depois. Empate mantém a ordem de
+            # chegada (e-mail 1 antes do e-mail 2).
+            imgs_inline = sorted(imgs_inline, key=lambda t: (t[3] if len(t) > 3 else 0))
+            sel, gasto, cortadas = [], 0, 0
+            for _t in imgs_inline:
+                _nome, _b = _t[0], _t[1]
+                _orig = _t[2] if len(_t) > 2 else ""
+                _tk = _img_tokens(_b)
+                if sel and (gasto + _tk > _IMG_MAX_TOKENS or len(sel) >= _IMG_MAX_N):
+                    cortadas += 1
+                    continue
+                sel.append((_nome, _b, _orig))
+                gasto += _tk
+            msg_content.append({"type": "text", "text": (
+                f"Analise também {len(sel)} imagem(ns) embutida(s) no(s) e-mail(s). "
+                "Algumas são assinatura/logo/banner e não têm item nenhum — ignore "
+                "essas em silêncio. As tabelas de itens são as que importam.")})
+            for _nome, _b, _orig in sel:
+                # O rótulo amarra a imagem ao e-mail de onde veio. Sem ele, com dois
+                # e-mails de clientes diferentes na mesma extração, o modelo não tem
+                # como saber qual tabela é de qual — e a quebra por destino erra.
+                if _orig:
+                    msg_content.append({"type": "text",
+                                        "text": f"[imagem de: {_orig}]"})
                 msg_content.append({"type": "image", "source": {"type": "base64",
-                    "media_type": _media_type_img(img_bytes), "data": _b64.standard_b64encode(img_bytes).decode()}})
+                    "media_type": _media_type_img(_b), "data": _b64.standard_b64encode(_b).decode()}})
+            if cortadas:
+                # NOTA, não aviso: as que sobram são as do fim do e-mail (rodapé), e
+                # abrir chamado automático por banner de assinatura descartado treina
+                # todo mundo a ignorar chamado. O operador só precisa saber.
+                notas_extracao.append({
+                    "tipo": "imagens_cortadas",
+                    "arquivo": "",
+                    "mensagem": (f"O(s) e-mail(s) traziam {len(sel) + cortadas} imagens e li as "
+                                 f"{len(sel)} primeiras (as do corpo vêm antes das de "
+                                 f"assinatura). Se faltar item, confira as imagens à mão."),
+                    "exclusivos": [],
+                })
         if imgs_upload:
-            for img in (imgs_upload or [])[:4]:
+            _gasto_up = 0
+            for img in (imgs_upload or [])[:_IMG_MAX_N]:
                 ib = await img.read()
+                if _img_descartavel(ib):
+                    continue
+                _tk = _img_tokens(ib)
+                if _gasto_up and _gasto_up + _tk > _IMG_MAX_TOKENS:
+                    break
+                _gasto_up += _tk
                 msg_content.append({"type": "image", "source": {"type": "base64", "media_type": _media_type_img(ib),
                     "data": _b64.standard_b64encode(ib).decode()}})
         if not msg_content:
@@ -1419,18 +1723,74 @@ async def extrair_email(
             })
             return []
 
-    if conteudo_files:
-        # Uma chamada por arquivo de conteúdo
+    async def _chamar_com_content(msg_content):
+        """Mesma chamada, recebendo o content já montado pela ingestão."""
+        if not msg_content:
+            return []
+        resp = claude.messages.create(
+            model=modelo_extracao, max_tokens=16000,
+            system=SYSTEM_EXTRACAO,
+            messages=[{"role": "user", "content": msg_content}],
+        )
+        if getattr(resp, "stop_reason", "") == "max_tokens":
+            avisos_extracao.append({
+                "tipo": "busca_falhou", "etapa": "extracao_truncada",
+                "assinatura": "extracao:max_tokens",
+                "mensagem": ("A lista de itens era grande demais e a extração foi "
+                             "cortada no meio. A proposta pode ter vindo INCOMPLETA "
+                             "— confira contra o e-mail antes de gerar o CSV."),
+                "detalhe": f"stop_reason=max_tokens · modelo={modelo_extracao}",
+            })
+        raw = "".join(b.text for b in resp.content
+                      if getattr(b, "type", "") == "text").strip()
+        raw = re.sub(r'^```(?:json)?\s*', '', raw.strip())
+        raw = re.sub(r'\s*```$', '', raw.strip())
+        s0 = raw.find('{')
+        if s0 > 0:
+            raw = raw[s0:]
+        e0 = raw.rfind('}')
+        if e0 != -1 and e0 < len(raw) - 1:
+            raw = raw[:e0 + 1]
+        try:
+            parsed = _json_ext.loads(raw)
+            if "itens" in parsed and "propostas" not in parsed:
+                parsed = {"propostas": [parsed]}
+            return parsed.get("propostas", [])
+        except Exception as e:
+            avisos_extracao.append({
+                "tipo": "busca_falhou", "etapa": "extracao_json",
+                "assinatura": f"extracao:json:{type(e).__name__}",
+                "mensagem": ("Li o e-mail mas não consegui interpretar a resposta da "
+                             "extração. Os itens NÃO foram perdidos no e-mail — foi "
+                             "falha do sistema. Tente de novo; se repetir, me chame."),
+                "detalhe": f"{type(e).__name__}: {e}"[:400],
+            })
+            return []
+
+    avisos_extracao.extend(avisos_ingestao)
+    _rel_ing = {}
+
+    if _INGESTAO_OK and documentos and not propostas_raw:
+        # ── UMA chamada, com o documento inteiro e em ordem ─────────────────
+        # Uma chamada, não uma por anexo: um e-mail da Universal com 6 PDFs é UMA
+        # demanda do cliente, não seis propostas. Quem quebra em abas é o MODELO,
+        # pela regra de DESTINO — endereço/CNPJ diferente = proposta diferente —
+        # e para decidir isso ele precisa ver o pedido inteiro de uma vez.
+        _content, _rel_ing = _ing_montar_payload(documentos, texto_extra=(texto or ""))
+        propostas_raw.extend(await _chamar_com_content(_content))
+        if _rel_ing.get("imagens_cortadas"):
+            notas_extracao.append({
+                "tipo": "imagens_cortadas", "arquivo": "",
+                "mensagem": (f"O material trazia mais imagens do que coube na leitura "
+                             f"({_rel_ing['imagens_cortadas']} ficaram de fora). Se "
+                             f"faltar item, confira as imagens à mão."),
+                "exclusivos": [],
+            })
+    elif conteudo_files:
+        # Caminho antigo — só roda se a ingestão não estiver disponível.
         for _ordem, (nome_arq, conteudo_arq, _tipo_arq) in enumerate(conteudo_files):
-            # O corpo entra pelas DUAS pontas: o cabeçalho diz quem pediu, o rodapé
-            # é onde mora o CNPJ. Cortar só a cauda em 3.000 chars perdia o CNPJ de
-            # todo e-mail longo — e o CNPJ é o campo que amarra o preço ao cliente.
             ctx = f"CONTEXTO (cliente/CNPJ/referência do e-mail):\n{_recorte_contexto(contexto_email)}\n\n" \
                   f"CONTEÚDO PARA COTAÇÃO — arquivo: {nome_arq}\n{conteudo_arq[:15000]}"
-            # As imagens embutidas eram coletadas e NUNCA enviadas neste ramo — e o
-            # modelo já era promovido a Sonnet por causa delas, então pagávamos por
-            # visão sem mandar imagem nenhuma. Vão na primeira chamada só: elas são
-            # do e-mail, não de um arquivo, e repeti-las por arquivo multiplicaria custo.
             props = await _chamar_extracao(
                 ctx,
                 imgs_inline=(imgs_msg if _ordem == 0 else None),
@@ -1470,7 +1830,16 @@ async def extrair_email(
     # Tudo que a IA viu: corpo do e-mail, anexos convertidos e o texto colado.
     # O anexo descartado entra MARCADO: a fonte é o registro do que chegou, e sumir
     # com ele esconderia a decisão de quem for auditar a proposta depois.
-    _fonte = "\n\n".join(x for x in [
+    # A FONTE é o documento renderizado: exatamente o que a IA leu, na ordem em
+    # que leu, com a imagem marcada no lugar dela. Antes era a concatenação solta
+    # de corpo + anexos, que já não correspondia ao que foi enviado.
+    _fonte_ing = ""
+    if _INGESTAO_OK and documentos:
+        try:
+            _fonte_ing = "\n\n".join(d.render_texto() for d in documentos).strip()
+        except Exception:
+            _fonte_ing = ""
+    _fonte = _fonte_ing or "\n\n".join(x for x in [
         contexto_email.strip(),
         "\n\n".join(f"--- {n} ---\n{c}" for n, c, _t in conteudo_files),
         "\n\n".join(f"--- {n} (anexo redundante — não enviado à IA) ---\n{c}"
@@ -1502,6 +1871,30 @@ async def extrair_email(
                 _its_ok.append(_it)
             # qualquer outra coisa (número, null) é descartada em silêncio
         _pr["itens"] = _its_ok
+        # ── Linha idêntica repetida DENTRO da mesma proposta SOMA ───────────
+        # Regra do operador, confirmada nos dados: na Syntegon RC 24202087 o
+        # cliente repetiu as mesmas 5 linhas na MESMA tabela e a proposta 1050722
+        # saiu 2/2/4/2/6 — somado, 5 itens, não 10. Hoje isso acontece por SORTE:
+        # nada manda somar, e a regra escrita diz "NUNCA junte" (ela existe para
+        # propostas DIFERENTES). Se o modelo aplicá-la aqui, o valor da proposta
+        # dobra e ninguém percebe, porque 10 linhas parecem válidas.
+        # A quebra por DESTINO vem antes e não é tocada: isto roda DENTRO de uma
+        # proposta, ou seja, dentro de um destino.
+        if _INGESTAO_OK and _ing_consolidar:
+            try:
+                _antes = len(_pr["itens"])
+                _pr["itens"] = _ing_consolidar(_pr["itens"])
+                if len(_pr["itens"]) < _antes:
+                    notas_extracao.append({
+                        "tipo": "itens_somados", "arquivo": "",
+                        "mensagem": (f"O cliente repetiu linhas idênticas na mesma "
+                                     f"tabela: juntei {_antes} em {len(_pr['itens'])} "
+                                     f"itens, somando as quantidades. Confira se era "
+                                     f"isso mesmo."),
+                        "exclusivos": [],
+                    })
+            except Exception:
+                pass
         _props_norm.append(_pr)
     propostas_raw = _props_norm
 
