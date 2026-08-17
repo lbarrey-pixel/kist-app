@@ -5511,7 +5511,7 @@ async def datasheet_gerar(payload: DatasheetGerarIn, usuario: str = Depends(veri
     _modo = (payload.modo or "tecnico").strip().lower()
     if _modo not in ("tecnico", "comercial"):
         _modo = "tecnico"
-    anterior, ident_ant, ds_row = None, None, None
+    anterior, ident_ant, pistas_ant, ds_row = None, None, "", None
     if payload.datasheet_id:
         r = sb.table("datasheets").select("*").eq("id", payload.datasheet_id).limit(1).execute()
         if r.data:
@@ -5521,6 +5521,10 @@ async def datasheet_gerar(payload: DatasheetGerarIn, usuario: str = Depends(veri
             # FOTO, o módulo reaproveita as duas e não chama o modelo — sem ela,
             # o fabricante/modelo já confirmados seriam recalculados do zero.
             ident_ant = (ds_row.get("payload") or {}).get("identificacao") or None
+            # As pistas da versão anterior. O front manda `pistas` em toda
+            # chamada (é estado de tela e nunca é limpo), então só a COMPARAÇÃO
+            # com estas revela se o operador pediu algo novo agora.
+            pistas_ant = (ds_row.get("payload") or {}).get("pistas") or ""
 
     # Foto que o operador mandou vence a busca — ele é a hierarquia superior.
     img_op = None
@@ -5535,13 +5539,28 @@ async def datasheet_gerar(payload: DatasheetGerarIn, usuario: str = Depends(veri
         except Exception as e:
             raise HTTPException(400, f"Não consegui baixar a imagem desse link ({type(e).__name__}).")
 
+    # Foto que o operador JÁ tinha enviado numa versão anterior. Ele não vai
+    # reenviar o arquivo a cada crítica — sem isto, corrigir o texto derruba a
+    # imagem e ele fica num vaivém que nunca fecha. Falhar aqui não impede a
+    # geração: o pior caso é a busca de foto normal.
+    img_preservada = None
+    if (not img_op and ds_row
+            and (ds_row.get("imagem_origem") or "") == "operador"
+            and ds_row.get("imagem_path")):
+        try:
+            img_preservada = _ds_storage().download(ds_row["imagem_path"])
+        except Exception:
+            img_preservada = None
+
     try:
         r = _ds_mod.gerar(
             get_claude(), item, logo,
             baixar=_ds_baixar, buscar_pagina=_ds_pagina, buscar_json=_ds_json,
             fonte_texto=payload.fonte_texto or "",
             pistas=payload.pistas or "", critica=payload.critica or "",
-            anterior=anterior, ident_anterior=ident_ant, imagem_operador=img_op,
+            anterior=anterior, ident_anterior=ident_ant,
+            pistas_anterior=pistas_ant,
+            imagem_operador=img_op, imagem_preservada=img_preservada,
             contato_rodape=payload.contato_rodape or "",
             modo=_modo,
             system_comercial=(_ds_mod.prompt_comercial(sb) if _modo == "comercial" else ""),
@@ -5598,6 +5617,7 @@ async def datasheet_gerar(payload: DatasheetGerarIn, usuario: str = Depends(veri
                     "foto": r.get("foto") or {}, "origem": r.get("origem") or {},
                     "avisos": r.get("avisos") or [],
                     "nome_arquivo": r.get("nome_arquivo") or "",
+                    "pistas": r.get("pistas") or "",
                     "modo": _modo},
         "imagem_path": img_path or None,
         "imagem_origem": (r.get("foto") or {}).get("origem") or "ausente",

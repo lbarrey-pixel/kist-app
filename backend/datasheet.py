@@ -332,19 +332,19 @@ def identificar(claude, item: Dict[str, Any], fonte_texto: str = "",
         _norm(item.get("specs_complementares")), _norm(item.get("sku_fornecedor")),
         pistas or "",
     ]))
+    ident["divergencia"] = ""
     if (not origem_ok and len(tk_nome) >= 2 and tk_entrada
             and not (tk_nome & tk_entrada)):
-        ident["descartado"].append(
-            f"nome_produto='{ident['nome_produto']}' (sem origem verificada e "
-            f"sem nenhuma palavra em comum com o que o cliente pediu)")
-        ident["ambiguidade"].append(
-            "a identificação não bate com a descrição do cliente")
-        ident["perguntas"].append(
-            f"Identifiquei como \"{ident['nome_produto']}\", mas o cliente pediu "
-            f"\"{_norm(item.get('descricao_original')) or _norm(item.get('descricao_final'))}\". "
-            "A página de origem não abriu, então não tenho como confirmar. "
-            "Qual é o produto? (se o link estiver errado, corrija-o no item)")
-        ident["nome_produto"] = ""
+        # AVISA, não trava. Substituição de produto é rotina comercial na Kist
+        # (o cliente pede um modem 3G e a Kist oferta um Amplimax 5G) — travar
+        # cobraria um clique em toda venda de equivalente. O que NÃO passa é o
+        # identificador inventado: fabricante e modelo já foram descartados
+        # acima, e o `montar_conteudo` impede que voltem pela busca.
+        ident["divergencia"] = (
+            f"identifiquei como \"{ident['nome_produto']}\", mas o cliente pediu "
+            f"\"{_norm(item.get('descricao_original')) or _norm(item.get('descricao_final'))}\" "
+            "— e a página de origem não abriu, então não tenho como confirmar. "
+            "Se não for o mesmo item, corrija o link ou use \"está errado\"")
 
     ident["precisa_operador"] = (ident["confianca"] == "baixa"
                                 or not ident["nome_produto"]
@@ -1201,7 +1201,9 @@ def gerar(claude, item: Dict[str, Any], logo_bytes: bytes,
           critica: str = "",
           anterior: Optional[Dict[str, Any]] = None,
           ident_anterior: Optional[Dict[str, Any]] = None,
+          pistas_anterior: str = "",
           imagem_operador: Optional[bytes] = None,
+          imagem_preservada: Optional[bytes] = None,
           contato_rodape: str = "",
           modo: str = "tecnico",
           system_comercial: str = "") -> Dict[str, Any]:
@@ -1219,13 +1221,21 @@ def gerar(claude, item: Dict[str, Any], logo_bytes: bytes,
     #   comercial -> SOMENTE a origem
     origem = abrir_origem(link, buscar_pagina, buscar_json)
 
-    # ── Trocar a FOTO não pode reescrever o TEXTO ──────────────────────────
-    # Subir a imagem chamava o fluxo inteiro de novo, sem crítica — e sem
-    # crítica o `anterior` era ignorado no montar_conteudo, então o conteúdo
-    # era re-sorteado do zero. O operador subia a foto e perdia a ficha que já
-    # tinha aprovado. Aqui: se veio imagem e NADA mais mudou, o texto fica.
+    # ── O que o operador MEXEU nesta requisição ────────────────────────────
+    # Regra: a regeração só altera o que ele tocou agora. O resto é preservado.
+    #
+    # `pistas` chega em TODA chamada do front (é estado da tela e nunca é
+    # limpo), então "veio pista" não significa "ele pediu algo". Uma vez que o
+    # operador responde à tela de identificação, aquela pista o acompanha pelo
+    # resto da vida do documento — inclusive quando ele só troca a foto. O que
+    # conta é a pista ser DIFERENTE da que gerou a versão anterior.
+    pistas_novas = bool(_norm(pistas)) and _norm(pistas) != _norm(pistas_anterior)
+    critica_nova = bool(_norm(critica))
+
+    # Trocar a FOTO não pode reescrever o TEXTO: se a única coisa nova é a
+    # imagem, o conteúdo aprovado fica intacto e nenhum modelo é chamado.
     so_foto = bool(imagem_operador) and bool(anterior) \
-        and not _norm(critica) and not _norm(pistas)
+        and not critica_nova and not pistas_novas
 
     if so_foto:
         # Nem identificar, nem montar conteúdo: ZERO chamada ao modelo. Em
@@ -1280,6 +1290,18 @@ def gerar(claude, item: Dict[str, Any], logo_bytes: bytes,
                 if ok else
                 {"imagem": None, "mime": "", "url": "", "origem": "ausente",
                  "recusadas": [f"arquivo do operador: {nota}"], "nota": nota})
+    elif imagem_preservada:
+        # O outro lado do ciclo: corrigir o TEXTO não pode derrubar a FOTO.
+        # A imagem que o operador subiu vale para todas as versões seguintes —
+        # ele não vai reenviar o arquivo a cada crítica. Sem isto, o documento
+        # oscila: sobe foto e perde texto, corrige texto e perde foto.
+        ok, nota = _imagem_legivel(imagem_preservada)
+        foto = ({"imagem": imagem_preservada, "mime": _mime_de(imagem_preservada),
+                 "url": "", "origem": "operador", "recusadas": [],
+                 "nota": f"{nota} (mantida da versão anterior)"}
+                if ok else
+                {"imagem": None, "mime": "", "url": "", "origem": "ausente",
+                 "recusadas": [f"imagem preservada ilegível: {nota}"], "nota": nota})
     else:
         foto = pegar_foto(claude, ident, origem, baixar)
 
@@ -1319,9 +1341,13 @@ def gerar(claude, item: Dict[str, Any], logo_bytes: bytes,
                     contato_rodape=contato_rodape or None)
 
     avisos: List[str] = []
+    if ident.get("divergencia"):
+        avisos.append("⚠ " + ident["divergencia"])
     if so_foto:
         avisos.append("troquei só a FOTO — o texto da versão anterior foi "
                       "mantido inteiro (nada foi reescrito)")
+    elif imagem_preservada and foto.get("origem") == "operador":
+        avisos.append("mantive a foto que você tinha enviado")
     avisos += [f"identificação: descartei {d}" for d in (ident.get("descartado") or [])]
     avisos += [f"campo sem dado (o modelo tinha escrito um marcador): {p}"
                for p in placeholders]
@@ -1369,6 +1395,10 @@ def gerar(claude, item: Dict[str, Any], logo_bytes: bytes,
         "imagem_bytes": foto.get("imagem"),
         "pdf_bytes": pdf,
         "nome_arquivo": nome_arquivo(conteudo),
+        # As pistas viajam para o registro: é comparando com elas que a próxima
+        # requisição sabe se o operador pediu algo novo ou se é só o estado da
+        # tela vindo de carona.
+        "pistas": _norm(pistas),
         "avisos": avisos,
     }
 
