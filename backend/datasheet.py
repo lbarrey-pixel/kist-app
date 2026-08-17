@@ -126,6 +126,97 @@ def _norm(s: Any) -> str:
     return re.sub(r"\s+", " ", str(s or "")).strip()
 
 
+# ── Placeholder: o buraco que o modelo tapa com texto ──────────────────────
+# Quando não há dado e o prompt proíbe deduzir, o modelo tende a PREENCHER o
+# campo com um marcador em vez de deixá-lo vazio — e o marcador vai pro
+# cabeçalho do PDF e pro nome do arquivo ("..._unknown.pdf"). Campo vazio é a
+# resposta correta: o template já encolhe e omite o que está em branco.
+_PLACEHOLDERS = {
+    "unknown", "<unknown>", "n/a", "n.a.", "na", "nd", "n/d", "none", "null",
+    "tbd", "a definir", "indefinido", "desconhecido", "desconhecida",
+    "nao informado", "não informado", "nao informada", "não informada",
+    "nao especificado", "não especificado", "nao aplicavel", "não aplicável",
+    "sem informacao", "sem informação", "sem modelo", "modelo",
+    "-", "--", "---", "?", "??", "...", "n/i", "ni", "xxx", "xxxx",
+}
+
+
+def _e_placeholder(s: Any) -> bool:
+    """True quando o texto não carrega informação — só marca ausência."""
+    bruto = _norm(s)
+    if not bruto:
+        return False          # já está vazio — não há o que remover
+    v = bruto.lower().strip(" .:;·—–")
+    if not v:
+        return True           # sobrou só pontuação ("...", "—", ". . .")
+    if v in _PLACEHOLDERS:
+        return True
+    # <QUALQUER COISA> e {{campo}} são sempre marcador, nunca dado real.
+    if re.fullmatch(r"[<\[{(]+\s*[^>\]})]*\s*[>\]})]+", v):
+        return True
+    return False
+
+
+def _sp(s: Any) -> str:
+    """Devolve o texto, ou vazio se for placeholder."""
+    return "" if _e_placeholder(s) else _norm(s)
+
+
+def _sem_placeholder(conteudo: Dict[str, Any],
+                     removidos: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Varre o conteúdo inteiro e zera todo marcador de ausência.
+
+    Roda no fim do caminho, inclusive quando o conteúdo é REAPROVEITADO de uma
+    versão anterior — placeholder gravado ontem não pode reaparecer hoje.
+    """
+    c = dict(conteudo)
+    reg = removidos if removidos is not None else []
+
+    for campo in ("modelo", "subtitulo", "introducao"):
+        if _e_placeholder(c.get(campo)):
+            reg.append(f"{campo}='{_norm(c.get(campo))}'")
+            c[campo] = ""
+
+    # nome_produto é estrutural: some o marcador, mas não apaga o campo se for
+    # a única coisa que existe — o validador reclama e o operador resolve.
+    if _e_placeholder(c.get("nome_produto")):
+        reg.append(f"nome_produto='{_norm(c.get('nome_produto'))}'")
+        c["nome_produto"] = ""
+
+    dest = []
+    for d in (c.get("destaques") or []):
+        if _e_placeholder(d.get("valor")) or _e_placeholder(d.get("rotulo")):
+            reg.append(f"destaque '{_norm(d.get('rotulo'))}'")
+            continue
+        dest.append(d)
+    c["destaques"] = dest
+
+    specs = []
+    for s in (c.get("specs") or []):
+        if _e_placeholder(s.get("especificacao")) or _e_placeholder(s.get("caracteristica")):
+            reg.append(f"spec '{_norm(s.get('caracteristica'))}'")
+            continue
+        specs.append(s)
+    c["specs"] = specs
+    return c
+
+
+# ── Tokens: usados pela trava anti-invenção da identificação ───────────────
+_ACENTOS = str.maketrans("áàãâäéèêëíìîïóòõôöúùûüçñ", "aaaaaeeeeiiiiooooouuuucn")
+_VAZIAS = {
+    "para", "com", "sem", "por", "das", "dos", "uma", "uns", "the", "and",
+    "de", "da", "do", "em", "no", "na", "ou", "e", "a", "o", "of", "for",
+    "tipo", "modelo", "marca", "item", "produto", "unidade", "und", "pct",
+}
+
+
+def _tokens(s: Any) -> set:
+    """Palavras com carga semântica (>=4 letras/dígitos), sem acento."""
+    v = _norm(s).lower().translate(_ACENTOS)
+    return {t for t in re.split(r"[^a-z0-9]+", v)
+            if len(t) >= 4 and t not in _VAZIAS}
+
+
 def contexto_do_item(item: Dict[str, Any], fonte_texto: str = "",
                      origem: Optional[Dict[str, Any]] = None) -> str:
     """Monta o texto que o modelo lê. Mesma espinha do /conferir.
@@ -223,6 +314,38 @@ def identificar(claude, item: Dict[str, Any], fonte_texto: str = "",
             ident["descartado"].append(f"{campo}='{valor}' (não estava em nenhuma fonte)")
             ident[campo] = ""
 
+    # ── Trava 2: o PRODUTO inteiro trocado ─────────────────────────────────
+    # A trava acima só cobre fabricante e modelo. Ela não impede o modelo de
+    # devolver OUTRO produto em `nome_produto` — e foi exatamente isso que
+    # aconteceu com a fonte de alimentação da Equatorial (link do eBay morto,
+    # identificação "Gabinete Form 6 F6-P2B" com confiança ALTA, e o conteúdo
+    # depois buscou na web a partir do nome inventado).
+    #
+    # Substring não serve aqui: o nome é redigido, não copiado ("PPD24" vira
+    # "Patch Panel 24 portas" legitimamente). O sinal é OUTRO — nenhuma palavra
+    # em comum com o que o cliente pediu. E só vale quando NÃO há origem
+    # verificada: com a página aberta, o nome pode vir dela com toda razão.
+    origem_ok = bool((origem or {}).get("ok"))
+    tk_nome = _tokens(ident.get("nome_produto"))
+    tk_entrada = _tokens(" ".join([
+        _norm(item.get("descricao_original")), _norm(item.get("descricao_final")),
+        _norm(item.get("specs_complementares")), _norm(item.get("sku_fornecedor")),
+        pistas or "",
+    ]))
+    if (not origem_ok and len(tk_nome) >= 2 and tk_entrada
+            and not (tk_nome & tk_entrada)):
+        ident["descartado"].append(
+            f"nome_produto='{ident['nome_produto']}' (sem origem verificada e "
+            f"sem nenhuma palavra em comum com o que o cliente pediu)")
+        ident["ambiguidade"].append(
+            "a identificação não bate com a descrição do cliente")
+        ident["perguntas"].append(
+            f"Identifiquei como \"{ident['nome_produto']}\", mas o cliente pediu "
+            f"\"{_norm(item.get('descricao_original')) or _norm(item.get('descricao_final'))}\". "
+            "A página de origem não abriu, então não tenho como confirmar. "
+            "Qual é o produto? (se o link estiver errado, corrija-o no item)")
+        ident["nome_produto"] = ""
+
     ident["precisa_operador"] = (ident["confianca"] == "baixa"
                                 or not ident["nome_produto"]
                                 or bool(ident["ambiguidade"]))
@@ -245,6 +368,12 @@ compatibilidade. Se uma característica varia por versão e você não confirmou
 deixe de fora ou use redação tecnicamente segura. Para item genérico, inclua
 apenas o que é praticamente universal naquele tipo de produto.
 Ficha magra e correta é melhor que ficha cheia e chutada.
+
+CAMPO SEM DADO FICA VAZIO. Se você não confirmou o modelo, devolva `modelo`
+como string vazia ou simplesmente não devolva o campo. NUNCA escreva marcador
+de ausência — nada de "<UNKNOWN>", "N/A", "não informado", "a definir", "-",
+"?" ou equivalente. Esse texto vai parar no cabeçalho do PDF que o cliente
+recebe. Vazio é a resposta certa; o layout já omite o que está em branco.
 
 NUNCA INCLUA, em nenhum campo:
 preço, valor, desconto, frete, imposto, condição de pagamento, nome de
@@ -370,10 +499,22 @@ def montar_conteudo(claude, ident: Dict[str, Any], contexto: str,
              for s in (dados.get("specs") or [])
              if _norm(s.get("caracteristica")) or _norm(s.get("especificacao"))]
 
+    # ── A porta dos fundos da trava ────────────────────────────────────────
+    # A identificação descarta o modelo inventado, mas ESTA etapa busca na web
+    # e pode trazer o mesmo código de volta — foi assim que o "F6-P2B" morto na
+    # identificação renasceu no conteúdo. Se o campo já foi descartado lá atrás,
+    # ele só volta se aparecer no contexto (fonte real), nunca pela busca.
+    modelo_bruto = _sp(dados.get("modelo"))
+    if modelo_bruto and any(d.startswith("modelo=") for d in (ident.get("descartado") or [])):
+        if modelo_bruto.lower() not in contexto.lower():
+            ident.setdefault("descartado", []).append(
+                f"modelo='{modelo_bruto}' (reapareceu na busca depois de descartado)")
+            modelo_bruto = ""
+
     conteudo = {
-        "nome_produto": _norm(dados.get("nome_produto")) or ident.get("nome_produto", ""),
-        "modelo": _norm(dados.get("modelo")) or ident.get("modelo", ""),
-        "subtitulo": _norm(dados.get("subtitulo")) or ident.get("subtitulo", ""),
+        "nome_produto": _sp(dados.get("nome_produto")) or ident.get("nome_produto", ""),
+        "modelo": modelo_bruto or _sp(ident.get("modelo")),
+        "subtitulo": _sp(dados.get("subtitulo")) or ident.get("subtitulo", ""),
         "introducao": _norm(dados.get("introducao")),
         "destaques": destaques,
         "specs": specs,
@@ -387,6 +528,9 @@ def montar_conteudo(claude, ident: Dict[str, Any], contexto: str,
                    if getattr(b, "type", "") == "server_tool_use"
                    and isinstance(getattr(b, "input", None), dict)],
     }
+    # A varredura completa de placeholder roda em `gerar`, que registra o que
+    # removeu nos avisos. Aqui os `_sp` acima já evitam o caso mais comum:
+    # marcador no campo em vez do dado.
     return conteudo
 
 
@@ -472,7 +616,13 @@ FORMATO DA RESPOSTA
 O layout, o logotipo, as cores, as margens e o controle de sobreposição já são
 garantidos pelo template — você não desenha nada. Devolva apenas o CONTEÚDO
 pela ferramenta `montar_datasheet`: nome, modelo, subtítulo, introdução,
-exatamente 4 destaques e a tabela de especificações."""
+exatamente 4 destaques e a tabela de especificações.
+
+CAMPO SEM DADO FICA VAZIO. O `modelo` só é preenchido quando o modelo está na
+descrição do item ou na página de origem. Não sabendo, devolva string vazia ou
+omita o campo. NUNCA escreva "<UNKNOWN>", "N/A", "não informado", "a definir",
+"-" ou qualquer outro marcador de ausência: esse texto sai impresso no
+cabeçalho do documento que vai para o cliente."""
 
 
 def prompt_comercial(sb=None) -> str:
@@ -1050,6 +1200,7 @@ def gerar(claude, item: Dict[str, Any], logo_bytes: bytes,
           pistas: str = "",
           critica: str = "",
           anterior: Optional[Dict[str, Any]] = None,
+          ident_anterior: Optional[Dict[str, Any]] = None,
           imagem_operador: Optional[bytes] = None,
           contato_rodape: str = "",
           modo: str = "tecnico",
@@ -1068,7 +1219,29 @@ def gerar(claude, item: Dict[str, Any], logo_bytes: bytes,
     #   comercial -> SOMENTE a origem
     origem = abrir_origem(link, buscar_pagina, buscar_json)
 
-    if comercial:
+    # ── Trocar a FOTO não pode reescrever o TEXTO ──────────────────────────
+    # Subir a imagem chamava o fluxo inteiro de novo, sem crítica — e sem
+    # crítica o `anterior` era ignorado no montar_conteudo, então o conteúdo
+    # era re-sorteado do zero. O operador subia a foto e perdia a ficha que já
+    # tinha aprovado. Aqui: se veio imagem e NADA mais mudou, o texto fica.
+    so_foto = bool(imagem_operador) and bool(anterior) \
+        and not _norm(critica) and not _norm(pistas)
+
+    if so_foto:
+        # Nem identificar, nem montar conteúdo: ZERO chamada ao modelo. Em
+        # registro antigo (sem identificação salva) ela é derivada do próprio
+        # conteúdo aprovado — reidentificar aqui poderia jogar o operador de
+        # volta pra tela de identificação no meio de uma troca de foto.
+        ident = dict(ident_anterior) if ident_anterior else {
+            "nome_produto": _norm(anterior.get("nome_produto")),
+            "fabricante": "", "modelo": _norm(anterior.get("modelo")),
+            "categoria": "", "subtitulo": _norm(anterior.get("subtitulo")),
+            "confianca": "operador", "ambiguidade": [], "perguntas": [],
+            "termos_busca": [],
+        }
+        ident.setdefault("descartado", [])
+        ident["precisa_operador"] = False
+    elif comercial:
         # Sem etapa de identificação: o prompt do Fábio parte da descrição do
         # item, e é isso que ele pediu — gera, aprova ou corrige. Uma chamada
         # ao modelo em vez de duas.
@@ -1086,12 +1259,18 @@ def gerar(claude, item: Dict[str, Any], logo_bytes: bytes,
             return {"etapa": "identificacao", "precisa_operador": True,
                     "identificacao": ident, "avisos": ident.get("descartado") or []}
 
-    contexto = contexto_do_item(item, fonte_texto, origem)
-    if comercial and _norm(pistas):
-        contexto += f"\n\n### ORIENTAÇÃO DO OPERADOR\n{pistas}"
-    conteudo = montar_conteudo(claude, ident, contexto,
-                               critica=critica, anterior=anterior,
-                               modo=modo, system_comercial=system_comercial)
+    if so_foto:
+        # Zero chamada ao modelo: o texto aprovado é mantido inteiro. O
+        # sanitizador roda mesmo assim, para limpar placeholder que tenha sido
+        # gravado por uma versão anterior do sistema.
+        conteudo = _sem_placeholder(dict(anterior))
+    else:
+        contexto = contexto_do_item(item, fonte_texto, origem)
+        if comercial and _norm(pistas):
+            contexto += f"\n\n### ORIENTAÇÃO DO OPERADOR\n{pistas}"
+        conteudo = montar_conteudo(claude, ident, contexto,
+                                   critica=critica, anterior=anterior,
+                                   modo=modo, system_comercial=system_comercial)
 
     # ── Foto ───────────────────────────────────────────────────────────────
     if imagem_operador:
@@ -1120,6 +1299,13 @@ def gerar(claude, item: Dict[str, Any], logo_bytes: bytes,
                     reforco["origem"] = "fabricante"
                     foto = reforco
 
+    # ── Placeholder: varredura determinística antes de tudo ────────────────
+    # Roda nos dois caminhos (conteúdo novo e conteúdo reaproveitado) e antes
+    # do `validar_dados`, para que o marcador nunca chegue ao cabeçalho do PDF
+    # nem ao nome do arquivo.
+    placeholders: List[str] = []
+    conteudo = _sem_placeholder(conteudo, placeholders)
+
     # ── Regra 6: varredura determinística antes de desenhar ────────────────
     problemas = validar_dados(conteudo)
     if problemas:
@@ -1133,7 +1319,12 @@ def gerar(claude, item: Dict[str, Any], logo_bytes: bytes,
                     contato_rodape=contato_rodape or None)
 
     avisos: List[str] = []
+    if so_foto:
+        avisos.append("troquei só a FOTO — o texto da versão anterior foi "
+                      "mantido inteiro (nada foi reescrito)")
     avisos += [f"identificação: descartei {d}" for d in (ident.get("descartado") or [])]
+    avisos += [f"campo sem dado (o modelo tinha escrito um marcador): {p}"
+               for p in placeholders]
     if foto.get("imagem") is None:
         avisos.append("sem foto confirmada — o PDF saiu sem imagem")
     avisos += [f"conteúdo removido pela regra 6: {p}" for p in problemas]

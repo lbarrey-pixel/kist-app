@@ -5511,12 +5511,16 @@ async def datasheet_gerar(payload: DatasheetGerarIn, usuario: str = Depends(veri
     _modo = (payload.modo or "tecnico").strip().lower()
     if _modo not in ("tecnico", "comercial"):
         _modo = "tecnico"
-    anterior, ds_row = None, None
+    anterior, ident_ant, ds_row = None, None, None
     if payload.datasheet_id:
         r = sb.table("datasheets").select("*").eq("id", payload.datasheet_id).limit(1).execute()
         if r.data:
             ds_row = r.data[0]
             anterior = (ds_row.get("payload") or {}).get("conteudo") or None
+            # A identificação anterior viaja junto: quando o operador só troca a
+            # FOTO, o módulo reaproveita as duas e não chama o modelo — sem ela,
+            # o fabricante/modelo já confirmados seriam recalculados do zero.
+            ident_ant = (ds_row.get("payload") or {}).get("identificacao") or None
 
     # Foto que o operador mandou vence a busca — ele é a hierarquia superior.
     img_op = None
@@ -5537,7 +5541,7 @@ async def datasheet_gerar(payload: DatasheetGerarIn, usuario: str = Depends(veri
             baixar=_ds_baixar, buscar_pagina=_ds_pagina, buscar_json=_ds_json,
             fonte_texto=payload.fonte_texto or "",
             pistas=payload.pistas or "", critica=payload.critica or "",
-            anterior=anterior, imagem_operador=img_op,
+            anterior=anterior, ident_anterior=ident_ant, imagem_operador=img_op,
             contato_rodape=payload.contato_rodape or "",
             modo=_modo,
             system_comercial=(_ds_mod.prompt_comercial(sb) if _modo == "comercial" else ""),
