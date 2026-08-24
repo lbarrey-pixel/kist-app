@@ -37,7 +37,9 @@ from typing import Any, Dict, Optional
 
 # ── Estado do módulo ──────────────────────────────────────────────────────────
 _USUARIO: contextvars.ContextVar[str] = contextvars.ContextVar("ia_usuario", default="")
-_get_supabase = None          # injetado pelo main.py (evita duplicar credencial)
+_criar_supabase = None        # fábrica injetada pelo main.py
+_sb_proprio = None            # cliente DEDICADO desta thread — ver nota abaixo
+_sb_lock = threading.Lock()
 _fila: "queue.Queue[dict]" = queue.Queue(maxsize=5000)
 _worker: Optional[threading.Thread] = None
 _LOTE = 25                    # grava a cada 25 registros
@@ -59,6 +61,30 @@ _precos_cache: Dict[str, Any] = {}
 _precos_em = 0.0
 
 
+def _sb():
+    """Cliente Supabase EXCLUSIVO da telemetria.
+
+    Não reusar o singleton do main.py. O cliente do Supabase carrega um pool
+    httpx com sockets keep-alive; quando a thread de fundo grava telemetria ao
+    mesmo tempo em que o request está lendo a memória de matching, as duas
+    disputam a mesma conexão e o socket devolve
+    `ReadError: [Errno 11] Resource temporarily unavailable`.
+
+    O sintoma aparece na operação, não na telemetria: quem perde a leitura é a
+    proposta. Contabilizar tokens não pode custar um match. Uma conexão própria
+    isola por completo — o custo é um socket a mais, ocioso quase o tempo todo.
+    """
+    global _sb_proprio
+    if _sb_proprio is None and _criar_supabase is not None:
+        with _sb_lock:
+            if _sb_proprio is None:
+                try:
+                    _sb_proprio = _criar_supabase()
+                except Exception:
+                    return None
+    return _sb_proprio
+
+
 def _precos() -> Dict[str, Any]:
     """Lê config_kist['precos_ia'] com cache de 10 min. Falhou → fallback."""
     global _precos_cache, _precos_em
@@ -66,7 +92,7 @@ def _precos() -> Dict[str, Any]:
         return _precos_cache
     tab = dict(_PRECOS_FALLBACK)
     try:
-        sb = _get_supabase() if _get_supabase else None
+        sb = _sb()
         if sb is not None:
             r = sb.table("config_kist").select("valor").eq("chave", "precos_ia").execute()
             if r.data:
@@ -107,10 +133,14 @@ def get_usuario() -> str:
         return "(sistema)"
 
 
-def configurar(get_supabase) -> None:
-    """Chamado uma vez pelo main.py, passando o getter do cliente Supabase."""
-    global _get_supabase
-    _get_supabase = get_supabase
+def configurar(criar_supabase) -> None:
+    """Chamado uma vez pelo main.py.
+
+    Recebe uma FÁBRICA (que cria um cliente novo), não o getter do singleton:
+    a telemetria roda em thread própria e precisa da sua própria conexão.
+    """
+    global _criar_supabase
+    _criar_supabase = criar_supabase
     _garantir_worker()
 
 
@@ -119,6 +149,8 @@ def configurar(get_supabase) -> None:
 # nome do módulo — nunca inventamos etapa que não existe.
 _ETAPAS = {
     ("main", "extrair"):            "proposta",
+    ("main", "_chamar_extracao"):   "proposta_extracao",
+    ("main", "_chamar_com_content"): "proposta_extracao",
     ("main", "_fazer_matching"):    "proposta_matching",
     ("main", "_matching"):          "proposta_matching",
     ("main", "conferir"):           "conferir_ia",
@@ -175,7 +207,7 @@ def _drenar(bloqueante: bool = False) -> None:
     if not linhas:
         return
     try:
-        sb = _get_supabase() if _get_supabase else None
+        sb = _sb()
         if sb is not None:
             sb.table("ia_uso").insert(linhas).execute()
     except Exception:

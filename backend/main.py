@@ -160,7 +160,11 @@ def get_claude():
         cru = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
         if _IA_USO_OK:
             try:
-                _ia.configurar(get_supabase)
+                # FÁBRICA, não o singleton: a telemetria roda em thread própria e
+                # precisa da sua própria conexão. Compartilhar o cliente fazia a
+                # gravação de tokens disputar o socket com a leitura da memória de
+                # matching — e quem perdia era a proposta (ReadError Errno 11).
+                _ia.configurar(lambda: create_client(SUPABASE_URL, SUPABASE_KEY))
                 cru = _ia.envolver(cru)
             except Exception:
                 pass
