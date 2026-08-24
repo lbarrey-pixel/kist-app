@@ -1029,11 +1029,14 @@ diferente = null; spec divergente = não é o mesmo item, mesmo que a descriçã
             matches = {m["indice"]: m for m in _jm.loads(raw_match).get("matches", [])}
         except Exception as e:
             matches = {}
+            # `_falhou` já registra o aviso COMPLETO (com assinatura e detalhe).
+            # O append de texto solto que existia aqui era redundante E fatal: o
+            # /extrair percorre estes avisos chamando a.get("assinatura"), e uma
+            # string não tem .get — qualquer falha de matching virava 500 na tela
+            # em vez do aviso "itens sem preço por falha do sistema".
             _falhou("ia_matching", e,
                     "A IA de matching não respondeu. Os candidatos do banco foram "
                     "encontrados, mas ninguém escolheu entre eles.")
-            avisos.append(f"IA de matching falhou ({type(e).__name__}): os itens "
-                          f"vieram sem sugestão do banco. Os candidatos existiam.")
 
     # A memória vence a IA: entra depois e sobrescreve.
     for i, (row, origem) in resolvido.items():
@@ -2066,6 +2069,17 @@ async def extrair_email(
     # volta pro operador com o número — ligado a ele, que é quem viu o problema.
     avisos_saida, vistas = [], set()
     if avisos_extracao:
+        # Um aviso em texto solto (em vez de dict) derrubava a extração INTEIRA
+        # aqui embaixo, no a.get(). Normaliza uma vez: o aviso é informação de
+        # apoio, nunca pode custar a proposta.
+        avisos_extracao = [
+            a if isinstance(a, dict) else {
+                "tipo": "busca_falhou", "etapa": "geral",
+                "assinatura": f"matching:geral:{str(a)[:60]}",
+                "mensagem": str(a), "detalhe": str(a)[:400],
+            }
+            for a in avisos_extracao if a
+        ]
         _sb = get_supabase()
         for a in avisos_extracao:
             assin = a.get("assinatura") or ""

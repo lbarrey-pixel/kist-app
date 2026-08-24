@@ -1,7 +1,21 @@
 fastapi
 uvicorn
 python-multipart
-anthropic
+# TRAVADO em 0.x de propósito (24/08/2026).
+#
+# O SDK 1.0.0 saiu em 20/08/2026 e REMOVEU o parâmetro `temperature` do
+# messages.create(). Como esta linha estava sem versão, o "Clear build cache &
+# deploy" reinstalou tudo, puxou a major nova e TODAS as 16 chamadas de IA do
+# sistema passaram a estourar TypeError — matching, motor de preços e datasheet.
+#
+# `temperature=0` é o invariante de determinismo do matching; não dá para
+# simplesmente apagar o parâmetro. Migrar para a 1.x é projeto à parte, feito com
+# teste, não no meio de um incidente.
+#
+# LIÇÃO: dependência sem versão fixa significa que qualquer deploy pode trazer
+# uma major nova. O build não muda quando o código muda — muda quando o mundo
+# lá fora muda.
+anthropic==0.125.0
 supabase
 extract-msg
 pydantic
