@@ -287,6 +287,82 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
   // apresenta; o preço de venda continua decisão do operador. "Usar" sobe a origem
   // (e a descrição, se ele escolher) e marca origem_escolha='internet' — é isso que
   // ensina o nó no /upsert-precos.
+  // ── Busca MANUAL no banco de preços ───────────────────────────────────────
+  // O matching automático acerta muito, mas quando erra o operador não tinha
+  // saída: aceitava o candidato da IA ou ficava sem. Medido em jul/ago: de 671
+  // itens que saíram sem match e foram precificados na mão, 134 tinham no banco
+  // um produto igual ou parecido, cadastrado dias antes.
+  //
+  // Custo zero de IA (trigrama no Postgres, ~7ms). É a consulta que deve ser
+  // tentada ANTES de gastar uma busca na internet.
+  const [bqAberto, setBqAberto] = useState(false);
+  // Pré-carrega as 3 PRIMEIRAS PALAVRAS, não a descrição inteira: a busca é um
+  // E de todos os termos, e 12 palavras do cliente dariam zero. Três palavras dão
+  // a busca ampla; ele afunila digitando.
+  const [bqTermo, setBqTermo] = useState(() =>
+    (item.descricao_original || item.descricao_final || "").split(/\s+/).slice(0, 3).join(" "));
+  const [bqLinhas, setBqLinhas] = useState(null);
+  const [bqLoad, setBqLoad] = useState(false);
+  const [bqErr, setBqErr] = useState("");
+  const [bqMin, setBqMin] = useState("");
+  const [bqMax, setBqMax] = useState("");
+  const [bqForn, setBqForn] = useState("");
+  // Produto escolhido cuja ORIGEM aguarda confirmação. Regra do Leonardo: herda,
+  // mas mostra de onde veio pra ele confirmar. Enquanto não confirmar, custo e
+  // fornecedor NÃO entram no item — em branco é melhor que dado do item errado.
+  const [bqPendente, setBqPendente] = useState(null);
+
+  async function buscarBanco() {
+    const termo = (bqTermo || "").trim();
+    if (!termo && !bqForn.trim() && !bqMin && !bqMax) return;
+    setBqLoad(true); setBqErr("");
+    try {
+      const p = new URLSearchParams({ q: termo, limite: "40" });
+      if (bqForn.trim()) p.set("fornecedor", bqForn.trim());
+      if (bqMin !== "") p.set("preco_min", String(Number(bqMin)));
+      if (bqMax !== "") p.set("preco_max", String(Number(bqMax)));
+      const r = await fetch(`${apiUrl}/banco/buscar?${p.toString()}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || "falhou");
+      const d = await r.json();
+      setBqLinhas(d.linhas || []);
+    } catch (e) {
+      setBqErr(`Não consegui consultar o banco (${e.message}).`);
+      setBqLinhas(null);
+    } finally { setBqLoad(false); }
+  }
+
+  // Escolha manual: o preço de VENDA entra na hora (é a decisão dele), e a origem
+  // fica pendente de confirmação.
+  //
+  // `banco_id` é a peça que amarra tudo: o /upsert-precos já sabe atualizar A LINHA
+  // apontada em vez de procurar por texto. Sem isso, a proposta criaria um gêmeo
+  // com a descrição do cliente — e a memória aprenderia o par apontando pro gêmeo,
+  // não pro produto que ele escolheu. (Foi duplicata assim que derrubou o W50.)
+  function escolherProdutoBanco(p) {
+    if (!p) return;
+    if (Number(p.preco_un) > 0) onChange(index, "preco_un", Number(p.preco_un));
+    onChange(index, "banco_id", p.id);
+    onChange(index, "origem_escolha", "banco");
+    const temOrigem = Number(p.preco_custo) > 0 || p.fornecedor || p.link_fornecedor;
+    setBqPendente(temOrigem ? p : null);
+    setBqAberto(false);
+  }
+
+  function confirmarOrigemBanco() {
+    const p = bqPendente; if (!p) return;
+    if (Number(p.preco_custo) > 0) onChange(index, "preco_custo", Number(p.preco_custo));
+    if (p.fornecedor)      onChange(index, "fornecedor", p.fornecedor);
+    if (p.link_fornecedor) onChange(index, "link_fornecedor", p.link_fornecedor);
+    if (p.sku_fornecedor)  onChange(index, "sku_fornecedor", p.sku_fornecedor);
+    const canal   = p.fornecedor_canal   || (p.link_fornecedor ? "link" : "");
+    const contato = p.fornecedor_contato || (p.link_fornecedor || "");
+    if (canal)   onChange(index, "fornecedor_canal", canal);
+    if (contato) onChange(index, "fornecedor_contato", contato);
+    setBqPendente(null);
+  }
+
   const [net, setNet] = useState(null);          // ficha devolvida pelo /ficha-internet
   const [netLoad, setNetLoad] = useState(false);
   const [netErr, setNetErr] = useState("");
@@ -322,16 +398,19 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
     }
   }
 
-  // Dispara a busca automaticamente SÓ para item sem match ou incerto (é o que
-  // cobre a lacuna). Match bom não busca. A condição semMatchUtil se apoia na
-  // CONFIANÇA (persistida), não na ficha do banco (que não sobrevive ao reload).
-  useEffect(() => {
-    if (motorAberto && semMatchUtil && !netBuscadoRef.current && (item.descricao_original || item.descricao_final)) {
-      netBuscadoRef.current = true;
-      buscarInternet();
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [motorAberto]);
+  // DISPARO AUTOMÁTICO SUSPENSO (decisão do Leonardo, ago/2026).
+  //
+  // Até aqui, abrir a gaveta de um item sem match disparava a busca sozinha.
+  // Uma proposta de 20 itens sem match abria 20 buscas que ninguém pediu — e a
+  // medição de jul/ago mostrou que cada busca custa ~5 chamadas de IA. O
+  // operador olhava o resultado de talvez três delas.
+  //
+  // A busca continua exatamente igual; o que muda é QUEM dispara. A gaveta
+  // segue abrindo sozinha no item sem match (isso é sinal visual, é de graça),
+  // mostrando o botão "🌐 buscar na internet". Nada de IA roda antes do clique.
+  //
+  // Não remover o `netBuscadoRef`: ele ainda protege contra clique repetido e é
+  // o que decide se o estado vazio (com o botão) aparece.
 
   // "Usar esta ficha": sobe origem + (descrição, se escolheu a da internet) e marca
   // a escolha p/ o backend aprender o nó. Não sobrescreve o preço de venda — a
@@ -824,6 +903,102 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
                   Sem item correspondente no banco
                 </div>
               )}
+
+              {/* ── BUSCA MANUAL NO BANCO ──────────────────────────────────
+                  Fica na coluna do BANCO e aparece SEMPRE — inclusive quando a
+                  IA achou algo, porque o caso que importa é justamente "trouxe,
+                  mas não é o certo". Espelha o "não é isso?" que o lado internet
+                  já tinha; até aqui só a internet podia ser contestada. */}
+              <div className="md:col-start-1">
+                {bqPendente && (
+                  <div className="mb-2 rounded-lg border border-kist/40 bg-paper px-3 py-2">
+                    <div className="text-[11px] font-semibold text-kist">Confirma a origem?</div>
+                    <div className="mt-1 text-[12px] leading-relaxed text-sub">
+                      {Number(bqPendente.preco_custo) > 0 && (
+                        <>custo <span className="font-mono text-ink">{brl(bqPendente.preco_custo)}</span></>
+                      )}
+                      {bqPendente.fornecedor && <> · {bqPendente.fornecedor}</>}
+                      {bqPendente.fornecedor_contato && (
+                        <> · <span className="font-mono">{bqPendente.fornecedor_contato}</span></>
+                      )}
+                      {bqPendente.proposta_tiny && <> · proposta {bqPendente.proposta_tiny}</>}
+                      {bqPendente.data_ref && <> de {bqPendente.data_ref.split("-").reverse().join("/")}</>}
+                    </div>
+                    <div className="mt-1.5 flex gap-2">
+                      <button onClick={confirmarOrigemBanco}
+                        className="rounded-md border border-kist bg-kist px-2 py-0.5 text-[11px] font-medium text-white hover:bg-kist600">
+                        confirmar origem
+                      </button>
+                      <button onClick={() => setBqPendente(null)}
+                        className="rounded-md border border-line2 px-2 py-0.5 text-[11px] font-medium text-sub hover:border-kist hover:text-kist">
+                        só o preço de venda
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {!bqAberto ? (
+                  <button onClick={() => setBqAberto(true)}
+                    className="w-full rounded-lg border border-dashed border-line2 px-3 py-1.5 text-[11.5px] font-medium text-sub hover:border-kist hover:text-kist">
+                    procurar outro no banco
+                  </button>
+                ) : (
+                  <div className="rounded-lg border border-line2 bg-surface p-2.5">
+                    <div className="flex gap-1.5">
+                      <input value={bqTermo} onChange={(e) => setBqTermo(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") buscarBanco(); }}
+                        placeholder="palavra-chave, modelo, fabricante, nº da proposta…"
+                        className="min-w-0 flex-1 rounded-md border border-line2 bg-paper px-2 py-1 text-[12px] text-ink outline-none focus:border-kist" />
+                      <button onClick={buscarBanco} disabled={bqLoad}
+                        className="flex-shrink-0 rounded-md border border-line2 px-2 py-1 text-[11px] font-medium text-sub hover:border-kist hover:text-kist disabled:opacity-50">
+                        {bqLoad ? "…" : "buscar"}
+                      </button>
+                      <button onClick={() => setBqAberto(false)}
+                        className="flex-shrink-0 rounded-md px-1.5 text-[11px] text-faint hover:text-ink">✕</button>
+                    </div>
+
+                    <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[11px]">
+                      <input value={bqForn} onChange={(e) => setBqForn(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") buscarBanco(); }}
+                        placeholder="fornecedor"
+                        className="w-28 rounded-md border border-line2 bg-paper px-1.5 py-0.5 text-[11px] outline-none focus:border-kist" />
+                      <input value={bqMin} onChange={(e) => setBqMin(e.target.value)} type="number"
+                        placeholder="R$ de" className="w-20 rounded-md border border-line2 bg-paper px-1.5 py-0.5 text-[11px] outline-none focus:border-kist" />
+                      <input value={bqMax} onChange={(e) => setBqMax(e.target.value)} type="number"
+                        placeholder="R$ até" className="w-20 rounded-md border border-line2 bg-paper px-1.5 py-0.5 text-[11px] outline-none focus:border-kist" />
+                      {bqLinhas && (
+                        <span className="text-faint">
+                          {bqLinhas.length === 0 ? "nada encontrado — tire uma palavra"
+                            : `${bqLinhas.length}${bqLinhas.length >= 40 ? "+" : ""} resultado${bqLinhas.length > 1 ? "s" : ""}${bqLinhas.length > 8 ? " — acrescente uma palavra pra refinar" : ""}`}
+                        </span>
+                      )}
+                    </div>
+
+                    {bqErr && <div className="mt-1.5 text-[11.5px] text-amber">{bqErr}</div>}
+
+                    {bqLinhas?.length > 0 && (
+                      <div className="mt-2 max-h-64 space-y-1 overflow-y-auto pr-0.5">
+                        {bqLinhas.map((p) => (
+                          <button key={p.id} onClick={() => escolherProdutoBanco(p)}
+                            className="block w-full rounded-md border border-line2 bg-paper px-2 py-1.5 text-left hover:border-kist">
+                            <div className="text-[12px] leading-snug text-ink">{p.descricao}</div>
+                            <div className="mt-0.5 flex flex-wrap items-baseline gap-x-2 text-[11px]">
+                              <span className="font-mono text-ink">{brl(p.preco_un)}</span>
+                              {Number(p.preco_custo) > 0 && (
+                                <span className="text-faint">custo <span className="font-mono">{brl(p.preco_custo)}</span></span>
+                              )}
+                              {p.fornecedor && <span className="text-sub">{p.fornecedor}</span>}
+                              {p.rastreavel && <span className="text-signal">rastreável</span>}
+                              {p.data_ref && <span className="text-faint">{p.data_ref.split("-").reverse().join("/")}</span>}
+                              {p.onde === "outro campo" && <span className="text-faint">(casou fora da descrição)</span>}
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
 
               {/* ── INTERNET (direita) ── */}
               <div>

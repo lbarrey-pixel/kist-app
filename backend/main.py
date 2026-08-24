@@ -51,14 +51,53 @@ except Exception:
     _ing_doc_arquivo = _ing_montar_payload = _ing_consolidar = None
     _INGESTAO_OK = False
 
+# ── Contabilidade de tokens (v3.25) ──────────────────────────────────────────
+# Envelope em volta do cliente da Anthropic: conta tokens e custo por USUÁRIO e
+# por FUNÇÃO sem tocar em nenhum dos 20 pontos de chamada. Protegido igual aos
+# outros: se o arquivo faltar, o app sobe e só a telemetria some.
+try:
+    import ia_uso as _ia
+    _IA_USO_OK = True
+except Exception:
+    _ia = None
+    _IA_USO_OK = False
+
 # Versão do backend. O núcleo do Analista guarda a versão que ele descreve; se as
 # duas divergirem, o agente é avisado de que o conhecimento dele está atrasado.
 # Conhecimento velho não avisa que é velho — ele responde com a mesma confiança
 # e erra. Este número é a única coisa que impede isso.
-VERSAO_BACKEND = "3.24"
+VERSAO_BACKEND = "3.25"
 
 app = FastAPI(title="Kist Cotações API", version=VERSAO_BACKEND)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.middleware("http")
+async def _marcar_usuario(request: Request, call_next):
+    """Carimba QUEM está pedindo, para a contabilidade de tokens.
+
+    Precisa ser middleware e não Depends: dependência síncrona roda em
+    threadpool e o contextvar setado lá dentro NÃO volta para o contexto do
+    endpoint. Aqui é setado antes do `call_next`, então o valor propaga para
+    tudo que roda abaixo — async ou síncrono.
+
+    Resolve pelo mesmo `_verificar_token_str` (que é cacheado), e ENGOLE
+    qualquer erro: quem devolve 401/403 é a dependência do endpoint, não este
+    middleware. Telemetria jamais decide acesso.
+    """
+    if _IA_USO_OK:
+        try:
+            auth = request.headers.get("authorization") or ""
+            if auth.lower().startswith("bearer "):
+                _ia.set_usuario(_verificar_token_str(auth.split(" ", 1)[1].strip()))
+            else:
+                _ia.set_usuario("(sem token)")
+        except Exception:
+            try:
+                _ia.set_usuario("(nao identificado)")
+            except Exception:
+                pass
+    return await call_next(request)
 
 
 @app.exception_handler(Exception)
@@ -109,9 +148,23 @@ _claude_client = None
 _supabase_client = None
 
 def get_claude():
+    """Cliente da Anthropic — EMBRULHADO pelo contador de tokens.
+
+    O envelope espelha `client.messages.create`, então nenhum dos 20 pontos de
+    chamada (main, motor_precos, datasheet) muda uma linha. Se o ia_uso não
+    subiu, devolve o cliente cru: telemetria é desejável, a operação é que não
+    pode parar.
+    """
     global _claude_client
     if _claude_client is None:
-        _claude_client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        cru = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        if _IA_USO_OK:
+            try:
+                _ia.configurar(get_supabase)
+                cru = _ia.envolver(cru)
+            except Exception:
+                pass
+        _claude_client = cru
     return _claude_client
 
 def get_supabase():
@@ -357,6 +410,65 @@ def health():
 @app.get("/ping")
 def ping():
     return {"pong": True}
+
+@app.get("/ia-uso")
+def ia_uso_resumo(dias: int = 30, por: str = "usuario",
+                  usuario: str = Depends(verificar_token)):
+    """Consumo de tokens e custo da API, agregado.
+
+    `por`: 'usuario' | 'etapa' | 'usuario_etapa' | 'funcao' | 'modelo' | 'dia'.
+    Lê a RPC `ia_uso_resumo` (agregação fica no Postgres — trazer linha a linha
+    para agregar no Python seria puxar dezenas de milhares de registros).
+    """
+    dias = max(1, min(int(dias or 30), 365))
+    por = (por or "usuario").strip().lower()
+    if por not in ("usuario", "etapa", "usuario_etapa", "funcao", "modelo", "dia"):
+        por = "usuario"
+    sb = get_supabase()
+    try:
+        r = sb.rpc("ia_uso_resumo", {"p_dias": dias, "p_por": por}).execute()
+        linhas = r.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ia_uso indisponível: {e}")
+    return {
+        "dias": dias, "por": por, "linhas": linhas,
+        "custo_total_usd": round(sum(float(x.get("custo_usd") or 0) for x in linhas), 4),
+        "chamadas_total": sum(int(x.get("chamadas") or 0) for x in linhas),
+        "ativo": _IA_USO_OK,
+    }
+
+
+@app.get("/banco/buscar")
+def banco_buscar(q: str = "", preco_min: float = None, preco_max: float = None,
+                 fornecedor: str = "", limite: int = 40,
+                 usuario: str = Depends(verificar_token)):
+    """Busca MANUAL do operador no banco de preços.
+
+    Existe porque o matching automático é bom mas não é infalível, e até aqui o
+    operador não tinha como discordar dele: aceitava o que a IA trouxe ou ficava
+    sem. Medido em jul/ago: de 671 itens que saíram sem match e foram
+    precificados na mão, 134 tinham no banco um produto igual ou parecido,
+    cadastrado dias antes.
+
+    Sem IA — trigrama e texto no Postgres (~7ms). É a consulta que o operador
+    deve tentar ANTES de gastar uma busca na internet.
+    """
+    q = (q or "").strip()
+    fornecedor = (fornecedor or "").strip()
+    if not q and not fornecedor and preco_min is None and preco_max is None:
+        return {"linhas": [], "total": 0, "aviso": "informe um termo ou um filtro"}
+    sb = get_supabase()
+    try:
+        r = sb.rpc("banco_buscar", {
+            "p_q": q, "p_preco_min": preco_min, "p_preco_max": preco_max,
+            "p_fornecedor": fornecedor or None,
+            "p_limite": max(1, min(int(limite or 40), 100)),
+        }).execute()
+        linhas = r.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"busca no banco falhou: {e}")
+    return {"linhas": linhas, "total": len(linhas), "q": q}
+
 
 @app.get("/proxima-proposta")
 def proxima_proposta(usuario: str = Depends(verificar_token)):
@@ -781,7 +893,8 @@ def _falta_lastro(row: dict) -> str:
 
 
 def _fazer_matching(itens_raw: list, claude, sb, cliente: str = "",
-                    avisos: list = None, so_rastreavel: bool = False) -> list:
+                    avisos: list = None, so_rastreavel: bool = False,
+                    cnpj: str = "") -> list:
     """Matching em 3 camadas (v3.14):
 
       [1] MEMÓRIA  — entrada já virou proposta antes? Cliente primeiro, depois
@@ -820,7 +933,8 @@ def _fazer_matching(itens_raw: list, claude, sb, cliente: str = "",
     # tela e o operador precifica na mão achando que o banco está pobre.
     mem = {}
     try:
-        rm = sb.rpc("memoria_match", {"entradas": descricoes, "cli": cliente or ""}).execute()
+        rm = sb.rpc("memoria_match", {"entradas": descricoes, "cli": cliente or "",
+                                      "cnpj_in": cnpj or ""}).execute()
         for m in (rm.data or []):
             mem[m["entrada_norm"]] = m
     except Exception as e:
@@ -1096,6 +1210,9 @@ def _defesa_do_match(match: dict, row: dict) -> str:
     aprende como o sistema lê, o que melhora a forma dele lançar descrição.
     """
     origem = match.get("_memoria")
+    if origem == "cnpj":
+        return ("Você já validou esta mesma descrição para esta EMPRESA (mesmo CNPJ) "
+                "em uma proposta anterior — e ela virou este produto.")
     if origem == "cliente":
         return ("Você já validou esta mesma descrição para este cliente em uma proposta "
                 "anterior — e ela virou este produto.")
@@ -1925,7 +2042,8 @@ async def extrair_email(
             itens_enriquecidos = _fazer_matching(itens_brutos, claude, sb,
                                                  cliente=prop_raw.get("cliente") or "",
                                                  avisos=avisos_extracao,
-                                                 so_rastreavel=_so_rastreavel)
+                                                 so_rastreavel=_so_rastreavel,
+                                                 cnpj=prop_raw.get("cnpj") or "")
         except Exception as e:
             # Fallback com a FORMA correta: descrição do cliente, tudo em branco.
             # (Devolver itens_brutos aqui produzia item vazio na tela.)
@@ -1991,7 +2109,7 @@ def _ilike_literal(s: str) -> str:
     return (s or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _aprender_memoria(sb, pares: list, cliente: str) -> dict:
+def _aprender_memoria(sb, pares: list, cliente: str, cnpj: str = "") -> dict:
     """[4] Grava o desfecho da proposta na memória de matching.
 
     Premissa (definida pelo Leonardo): o OPERADOR é a hierarquia superior. O que
@@ -2005,12 +2123,20 @@ def _aprender_memoria(sb, pares: list, cliente: str) -> dict:
       Na dúvida não julga nada — mas o fato fica registrado de qualquer forma.
     """
     cli = _norm_entrada(cliente or "")
+    # A chave de cliente da memória é a RAIZ do CNPJ (8 dígitos): a mesma empresa
+    # chega com nome diferente a cada proposta ("convergint", "convergint ms",
+    # "unicamp" faturado pela Convergint...). O nome fica gravado do mesmo jeito
+    # e continua servindo de rede quando não há CNPJ.
+    _dig = re.sub(r"\D", "", cnpj or "")
+    _cnpj14 = _dig if len(_dig) == 14 else None
+    _raiz = _dig[:8] if len(_dig) == 14 else None
     acertos, erros = 0, 0
 
     # O que a memória diria HOJE para estas entradas (antes de aprender)
     antes = {}
     try:
-        r = sb.rpc("memoria_match", {"entradas": [p[0] for p in pares], "cli": cliente or ""}).execute()
+        r = sb.rpc("memoria_match", {"entradas": [p[0] for p in pares], "cli": cliente or "",
+                                     "cnpj_in": cnpj or ""}).execute()
         for m in (r.data or []):
             antes[m["entrada_norm"]] = m.get("produto_id")
     except Exception:
@@ -2023,14 +2149,17 @@ def _aprender_memoria(sb, pares: list, cliente: str) -> dict:
                 .eq("entrada_norm", entrada).eq("cliente_norm", cli).eq("produto_id", pid)\
                 .limit(1).execute()
             if ex.data:
-                sb.table("match_memoria").update({
-                    "acertos": int(ex.data[0].get("acertos") or 0) + 1,
-                    "ultima_vez": _now_iso(),
-                }).eq("id", ex.data[0]["id"]).execute()
+                _upd = {"acertos": int(ex.data[0].get("acertos") or 0) + 1,
+                        "ultima_vez": _now_iso()}
+                if _raiz:      # nó criado antes da migração ganha a chave agora
+                    _upd["cnpj_raiz"] = _raiz
+                    _upd["cnpj"] = _cnpj14
+                sb.table("match_memoria").update(_upd).eq("id", ex.data[0]["id"]).execute()
             else:
                 sb.table("match_memoria").insert({
                     "entrada_norm": entrada, "cliente_norm": cli,
                     "produto_id": pid, "acertos": 1,
+                    "cnpj": _cnpj14, "cnpj_raiz": _raiz,
                 }).execute()
             acertos += 1
         except Exception:
@@ -2211,7 +2340,7 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
             except Exception:
                 pass   # aprender não pode derrubar o salvamento da proposta
 
-    memoria = _aprender_memoria(sb, aprender, cliente) if aprender else {}
+    memoria = _aprender_memoria(sb, aprender, cliente, cnpj) if aprender else {}
     return {"atualizados": atualizados, "inseridos": inseridos,
             "ignorados": ignorados, "memoria": memoria}
 
