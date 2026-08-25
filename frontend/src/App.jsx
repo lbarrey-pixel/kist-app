@@ -1665,7 +1665,12 @@ export default function App() {
     });
   }
 
-  async function processar() {
+  // `relerDoZero`: escape do cache de leitura. A leitura do e-mail é reaproveitada
+  // por 8h quando o conteúdo é idêntico (retentativa depois de erro, reload,
+  // "deixa eu tentar de novo" — tudo isso deixa de ser pago). O único caso em que
+  // reler o MESMO conteúdo faz sentido é leitura correta porém INCOMPLETA: o
+  // modelo pulou um item. Aí o operador força.
+  async function processar(relerDoZero = false) {
     if (!numeroProposta.trim()) { setErro("Informe o número da proposta."); return; }
     if (!texto.trim() && arquivos.length === 0 && imagens.length === 0) {
       setErro("Arraste arquivos, cole o texto ou adicione prints."); return;
@@ -1675,6 +1680,7 @@ export default function App() {
       const form = new FormData();
       form.append("numero_proposta", numeroProposta);
       form.append("so_rastreavel", soRastreavel ? "1" : "0");
+      if (relerDoZero) form.append("ignorar_cache", "1");
       arquivos.forEach((f) => form.append("arquivos", f));
       if (texto) form.append("texto", texto);
       imagens.forEach((img) => form.append("imagens", img));
@@ -2355,8 +2361,22 @@ export default function App() {
                         <div className="flex items-start gap-2.5">
                           <span className="mt-0.5 flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full bg-amber text-[10px] font-bold text-white">i</span>
                           <div className="min-w-0 flex-1">
-                            <div className="text-[13px] font-semibold text-amber">Anexo repetido — usei o corpo do e-mail</div>
+                            {/* O título era FIXO em "Anexo repetido" — nota de imagem
+                                cortada ou de leitura reaproveitada saía com rótulo de
+                                outra coisa. Agora cada tipo diz o que é. */}
+                            <div className="text-[13px] font-semibold text-amber">
+                              {nt.tipo === "leitura_reaproveitada" ? "Leitura reaproveitada — não paguei de novo"
+                                : nt.tipo === "imagens_cortadas"   ? "Nem todas as imagens couberam"
+                                : nt.tipo === "itens_somados"      ? "Linhas repetidas — somei as quantidades"
+                                : "Anexo repetido — usei o corpo do e-mail"}
+                            </div>
                             <div className="mt-0.5 text-[12.5px] leading-relaxed text-sub">{nt.mensagem}</div>
+                            {nt.tipo === "leitura_reaproveitada" && (
+                              <button onClick={() => { setNotasSistema([]); processar(true); }}
+                                className="mt-1.5 rounded-md border border-amber/60 px-2 py-0.5 text-[11px] font-medium text-amber hover:bg-white/50">
+                                ler o e-mail de novo, do zero
+                              </button>
+                            )}
                           </div>
                           <button onClick={() => setNotasSistema((p) => p.filter((_, j) => j !== i))}
                             title="Dispensar" className="rounded p-0.5 text-amber/60 hover:bg-white/40 hover:text-amber">

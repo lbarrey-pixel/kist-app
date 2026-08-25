@@ -66,7 +66,10 @@ except Exception:
 # duas divergirem, o agente é avisado de que o conhecimento dele está atrasado.
 # Conhecimento velho não avisa que é velho — ele responde com a mesma confiança
 # e erra. Este número é a única coisa que impede isso.
-VERSAO_BACKEND = "3.25"
+import hashlib as _hashlib_ext
+from datetime import datetime as _dt_ext, timedelta as _td_ext
+
+VERSAO_BACKEND = "3.26"
 
 app = FastAPI(title="Kist Cotações API", version=VERSAO_BACKEND)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -193,15 +196,24 @@ Formato — SEMPRE retorne um array de propostas, mesmo que seja apenas uma:
       "rc_neg": "RC XXXXX ou NEG-XXXXXXX ou null",
       "itens": [
         {
-          "descricao": "descrição comercial curta — máx 120 chars",
           "descricao_original": "texto exato do cliente, preservado integralmente",
-          "codigo_cliente": "código do item no sistema do cliente, ou null",
-          "specs_complementares": "specs técnicas ou PN se presentes, senão null",
+          "descricao": "SÓ se você for de fato encurtar/limpar o texto. Se a sua versão
+                        ficaria igual à original, OMITA este campo — o sistema copia
+                        a original sozinho. Máx 120 chars.",
+          "codigo_cliente": "código do item no sistema do cliente (omita se não houver)",
+          "specs_complementares": "specs técnicas ou PN (omita se não houver)",
           "quantidade": 1,
-          "unidade": "UN",
-          "sugerir_pn": false
+          "unidade": "UN"
         }
       ]
+
+REGRA DE ECONOMIA (vale para todos os campos de item):
+- Campo que não se aplica: OMITA. Não escreva "campo": null.
+- "descricao": omita quando ficaria idêntica à "descricao_original". Medido no
+  histórico: isso acontece em 44% dos itens. Escrever o mesmo texto duas vezes é
+  puro desperdício — e cada reescrita é uma chance de corromper o texto do cliente,
+  que é sagrado.
+- Não indente o JSON nem quebre linhas: retorne compacto.
     }
   ]
 }
@@ -227,8 +239,7 @@ REGRAS DE DESCRIÇÃO:
 - "descricao": sempre curta e comercial. Formato: [Categoria] [Marca/Modelo] [Spec principal]
 - "descricao_original": preservar EXATAMENTE como veio, sem alterar nada
 - "specs_complementares": preencher quando original for longa ou tabela; incluir PN/código se presente
-- "sugerir_pn": true SÓ para itens de alto valor (notebook, servidor, switch gerenciável, UPS,
-  câmera IP, storage) sem modelo específico definido. Commodities → sempre false
+
 
 REGRAS DE CNPJ (o campo mais negligenciado — leia com atenção):
 - O CNPJ do CLIENTE é OBRIGATÓRIO sempre que existir no material. Sem ele a proposta não pode
@@ -364,6 +375,94 @@ def _excludentes_matching(sb) -> str:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Cache da LEITURA do e-mail ───────────────────────────────────────────────
+# Guarda o que a IA extraiu do conteúdo, NÃO a proposta: o matching contra o
+# banco roda sempre de novo (o banco muda entre uma tentativa e outra; a leitura
+# do e-mail, não). Medido: 11% das extrações salvas foram re-leitura de conteúdo
+# idêntico — e é um piso, porque tentativa que morre antes de salvar não aparece
+# na conta. Nas 4 tentativas de hoje, 3 foram a MESMA leitura, paga 3 vezes.
+_CACHE_HORAS_FALLBACK = 8
+
+def _cache_horas(sb) -> int:
+    """TTL em runtime (config_kist). Sem redeploy para ajustar."""
+    try:
+        r = sb.table("config_kist").select("valor").eq("chave", "extracao_cache_horas").execute()
+        if r.data:
+            return max(0, min(int(str(r.data[0].get("valor")).strip()), 168))
+    except Exception:
+        pass
+    return _CACHE_HORAS_FALLBACK
+
+
+def _hash_conteudo(msg_content: list, modelo: str) -> str:
+    """Impressão digital do que VAI para a IA — texto e imagens incluídos.
+
+    O modelo entra no hash de propósito: Haiku e Sonnet leem o mesmo e-mail de
+    forma diferente, e servir a leitura de um como se fosse do outro esconderia
+    exatamente a comparação que queremos poder fazer.
+    """
+    h = _hashlib_ext.sha256()
+    h.update((modelo or "").encode())
+    for b in msg_content or []:
+        if not isinstance(b, dict):
+            continue
+        t = b.get("type")
+        if t == "text":
+            h.update(b"T"); h.update((b.get("text") or "").encode("utf-8", "replace"))
+        elif t == "image":
+            src = b.get("source") or {}
+            h.update(b"I"); h.update((src.get("data") or "").encode())
+    return h.hexdigest()
+
+
+def _cache_extracao_ler(sb, hsh: str, horas: int):
+    """Devolve (propostas, idade_em_minutos) ou (None, 0)."""
+    if horas <= 0 or not hsh:
+        return None, 0
+    try:
+        r = sb.table("extracao_cache").select("resultado,criado_em,reusos") \
+              .eq("hash", hsh).limit(1).execute()
+        if not r.data:
+            return None, 0
+        row = r.data[0]
+        nasceu = _dt_ext.fromisoformat(str(row["criado_em"]).replace("Z", "+00:00"))
+        idade = _dt_ext.now(nasceu.tzinfo) - nasceu
+        if idade > _td_ext(hours=horas):
+            return None, 0
+        props = row.get("resultado")
+        if isinstance(props, dict):
+            props = props.get("propostas")
+        if not isinstance(props, list) or not props:
+            return None, 0
+        try:
+            sb.table("extracao_cache").update({
+                "reusos": int(row.get("reusos") or 0) + 1,
+                "ultimo_reuso": _now_iso(),
+            }).eq("hash", hsh).execute()
+        except Exception:
+            pass
+        return props, int(idade.total_seconds() // 60)
+    except Exception:
+        return None, 0
+
+
+def _cache_extracao_gravar(sb, hsh: str, props: list, modelo: str, usuario: str) -> None:
+    """Só grava leitura BEM-SUCEDIDA. Falha nunca entra no cache — senão o
+    'tente de novo' do aviso de erro devolveria a mesma falha para sempre."""
+    if not hsh or not props:
+        return
+    try:
+        sb.table("extracao_cache").upsert({
+            "hash": hsh, "resultado": {"propostas": props}, "modelo": modelo,
+            "n_propostas": len(props),
+            "n_itens": sum(len(p.get("itens") or []) for p in props if isinstance(p, dict)),
+            "usuario_email": usuario, "criado_em": _now_iso(),
+            "reusos": 0, "ultimo_reuso": None,
+        }).execute()
+    except Exception:
+        pass
+
+
 def _pede_atencao(descricao: str, specs: str) -> bool:
     """Sinaliza item que provavelmente precisa de consulta técnica: sem PN/código
     aparente em nenhum dos lados. É só um DESTAQUE — o botão Conferir existe em
@@ -1331,7 +1430,6 @@ def _parsear_excel_estruturado(data: bytes):
                     "specs_complementares": None,
                     "quantidade":  int(qtd) if qtd == int(qtd) else qtd,
                     "unidade":     unid,
-                    "sugerir_pn":  False,
                 })
 
             if not itens:
@@ -1351,6 +1449,7 @@ async def extrair_email(
     imagens: list[UploadFile] = File(default=[]),
     numero_proposta: str = Form(...),
     so_rastreavel: str = Form("0"),
+    ignorar_cache: str = Form("0"),
     token_form: str = Form(None),
     request: Request = None,
     usuario: str = Depends(verificar_token)
@@ -1359,6 +1458,11 @@ async def extrair_email(
     Aceita múltiplos arquivos simultaneamente; retorna uma ou mais propostas."""
 
     import json as _json_ext
+
+    # Escape do cache: leitura correta mas incompleta (o modelo pulou um item) é
+    # o único caso em que reler o MESMO conteúdo faz sentido. Sem esta porta, o
+    # operador ficaria 8h preso à primeira leitura.
+    _ignorar_cache = str(ignorar_cache).strip().lower() in ("1", "true", "on", "yes", "sim")
 
     imgs_msg: list = []        # imagens embutidas nos .msg
     contexto_email = ""        # body/assunto do email (contexto de cliente/CNPJ)
@@ -1796,61 +1900,40 @@ async def extrair_email(
                     "data": _b64.standard_b64encode(ib).decode()}})
         if not msg_content:
             return []
-        # 4000 tokens não cabiam uma cotação grande. O e-mail da Universal
-        # (NEG-0040613) precisava de ~4.400 no piso e ~7.000 com os endereços de
-        # entrega por item: a resposta cortava no meio, o JSON ficava inválido, o
-        # except devolvia [] e a proposta chegava VAZIA na tela — sem nenhum sinal
-        # de que tinha havido corte. Teto alto + o aviso abaixo: se bater, o
-        # operador fica sabendo em vez de receber uma lista silenciosamente curta.
-        resp = claude.messages.create(
-            model=modelo_extracao, max_tokens=16000,
-            system=SYSTEM_EXTRACAO,
-            messages=[{"role": "user", "content": msg_content}],
-        )
-        if getattr(resp, "stop_reason", "") == "max_tokens":
-            avisos_extracao.append({
-                "tipo": "busca_falhou", "etapa": "extracao_truncada",
-                "assinatura": "extracao:max_tokens",
-                "mensagem": ("A lista de itens era grande demais e a extração foi cortada "
-                             "no meio. A proposta pode ter vindo INCOMPLETA — confira "
-                             "contra o e-mail antes de gerar o CSV."),
-                "detalhe": f"stop_reason=max_tokens · modelo={modelo_extracao}",
-            })
-        raw = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
-        # Extração robusta: remove backticks/preamble e extrai pelo primeiro { → último }
-        raw = re.sub(r'^```(?:json)?\s*', '', raw.strip())
-        raw = re.sub(r'\s*```$', '', raw.strip())
-        # Se ainda tiver texto antes do JSON (ex: preamble "Aqui está:" ou "json" no início)
-        start = raw.find('{')
-        if start > 0:
-            raw = raw[start:]
-        end = raw.rfind('}')
-        if end != -1 and end < len(raw) - 1:
-            raw = raw[:end + 1]
-        try:
-            parsed = _json_ext.loads(raw)
-            # Normalizar: se retornar formato antigo (sem propostas[]), encapsular
-            if "itens" in parsed and "propostas" not in parsed:
-                parsed = {"propostas": [parsed]}
-            return parsed.get("propostas", [])
-        except Exception as e:
-            # Antes este except devolvia [] calado e a tela mostrava proposta vazia
-            # como se o e-mail não tivesse itens. "Não veio nada" e "não consegui ler"
-            # são coisas diferentes e o operador precisa saber qual das duas é.
-            avisos_extracao.append({
-                "tipo": "busca_falhou", "etapa": "extracao_json",
-                "assinatura": f"extracao:json:{type(e).__name__}",
-                "mensagem": ("Li o e-mail mas não consegui interpretar a resposta da "
-                             "extração. Os itens NÃO foram perdidos no e-mail — foi "
-                             "falha do sistema. Tente de novo; se repetir, me chame."),
-                "detalhe": f"{type(e).__name__}: {e}"[:400],
-            })
-            return []
+        # Uma rota só até a IA: monta aqui, chama lá. Antes eram DUAS cópias da
+        # mesma chamada + parsing; cache em uma só cobriria metade dos casos.
+        return await _chamar_com_content(msg_content)
 
     async def _chamar_com_content(msg_content):
-        """Mesma chamada, recebendo o content já montado pela ingestão."""
+        """Rota ÚNICA da leitura pela IA — com cache de conteúdo.
+
+        `_chamar_extracao` monta o content e delega para cá, de modo que existe
+        um só lugar que fala com a IA e um só lugar que consulta o cache.
+        """
         if not msg_content:
             return []
+
+        _sb_cache = get_supabase()
+        _horas = _cache_horas(_sb_cache)
+        _hsh = _hash_conteudo(msg_content, modelo_extracao)
+        if not _ignorar_cache:
+            _props_cache, _idade = _cache_extracao_ler(_sb_cache, _hsh, _horas)
+            if _props_cache:
+                # NOTA (não aviso): o frontend antigo ignora chaves novas e isso
+                # não é falha — é trabalho que não precisou ser refeito. O
+                # operador precisa saber que a leitura foi reaproveitada, senão
+                # ele corrige o e-mail, reenvia e não entende por que veio igual.
+                notas_extracao.append({
+                    "tipo": "leitura_reaproveitada", "arquivo": "",
+                    "mensagem": (f"Este conteúdo já tinha sido lido há {_idade} min — "
+                                 f"reaproveitei a leitura em vez de pagar de novo. "
+                                 f"O match com o banco foi refeito agora, do zero. "
+                                 f"Se quiser forçar uma leitura nova, marque "
+                                 f"'ignorar cache'."),
+                    "exclusivos": [],
+                })
+                return _props_cache
+
         resp = claude.messages.create(
             model=modelo_extracao, max_tokens=16000,
             system=SYSTEM_EXTRACAO,
@@ -1879,7 +1962,11 @@ async def extrair_email(
             parsed = _json_ext.loads(raw)
             if "itens" in parsed and "propostas" not in parsed:
                 parsed = {"propostas": [parsed]}
-            return parsed.get("propostas", [])
+            _props_ok = parsed.get("propostas", [])
+            # Só leitura BEM-SUCEDIDA entra no cache. Se guardássemos a falha, o
+            # "tente de novo" do aviso devolveria a mesma falha por 8 horas.
+            _cache_extracao_gravar(_sb_cache, _hsh, _props_ok, modelo_extracao, usuario)
+            return _props_ok
         except Exception as e:
             avisos_extracao.append({
                 "tipo": "busca_falhou", "etapa": "extracao_json",
@@ -1992,6 +2079,17 @@ async def extrair_email(
             if isinstance(_it, str):
                 _its_ok.append({"descricao": _it, "descricao_original": _it})
             elif isinstance(_it, dict):
+                # ECONOMIA DE SAÍDA: o prompt manda OMITIR "descricao" quando ela
+                # ficaria idêntica à original (44% dos itens, medido). O sistema
+                # reconstitui aqui. Vale nos dois sentidos, porque modelo antigo /
+                # fallback do Excel podem mandar só um dos lados — e item sem
+                # descricao_original quebra o matching e a ficha de procedência.
+                _d  = (_it.get("descricao") or "").strip()
+                _do = (_it.get("descricao_original") or "").strip()
+                if _do and not _d:
+                    _it["descricao"] = _do
+                elif _d and not _do:
+                    _it["descricao_original"] = _d
                 _its_ok.append(_it)
             # qualquer outra coisa (número, null) é descartada em silêncio
         _pr["itens"] = _its_ok
