@@ -69,7 +69,7 @@ except Exception:
 import hashlib as _hashlib_ext
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.26"
+VERSAO_BACKEND = "3.27"
 
 app = FastAPI(title="Kist Cotações API", version=VERSAO_BACKEND)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -392,6 +392,85 @@ def _cache_horas(sb) -> int:
     except Exception:
         pass
     return _CACHE_HORAS_FALLBACK
+
+
+# ── FREIO DE RAJADA NA BUSCA DA INTERNET (v3.27) ─────────────────────────────
+# Em 25/08 uma tela disparou 22 buscas em 0,53 s — itens DIFERENTES, em laço.
+# Custou US$ 5,11: 66% de tudo que o sistema gastou em 47 horas. Ninguém pediu
+# aquelas buscas e 15 delas não acharam nada.
+#
+# O freio mora no BACKEND de propósito. Não dá para controlar qual JavaScript
+# está aberto na aba de alguém: aba antiga, cache do navegador ou bug futuro de
+# frontend voltam a gastar sozinhos. Quem decide gastar tem de ser o lado que a
+# gente controla o deploy.
+#
+# O sinal que separa gente de laço é SIMULTANEIDADE, não quantidade. Operador
+# apressado clica 5 itens em 20 s; laço dispara 22 em meio segundo. Por isso o
+# nível duro é "2 em 3 s" — medido contra a rajada real e contra 6 cenários de
+# uso humano (nenhum barra).
+#
+# Estado em memória do processo: some no restart e não é compartilhado entre
+# workers. É de propósito — o freio não pode depender do banco nem custar I/O
+# no caminho quente. Com mais de um worker o teto efetivo multiplica pelo número
+# de workers, e ainda assim segura a rajada (que cai toda no mesmo worker).
+import threading as _threading
+
+_FREIO_LOCK = _threading.Lock()
+_FREIO_HIST: dict = {}          # usuario -> [timestamps das buscas liberadas]
+_FREIO_FALLBACK = {"burst_s": 3, "burst_max": 2,
+                   "janela_s": 60, "janela_max": 8, "teto_dia": 0}
+_freio_cfg_cache: dict = {}
+_freio_cfg_em: float = 0.0
+
+
+def _freio_cfg(sb) -> dict:
+    """config_kist['freio_busca'] com cache de 5 min. Ajuste sem redeploy.
+
+    `teto_dia` nasce DESLIGADO (0). Ele existe para o dono do orçamento ligar
+    quando quiser — não para o sistema decidir sozinho que o operador já
+    trabalhou demais hoje.
+    """
+    global _freio_cfg_cache, _freio_cfg_em
+    if _freio_cfg_cache and (time.time() - _freio_cfg_em) < 300:
+        return _freio_cfg_cache
+    cfg = dict(_FREIO_FALLBACK)
+    try:
+        import json as _jf
+        r = (sb.table("config_kist").select("valor")
+             .eq("chave", "freio_busca").limit(1).execute())
+        if r.data:
+            v = r.data[0].get("valor")
+            d = _jf.loads(v) if isinstance(v, str) else (v or {})
+            for k in cfg:
+                if k in d:
+                    cfg[k] = float(d[k]) if k.endswith("_s") else int(d[k])
+    except Exception:
+        pass
+    _freio_cfg_cache, _freio_cfg_em = cfg, time.time()
+    return cfg
+
+
+def _freio_busca(usuario: str, sb) -> tuple:
+    """(liberado, motivo). Só conta a busca quando libera.
+
+    Barrar é reversível: o operador clica de novo e a busca acontece. Gastar
+    não é. Na dúvida, barra.
+    """
+    cfg = _freio_cfg(sb)
+    t = time.time()
+    u = (usuario or "?").strip().lower()
+    with _FREIO_LOCK:
+        h = [x for x in _FREIO_HIST.get(u, []) if t - x < 86400.0]
+        _FREIO_HIST[u] = h
+        if sum(1 for x in h if t - x < cfg["burst_s"]) >= cfg["burst_max"]:
+            return False, f"{int(cfg['burst_max'])}+ buscas em {int(cfg['burst_s'])}s"
+        if sum(1 for x in h if t - x < cfg["janela_s"]) >= cfg["janela_max"]:
+            return False, f"{int(cfg['janela_max'])} buscas em {int(cfg['janela_s'])}s"
+        dia = int(cfg.get("teto_dia") or 0)
+        if dia and len(h) >= dia:
+            return False, f"teto diário de {dia} buscas"
+        h.append(t)
+        return True, ""
 
 
 def _hash_conteudo(msg_content: list, modelo: str) -> str:
@@ -1333,7 +1412,150 @@ def _defesa_do_match(match: dict, row: dict) -> str:
     return (base + (" " + motivo if motivo else "")).strip()
 
 
-def _parsear_excel_estruturado(data: bytes):
+# ── LEITURA DE PLANILHA: ESCOLHA DA COLUNA DE DESCRIÇÃO (v3.27) ──────────────
+# O que quebrou (26/08, RFQ da Maracatour): a planilha tinha DUAS colunas que
+# casavam com a regex — "MATERIAL / SERVIÇO / LICENÇA" (classificação) e
+# "Descrição Detalhada do Produto" (o produto). O código pegava a PRIMEIRA que
+# casasse. Todo item virou a palavra "MATERIAL" ou "LICENÇA", a consolidação
+# somou as linhas idênticas, e 7 itens viraram 2.
+#
+# O defeito de fundo era maior que a regex: o parser não tinha como DUVIDAR.
+# Devolver alguma coisa era lido como "deu certo" (`not propostas_raw`), e isso
+# calava a extração por IA — que lê a linha inteira e teria acertado.
+_H_DESC_FORTE   = re.compile(r'descri', re.I)                          # +4
+_H_DESC_MEDIO   = re.compile(r'especifica|discrimina', re.I)           # +3
+_H_DESC_PRODUTO = re.compile(r'produto|item\s+cotado', re.I)           # +2
+_H_DESC_FRACO   = re.compile(r'material|servi[çc]|equipamento', re.I)  # +1
+_H_DESC_NUNCA = re.compile(
+    r'\bmarca|fabricante|\bmodelo|c[oó]d(igo)?\b|refer[êe]ncia|part\s*number|\bpn\b|'
+    r'quant|\bqtd|\bqtde|valor|pre[çc]o|total|\bipi\b|\bicms\b|\bncm\b|'
+    r'prazo|entrega|unid|\bund\b|\bun\b|observa|\bobs\b', re.I)
+
+
+def _metricas_coluna(col: list) -> tuple:
+    v = [x for x in col if x]
+    if not v:
+        return 0.0, 0, 0.0, 1.0, 0.0
+    comp = sum(len(x) for x in v) / len(v)
+    dist = len(set(x.lower() for x in v))
+    num = sum(1 for x in v if re.fullmatch(r'[\d\.,\s%/R$-]+', x)) / len(v)
+    return comp, dist, dist / len(v), num, len(v) / len(col)
+
+
+def _escolher_col_descricao(header_row: list, item_rows: list):
+    """Índice da coluna de descrição, ou None se nenhuma parecer descrição.
+
+    Duas camadas, nenhuma específica de cliente:
+      · CABEÇALHO — "descrição" pesa mais que "material". Na prática "material"
+        tanto nomeia a classificação quanto a descrição, então virou o sinal
+        mais fraco, não o primeiro a casar.
+      · DADOS — coluna de classificação é curta e repetitiva (média de 8
+        caracteres, 2 valores distintos em 7 linhas); descrição é longa e
+        variada (66 caracteres, 7 de 7 distintos). É esta camada que salva
+        template cujo cabeçalho nunca vimos.
+
+    Devolver None não é falha: é o parser dizendo que não sabe, para a planilha
+    seguir à extração por IA. Errar em silêncio é o que não pode.
+    """
+    if not item_rows:
+        return None
+    n = max([len(header_row)] + [len(r) for r in item_rows])
+    placar = []
+    for i in range(n):
+        h = (header_row[i] if i < len(header_row) else "") or ""
+        col = [(str(r[i]).strip() if i < len(r) and r[i] else "") for r in item_rows]
+        comp, dist, razao, num, preench = _metricas_coluna(col)
+
+        if   _H_DESC_FORTE.search(h):   hs = 4.0
+        elif _H_DESC_MEDIO.search(h):   hs = 3.0
+        elif _H_DESC_PRODUTO.search(h): hs = 2.0
+        elif _H_DESC_FRACO.search(h):   hs = 1.0
+        else:                           hs = 0.0
+
+        # "Descrição" vence a lista de nunca: um cabeçalho "Descrição / Marca"
+        # continua sendo a descrição.
+        if hs < 3.0 and _H_DESC_NUNCA.search(h):
+            continue
+        if num >= 0.8 or preench < 0.5:
+            continue
+        # Classificação: curta E repetitiva, ou curta demais. Dois guardas
+        # independentes — com um limiar só, "CABO 6MM" era descartado junto.
+        if (comp < 15 and razao < 0.6) or comp < 9:
+            continue
+
+        placar.append((hs + min(comp / 30.0, 1.0) * 1.5 + razao * 1.5, i))
+    if not placar:
+        return None
+    placar.sort(reverse=True)
+    return placar[0][1]
+
+
+_SYSTEM_CERT_PLANILHA = """Você confere o mapa de colunas que um leitor automático montou para uma
+planilha de cotação. Responda APENAS JSON puro, sem markdown, sem comentário.
+
+{"descricao": <índice da coluna com a DESCRIÇÃO DO PRODUTO, ou null>,
+ "confere": true|false,
+ "motivo": "uma frase curta"}
+
+A coluna de DESCRIÇÃO é a que diz O QUE É o produto. NÃO é a coluna de
+classificação (MATERIAL / SERVIÇO / LICENÇA / TIPO), que apenas agrupa os itens.
+NÃO é marca, modelo, código, quantidade, unidade, preço, prazo ou observação.
+Se nenhuma coluna traz a descrição do produto, devolva descricao=null e
+confere=false."""
+
+
+def _certificar_colunas_ia(header_row: list, item_rows: list, i_desc: int, claude):
+    """A IA confere a escolha do parser. (aprovado, indice_dela).
+
+    Recebe só CABEÇALHO + 3 LINHAS de amostra — ~400 tokens no Haiku, cerca de
+    US$ 0,0004 por planilha. Não é a planilha inteira: certificar é barato,
+    reler é que custa.
+
+    Discordou → o parser abstém e a planilha vai para a extração normal, que lê
+    a linha toda. Não trocamos a escolha pela dela: quando os dois leitores
+    discordam sobre O QUE É a descrição, o certo é chamar quem lê o documento
+    inteiro, não escolher um palpite entre dois.
+
+    IA fora do ar → aprova. Ficar sem certificador não pode parar a leitura; a
+    escolha por cabeçalho+dados já se sustenta sozinha.
+    """
+    if claude is None:
+        return True, i_desc
+    try:
+        import json as _jc
+        cab = "\n".join(f"  [{i}] {h}" for i, h in enumerate(header_row) if str(h).strip())
+        am = ""
+        for n, v in enumerate(item_rows[:3]):
+            am += f"\n  linha {n + 1}: " + " · ".join(
+                f"[{i}]={str(x)[:60]}" for i, x in enumerate(v) if str(x).strip())
+        r = claude.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=300,
+            system=_SYSTEM_CERT_PLANILHA,
+            messages=[{"role": "user", "content":
+                       f"COLUNAS:\n{cab}\n\nAMOSTRA DAS LINHAS DE ITEM:{am}\n\n"
+                       f"O leitor escolheu descrição=[{i_desc}]. Confere?"}],
+            temperature=0.0, timeout=20.0,
+        )
+        raw = "".join(b.text for b in r.content if getattr(b, "type", "") == "text").strip()
+        raw = re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw.strip())
+        s0, e0 = raw.find('{'), raw.rfind('}')
+        if s0 == -1 or e0 == -1:
+            return True, i_desc
+        d = _jc.loads(raw[s0:e0 + 1])
+        dela = d.get("descricao")
+        if dela is None or int(dela) != int(i_desc):
+            print(f"[planilha] certificador discordou (parser={i_desc}, ia={dela}) "
+                  f"· {str(d.get('motivo'))[:120]}")
+            return False, dela
+        return True, i_desc
+    except Exception as e:
+        # Falha do certificador não pode custar a leitura.
+        print(f"[planilha] certificador indisponível: {type(e).__name__}")
+        return True, i_desc
+
+
+def _parsear_excel_estruturado(data: bytes, claude=None):
     """Parser determinístico para Excel com tabela de itens estruturada.
     Detecta colunas pelo header e extrai dados sem chamar a IA.
     Retorna lista de propostas no formato padrão, ou None se não detectar estrutura.
@@ -1381,11 +1603,26 @@ def _parsear_excel_estruturado(data: bytes):
                         return i
                 return None
 
-            i_desc = _col(HDESC2, header_row)
+            # A descrição NÃO é mais "a primeira coluna que casa" — é a que
+            # ganha por cabeçalho + dados, e depois passa pelo certificador.
+            i_desc = _escolher_col_descricao(header_row, item_rows_raw)
+            if i_desc is None:
+                print("[planilha] nenhuma coluna parece descrição — entregando à IA")
+                return None
+            _ok_cert, _ = _certificar_colunas_ia(header_row, item_rows_raw, i_desc, claude)
+            if not _ok_cert:
+                return None
+
             i_qtd  = _col(HQTD2, header_row)
             i_und  = _col(re.compile(r'\bund|\bun\b|\bunid', re.I), header_row)
+            # Marca/modelo/código são dado que o CLIENTE escreveu na planilha —
+            # carregá-los não é inventar. Sem eles, "MK-CN07 Confetti Shoot" vai
+            # para o matching e para o motor sem "Moka".
+            i_marca = _col(re.compile(r'\bmarca|fabricante', re.I), header_row)
+            i_mod   = _col(re.compile(r'\bmodelo|part\s*number|\bpn\b', re.I), header_row)
+            i_cod   = _col(re.compile(r'c[oó]d(igo)?\b|refer[êe]ncia', re.I), header_row)
 
-            if i_desc is None or i_qtd is None:
+            if i_qtd is None:
                 continue
 
             # Extrair metadados: CNPJ, cliente, RC
@@ -1413,7 +1650,10 @@ def _parsear_excel_estruturado(data: bytes):
                 def _cell(idx):
                     if idx is None or idx >= len(vals): return ""
                     v = vals[idx]
-                    return str(v).strip() if v is not None else ""
+                    # A célula do Excel quebra linha no meio da descrição
+                    # ("...Supports up to 8 \nDCI 4K Outputs..."). Sem
+                    # normalizar, o \n viaja para a proposta e para a query.
+                    return re.sub(r'\s+', ' ', str(v).strip()) if v is not None else ""
                 desc = _cell(i_desc)
                 if not desc or desc == "None":
                     continue
@@ -1424,10 +1664,16 @@ def _parsear_excel_estruturado(data: bytes):
                     qtd = 1
                 unid = (_cell(i_und) or "UN").upper()
                 if not unid or unid == "NONE": unid = "UN"
+                _sp = []
+                for _rot, _ix in (("Marca", i_marca), ("Modelo", i_mod),
+                                  ("Cód. cliente", i_cod)):
+                    _v = _cell(_ix)
+                    if _v and _v.lower() != "none":
+                        _sp.append(f"{_rot}: {_v}")
                 itens.append({
                     "descricao":          desc[:120],
                     "descricao_original": desc[:400],
-                    "specs_complementares": None,
+                    "specs_complementares": (" | ".join(_sp) or None),
                     "quantidade":  int(qtd) if qtd == int(qtd) else qtd,
                     "unidade":     unid,
                 })
@@ -1584,7 +1830,7 @@ async def extrair_email(
                 elif flo.endswith((".xlsx", ".xls", ".xlsm")):
                     _planilhas.append(dados)
                 for _pl in _planilhas:
-                    _det = _parsear_excel_estruturado(_pl)
+                    _det = _parsear_excel_estruturado(_pl, claude)
                     if _det:
                         propostas_raw.extend(_det)
             except Exception:
@@ -1632,7 +1878,7 @@ async def extrair_email(
                     continue
                 if afn.endswith((".xlsx", ".xls", ".xlsm")):
                     # Tentar parser determinístico primeiro (Excel estruturado com header)
-                    _props_det = _parsear_excel_estruturado(att.data)
+                    _props_det = _parsear_excel_estruturado(att.data, claude)
                     if _props_det:
                         # Enriquecer com contexto do email (CNPJ pode estar no body)
                         for _p in _props_det:
@@ -1701,7 +1947,7 @@ async def extrair_email(
                 imgs_msg.append((_n, _b, _origem_msg, _i))
 
         elif flo.endswith((".xlsx", ".xls", ".xlsm")):
-            _props_det = _parsear_excel_estruturado(dados)
+            _props_det = _parsear_excel_estruturado(dados, claude)
             if _props_det:
                 for _p in _props_det:
                     if not _p.get("cnpj") and contexto_email:
@@ -2801,6 +3047,26 @@ def ficha_internet(payload: dict, usuario: str = Depends(verificar_token)):
     # operador (reescreveu o termo): o motor usa o termo dele e aprende com isso.
     cnpj = _cnpj_do_cliente(payload.get("cnpj"))
     termo_rebusca = (payload.get("termo_rebusca") or "").strip() or None
+
+    # ── FREIO (v3.27) — ANTES de qualquer chamada de IA ───────────────────
+    # Uma busca custa ~US$ 0,22 e 5 chamadas de IA. Cobra-se a decisão de gastar
+    # aqui, não lá dentro.
+    _sb_freio = get_supabase()
+    _liberado, _motivo = _freio_busca(usuario, _sb_freio)
+    if not _liberado:
+        # Registra a recusa: sem isso o freio é invisível e não dá para saber se
+        # está apertado demais. camada=0 marca "não houve busca".
+        try:
+            _sb_freio.table("motor_precos_log").insert({
+                "descricao_busca": desc[:200], "camada": 0, "achou": False,
+                "n_apresentacoes": 0, "ms_total": 0, "usuario_email": usuario,
+                "telemetria": {"freio": _motivo},
+            }).execute()
+        except Exception:
+            pass
+        print(f"[freio] busca barrada · {usuario} · {_motivo} · {desc[:60]}")
+        raise HTTPException(429, "Muitas buscas de uma vez — esta não foi feita. "
+                                 "Clique de novo no item que você quer buscar.")
 
     try:
         ficha = _resolver_ficha_precos(item_motor, get_supabase(), get_claude(),
