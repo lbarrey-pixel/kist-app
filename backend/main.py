@@ -69,7 +69,7 @@ except Exception:
 import hashlib as _hashlib_ext
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.27"
+VERSAO_BACKEND = "3.28"
 
 app = FastAPI(title="Kist Cotações API", version=VERSAO_BACKEND)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -1412,280 +1412,13 @@ def _defesa_do_match(match: dict, row: dict) -> str:
     return (base + (" " + motivo if motivo else "")).strip()
 
 
-# ── LEITURA DE PLANILHA: ESCOLHA DA COLUNA DE DESCRIÇÃO (v3.27) ──────────────
-# O que quebrou (26/08, RFQ da Maracatour): a planilha tinha DUAS colunas que
-# casavam com a regex — "MATERIAL / SERVIÇO / LICENÇA" (classificação) e
-# "Descrição Detalhada do Produto" (o produto). O código pegava a PRIMEIRA que
-# casasse. Todo item virou a palavra "MATERIAL" ou "LICENÇA", a consolidação
-# somou as linhas idênticas, e 7 itens viraram 2.
-#
-# O defeito de fundo era maior que a regex: o parser não tinha como DUVIDAR.
-# Devolver alguma coisa era lido como "deu certo" (`not propostas_raw`), e isso
-# calava a extração por IA — que lê a linha inteira e teria acertado.
-_H_DESC_FORTE   = re.compile(r'descri', re.I)                          # +4
-_H_DESC_MEDIO   = re.compile(r'especifica|discrimina', re.I)           # +3
-_H_DESC_PRODUTO = re.compile(r'produto|item\s+cotado', re.I)           # +2
-_H_DESC_FRACO   = re.compile(r'material|servi[çc]|equipamento', re.I)  # +1
-_H_DESC_NUNCA = re.compile(
-    r'\bmarca|fabricante|\bmodelo|c[oó]d(igo)?\b|refer[êe]ncia|part\s*number|\bpn\b|'
-    r'quant|\bqtd|\bqtde|valor|pre[çc]o|total|\bipi\b|\bicms\b|\bncm\b|'
-    r'prazo|entrega|unid|\bund\b|\bun\b|observa|\bobs\b', re.I)
-
-
-def _metricas_coluna(col: list) -> tuple:
-    v = [x for x in col if x]
-    if not v:
-        return 0.0, 0, 0.0, 1.0, 0.0
-    comp = sum(len(x) for x in v) / len(v)
-    dist = len(set(x.lower() for x in v))
-    num = sum(1 for x in v if re.fullmatch(r'[\d\.,\s%/R$-]+', x)) / len(v)
-    return comp, dist, dist / len(v), num, len(v) / len(col)
-
-
-def _escolher_col_descricao(header_row: list, item_rows: list):
-    """Índice da coluna de descrição, ou None se nenhuma parecer descrição.
-
-    Duas camadas, nenhuma específica de cliente:
-      · CABEÇALHO — "descrição" pesa mais que "material". Na prática "material"
-        tanto nomeia a classificação quanto a descrição, então virou o sinal
-        mais fraco, não o primeiro a casar.
-      · DADOS — coluna de classificação é curta e repetitiva (média de 8
-        caracteres, 2 valores distintos em 7 linhas); descrição é longa e
-        variada (66 caracteres, 7 de 7 distintos). É esta camada que salva
-        template cujo cabeçalho nunca vimos.
-
-    Devolver None não é falha: é o parser dizendo que não sabe, para a planilha
-    seguir à extração por IA. Errar em silêncio é o que não pode.
-    """
-    if not item_rows:
-        return None
-    n = max([len(header_row)] + [len(r) for r in item_rows])
-    placar = []
-    for i in range(n):
-        h = (header_row[i] if i < len(header_row) else "") or ""
-        col = [(str(r[i]).strip() if i < len(r) and r[i] else "") for r in item_rows]
-        comp, dist, razao, num, preench = _metricas_coluna(col)
-
-        if   _H_DESC_FORTE.search(h):   hs = 4.0
-        elif _H_DESC_MEDIO.search(h):   hs = 3.0
-        elif _H_DESC_PRODUTO.search(h): hs = 2.0
-        elif _H_DESC_FRACO.search(h):   hs = 1.0
-        else:                           hs = 0.0
-
-        # "Descrição" vence a lista de nunca: um cabeçalho "Descrição / Marca"
-        # continua sendo a descrição.
-        if hs < 3.0 and _H_DESC_NUNCA.search(h):
-            continue
-        if num >= 0.8 or preench < 0.5:
-            continue
-        # Classificação: curta E repetitiva, ou curta demais. Dois guardas
-        # independentes — com um limiar só, "CABO 6MM" era descartado junto.
-        if (comp < 15 and razao < 0.6) or comp < 9:
-            continue
-
-        placar.append((hs + min(comp / 30.0, 1.0) * 1.5 + razao * 1.5, i))
-    if not placar:
-        return None
-    placar.sort(reverse=True)
-    return placar[0][1]
-
-
-_SYSTEM_CERT_PLANILHA = """Você confere o mapa de colunas que um leitor automático montou para uma
-planilha de cotação. Responda APENAS JSON puro, sem markdown, sem comentário.
-
-{"descricao": <índice da coluna com a DESCRIÇÃO DO PRODUTO, ou null>,
- "confere": true|false,
- "motivo": "uma frase curta"}
-
-A coluna de DESCRIÇÃO é a que diz O QUE É o produto. NÃO é a coluna de
-classificação (MATERIAL / SERVIÇO / LICENÇA / TIPO), que apenas agrupa os itens.
-NÃO é marca, modelo, código, quantidade, unidade, preço, prazo ou observação.
-Se nenhuma coluna traz a descrição do produto, devolva descricao=null e
-confere=false."""
-
-
-def _certificar_colunas_ia(header_row: list, item_rows: list, i_desc: int, claude):
-    """A IA confere a escolha do parser. (aprovado, indice_dela).
-
-    Recebe só CABEÇALHO + 3 LINHAS de amostra — ~400 tokens no Haiku, cerca de
-    US$ 0,0004 por planilha. Não é a planilha inteira: certificar é barato,
-    reler é que custa.
-
-    Discordou → o parser abstém e a planilha vai para a extração normal, que lê
-    a linha toda. Não trocamos a escolha pela dela: quando os dois leitores
-    discordam sobre O QUE É a descrição, o certo é chamar quem lê o documento
-    inteiro, não escolher um palpite entre dois.
-
-    IA fora do ar → aprova. Ficar sem certificador não pode parar a leitura; a
-    escolha por cabeçalho+dados já se sustenta sozinha.
-    """
-    if claude is None:
-        return True, i_desc
-    try:
-        import json as _jc
-        cab = "\n".join(f"  [{i}] {h}" for i, h in enumerate(header_row) if str(h).strip())
-        am = ""
-        for n, v in enumerate(item_rows[:3]):
-            am += f"\n  linha {n + 1}: " + " · ".join(
-                f"[{i}]={str(x)[:60]}" for i, x in enumerate(v) if str(x).strip())
-        r = claude.messages.create(
-            model="claude-haiku-4-5-20251001", max_tokens=300,
-            system=_SYSTEM_CERT_PLANILHA,
-            messages=[{"role": "user", "content":
-                       f"COLUNAS:\n{cab}\n\nAMOSTRA DAS LINHAS DE ITEM:{am}\n\n"
-                       f"O leitor escolheu descrição=[{i_desc}]. Confere?"}],
-            temperature=0.0, timeout=20.0,
-        )
-        raw = "".join(b.text for b in r.content if getattr(b, "type", "") == "text").strip()
-        raw = re.sub(r'^```(?:json)?\s*', '', raw)
-        raw = re.sub(r'\s*```$', '', raw.strip())
-        s0, e0 = raw.find('{'), raw.rfind('}')
-        if s0 == -1 or e0 == -1:
-            return True, i_desc
-        d = _jc.loads(raw[s0:e0 + 1])
-        dela = d.get("descricao")
-        if dela is None or int(dela) != int(i_desc):
-            print(f"[planilha] certificador discordou (parser={i_desc}, ia={dela}) "
-                  f"· {str(d.get('motivo'))[:120]}")
-            return False, dela
-        return True, i_desc
-    except Exception as e:
-        # Falha do certificador não pode custar a leitura.
-        print(f"[planilha] certificador indisponível: {type(e).__name__}")
-        return True, i_desc
-
-
-def _parsear_excel_estruturado(data: bytes, claude=None):
-    """Parser determinístico para Excel com tabela de itens estruturada.
-    Detecta colunas pelo header e extrai dados sem chamar a IA.
-    Retorna lista de propostas no formato padrão, ou None se não detectar estrutura.
-    """
-    try:
-        import openpyxl, io as _io2
-        HQTD2  = re.compile(r'\bqtd|\bquant', re.I)
-        HDESC2 = re.compile(r'descri|material|servi[çc]|equipamento', re.I)
-        HMETA2 = re.compile(r'cnpj|empresa|cliente|faturamento|rfq|referência|nº\s*rc|pedido', re.I)
-        CNPJ_PAT = re.compile(r'(\d{2}\.?\d{3}\.?\d{3}[\/]?\d{4}-?\d{2})')
-
-        wb = openpyxl.load_workbook(_io2.BytesIO(data), read_only=True, data_only=True)
-        for sname in wb.sheetnames:
-            ws = wb[sname]
-            rows = list(ws.iter_rows(values_only=True))
-            metadados_raw, item_rows_raw, header_row, header_idx = [], [], None, None
-
-            for i, row in enumerate(rows):
-                vals = [str(c).strip() if c is not None else "" for c in row]
-                nao_v = [v for v in vals if v and v != "None"]
-                if not nao_v:
-                    continue
-                linha = " | ".join(nao_v)
-                first = nao_v[0]
-                if header_idx is None:
-                    if len(nao_v) >= 4 and HQTD2.search(linha) and HDESC2.search(linha):
-                        header_idx = i
-                        header_row = vals
-                        continue
-                    if HMETA2.search(linha):
-                        metadados_raw.append(linha)
-                    continue
-                try:
-                    int(first)
-                    item_rows_raw.append(vals)
-                except ValueError:
-                    pass
-
-            if not header_row or not item_rows_raw:
-                continue
-
-            def _col(pattern, headers):
-                for i, h in enumerate(headers):
-                    if h and pattern.search(str(h)):
-                        return i
-                return None
-
-            # A descrição NÃO é mais "a primeira coluna que casa" — é a que
-            # ganha por cabeçalho + dados, e depois passa pelo certificador.
-            i_desc = _escolher_col_descricao(header_row, item_rows_raw)
-            if i_desc is None:
-                print("[planilha] nenhuma coluna parece descrição — entregando à IA")
-                return None
-            _ok_cert, _ = _certificar_colunas_ia(header_row, item_rows_raw, i_desc, claude)
-            if not _ok_cert:
-                return None
-
-            i_qtd  = _col(HQTD2, header_row)
-            i_und  = _col(re.compile(r'\bund|\bun\b|\bunid', re.I), header_row)
-            # Marca/modelo/código são dado que o CLIENTE escreveu na planilha —
-            # carregá-los não é inventar. Sem eles, "MK-CN07 Confetti Shoot" vai
-            # para o matching e para o motor sem "Moka".
-            i_marca = _col(re.compile(r'\bmarca|fabricante', re.I), header_row)
-            i_mod   = _col(re.compile(r'\bmodelo|part\s*number|\bpn\b', re.I), header_row)
-            i_cod   = _col(re.compile(r'c[oó]d(igo)?\b|refer[êe]ncia', re.I), header_row)
-
-            if i_qtd is None:
-                continue
-
-            # Extrair metadados: CNPJ, cliente, RC
-            cnpj, cliente, rc_neg = None, None, None
-            for meta in metadados_raw:
-                if not cnpj:
-                    cm = CNPJ_PAT.search(meta)
-                    if cm:
-                        raw_cnpj = cm.group(1)
-                        # Verificar que tem 14 dígitos
-                        if len(re.sub(r'\D', '', raw_cnpj)) == 14:
-                            cnpj = raw_cnpj
-                if not cliente:
-                    m2 = re.search(r'(?:empresa|cliente)[^\|]*\|\s*([^|]+)', meta, re.I)
-                    if m2:
-                        cliente = m2.group(1).strip()
-                if not rc_neg:
-                    m3 = re.search(r'(?:rfq|nº\s*rc|n[uú]mero\s*rc|pedido)[^\|]*\|\s*(\S+)', meta, re.I)
-                    if m3:
-                        rc_neg = m3.group(1).strip()
-
-            # Extrair itens
-            itens = []
-            for vals in item_rows_raw:
-                def _cell(idx):
-                    if idx is None or idx >= len(vals): return ""
-                    v = vals[idx]
-                    # A célula do Excel quebra linha no meio da descrição
-                    # ("...Supports up to 8 \nDCI 4K Outputs..."). Sem
-                    # normalizar, o \n viaja para a proposta e para a query.
-                    return re.sub(r'\s+', ' ', str(v).strip()) if v is not None else ""
-                desc = _cell(i_desc)
-                if not desc or desc == "None":
-                    continue
-                try:
-                    qtd = float(_cell(i_qtd).replace(",", "."))
-                    if qtd <= 0: qtd = 1
-                except Exception:
-                    qtd = 1
-                unid = (_cell(i_und) or "UN").upper()
-                if not unid or unid == "NONE": unid = "UN"
-                _sp = []
-                for _rot, _ix in (("Marca", i_marca), ("Modelo", i_mod),
-                                  ("Cód. cliente", i_cod)):
-                    _v = _cell(_ix)
-                    if _v and _v.lower() != "none":
-                        _sp.append(f"{_rot}: {_v}")
-                itens.append({
-                    "descricao":          desc[:120],
-                    "descricao_original": desc[:400],
-                    "specs_complementares": (" | ".join(_sp) or None),
-                    "quantidade":  int(qtd) if qtd == int(qtd) else qtd,
-                    "unidade":     unid,
-                })
-
-            if not itens:
-                continue
-
-            return [{"titulo": sname, "cliente": cliente or "",
-                     "cnpj": cnpj, "rc_neg": rc_neg, "itens": itens}]
-    except Exception:
-        pass
-    return None
+# ── LEITURA DE PLANILHA (v3.28) ──────────────────────────────────────────────
+# Aqui viviam `_parsear_excel_estruturado` e os auxiliares de escolha de coluna.
+# Foram REMOVIDOS: a planilha passou a ter um leitor só — a IA, que enxerga a
+# linha inteira com o nome das colunas via `_extrair_excel_bytes` (acima) ou o
+# Documento da ingestão canônica. Dois leitores com regras diferentes sobre o
+# mesmo artefato produziam divergência silenciosa, e o mais fraco calava o mais
+# forte. A nota completa da decisão está no laço de arquivos do /extrair.
 
 
 @app.post("/extrair")
@@ -1793,51 +1526,34 @@ async def extrair_email(
         dados = await arq.read()
         _brutos.append((fname, dados))
 
-        # ── Com a ingestão ativa, este laço só existe para o parser
-        # determinístico de Excel. Rodar o corpo antigo junto abria cada .msg
-        # DUAS vezes e convertia cada PDF DUAS vezes — custo e latência
-        # dobrados — e um arquivo corrompido estourava aqui, antes do try da
-        # ingestão, derrubando a requisição inteira.
+        # ── PARSER DETERMINÍSTICO DE EXCEL: REMOVIDO (v3.28) ──────────────────
+        # Ele lia a planilha por conta própria, escolhendo as colunas por regex, e
+        # o resultado dele CALAVA a extração por IA (`not propostas_raw`). Não
+        # tinha como duvidar: devolver alguma coisa era lido como "acertou".
+        #
+        # Em 26/08 isso custou 7 itens da RFQ da Maracatour. A planilha tinha duas
+        # colunas casando com a regex — "MATERIAL / SERVIÇO / LICENÇA"
+        # (classificação) e "Descrição Detalhada do Produto" — e ele pegou a
+        # primeira. Todo item virou a palavra "MATERIAL" ou "LICENÇA", a
+        # consolidação somou as linhas que ficaram idênticas, e a proposta saiu com
+        # 2 itens. Cada um deles virou busca na internet que não achou nada.
+        #
+        # O que decidiu remover em vez de consertar foi a MEDIÇÃO. No dia 26 ele
+        # ficou desligado por acidente (um bug de escopo) e o sistema leu MELHOR
+        # sem ele: as duas propostas da Maracatour saíram com os 7 itens certos,
+        # com marca e modelo, pela IA lendo o e-mail inteiro. O atalho economizava
+        # ~US$ 0,02 por planilha — 1/10 de UMA busca na internet — e pagava isso
+        # com item perdido.
+        #
+        # A planilha agora segue SEMPRE para a leitura por IA: pela ingestão
+        # canônica (Documento) quando ela está ativa, ou pelo _extrair_excel_bytes
+        # abaixo, que entrega a linha inteira com o nome das colunas. Um leitor só,
+        # que enxerga o documento todo, em vez de dois com regras diferentes.
         if _INGESTAO_OK:
-            try:
-                _planilhas = []
-                if flo.endswith(".msg"):
-                    _tmp_x = f"/tmp/xls_{abs(hash(fname)) % 10**9}_{len(dados)}.msg"
-                    _mx = None
-                    # O temporário é criado ANTES do try de propósito não: se o
-                    # openMsg falhava fora do try/finally, o arquivo ficava em
-                    # /tmp para sempre. Num serviço de longa duração isso vaza
-                    # disco a cada .msg corrompido.
-                    try:
-                        with open(_tmp_x, "wb") as _f:
-                            _f.write(dados)
-                        _mx = extract_msg.openMsg(_tmp_x)
-                        for _att in (_mx.attachments or []):
-                            _an = (getattr(_att, "longFilename", None)
-                                   or getattr(_att, "shortFilename", None) or "").lower()
-                            if _an.endswith((".xlsx", ".xls", ".xlsm")) and _att.data:
-                                _planilhas.append(_att.data)
-                    finally:
-                        try:
-                            if _mx is not None:
-                                _mx.close()
-                        except Exception:
-                            pass
-                        try:
-                            os.remove(_tmp_x)
-                        except Exception:
-                            pass
-                elif flo.endswith((".xlsx", ".xls", ".xlsm")):
-                    _planilhas.append(dados)
-                for _pl in _planilhas:
-                    _det = _parsear_excel_estruturado(_pl, claude)
-                    if _det:
-                        propostas_raw.extend(_det)
-            except Exception:
-                # Falha aqui NÃO é fatal: a planilha ainda vai ao modelo pelo
-                # bloco de anexo do Documento. O determinístico é atalho, não
-                # única via.
-                pass
+            # Os bytes já foram guardados em `_brutos`; a ingestão monta o
+            # Documento a partir deles. Não há mais nada a fazer por arquivo aqui
+            # — e não reabrir o .msg neste ponto economiza uma abertura OLE e uma
+            # escrita em /tmp por arquivo.
             continue
 
         if flo.endswith(".msg"):
@@ -1877,31 +1593,13 @@ async def extrair_email(
                 if not att.data:
                     continue
                 if afn.endswith((".xlsx", ".xls", ".xlsm")):
-                    # Tentar parser determinístico primeiro (Excel estruturado com header)
-                    _props_det = _parsear_excel_estruturado(att.data, claude)
-                    if _props_det:
-                        # Enriquecer com contexto do email (CNPJ pode estar no body)
-                        for _p in _props_det:
-                            if not _p.get("cnpj"):
-                                # Pegar o PRIMEIRO CNPJ do texto era errado: o corpo quase
-                                # sempre traz dois (o do cliente e o nosso, da assinatura ou
-                                # do encadeamento). Percorre todos e fica com o primeiro que
-                                # seja válido E não seja da Kist.
-                                for _cand in re.findall(r'(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})', contexto_email):
-                                    _ok = _cnpj_do_cliente(_cand)
-                                    if _ok:
-                                        _p["cnpj"] = _ok
-                                        break
-                            if not _p.get("cliente") and contexto_email:
-                                _mc = re.search(r'(?:empresa|cliente|razão social)[:\s]+([^\n\|]{3,60})', contexto_email, re.I)
-                                if _mc:
-                                    _p["cliente"] = _mc.group(1).strip()
-                        propostas_raw.extend(_props_det)
-                    else:
-                        # Fallback: extração por texto (IA vai processar)
-                        xl = _extrair_excel_bytes(att.data, afn)
-                        if xl.strip():
-                            conteudo_files.append((att.longFilename or att.shortFilename, xl, "excel"))
+                    # A planilha vira TEXTO com o nome das colunas e a linha
+                    # inteira, e quem lê é a IA (v3.28). O parser determinístico
+                    # que rodava antes daqui foi removido — ver a nota no laço de
+                    # arquivos.
+                    xl = _extrair_excel_bytes(att.data, afn)
+                    if xl.strip():
+                        conteudo_files.append((att.longFilename or att.shortFilename, xl, "excel"))
                 elif afn.endswith(".pdf") and not _PDF_SKIP.search(afn) and len(att.data) <= _PDF_MAX_BYTES:
                     pt = _pdf_po_texto(att.data)
                     if pt.strip():
@@ -1947,22 +1645,10 @@ async def extrair_email(
                 imgs_msg.append((_n, _b, _origem_msg, _i))
 
         elif flo.endswith((".xlsx", ".xls", ".xlsm")):
-            _props_det = _parsear_excel_estruturado(dados, claude)
-            if _props_det:
-                for _p in _props_det:
-                    if not _p.get("cnpj") and contexto_email:
-                        # Mesmo bug do caminho do .msg: pegar o PRIMEIRO CNPJ do corpo
-                        # pega o da Kist quando ele vem antes (assinatura, encadeamento).
-                        for _cand in re.findall(r'(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})', contexto_email):
-                            _ok = _cnpj_do_cliente(_cand)
-                            if _ok:
-                                _p["cnpj"] = _ok
-                                break
-                propostas_raw.extend(_props_det)
-            else:
-                xl = _extrair_excel_bytes(dados, fname)
-                if xl.strip():
-                    conteudo_files.append((fname, xl, "excel"))
+            # Planilha solta: vira texto (colunas + linha inteira) e a IA lê.
+            xl = _extrair_excel_bytes(dados, fname)
+            if xl.strip():
+                conteudo_files.append((fname, xl, "excel"))
 
         elif flo.endswith(".pdf") and not _PDF_SKIP.search(flo) and len(dados) <= _PDF_MAX_BYTES:
             pt = _pdf_po_texto(dados)
