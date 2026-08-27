@@ -171,6 +171,12 @@ MIKROTIK FLUKE SIEMENS ABB LUTRON PRYSMIAN HP DELL EPSON SAMSUNG LG SONY CANON B
 UGREEN KODAK MOKA SIMINICS MICROSEMI D2W ITCOMTECH ELITECH MASTERCOOL ADATA ICOM MINOX
 MOES DECA DJI CANARE SECCON SCANIA MWM OWA HARDEN ROSSI NESFER MTM STARTEC ORANGE
 SEAGATE TOSHIBA ACER ASUS INTEL AMD NIKE JORDAN LAIRD JEVIN MXT VBOX PIER
+SCOTCH 3M ALULEV HIKARI MARFINITE TASCHIBRA QSC BLACKMAGIC SOLARTRON BUFFALO GE
+ENERBRAS ORION CONDOR ATLAS LUKSCOLOR SUVINIL KARCHER EATON APPLE HELLERMANN HDL
+SENSOTRON LEDVANCE NITROLUX MIGRARE ROMAZI JAGUAR NOVATEC TRANE BAUDOUIN FREEDOM
+ELECTROLUX TEKBOND RAPIFIX NADIR SUMAY STARTEC SEGURIMAX FOXLUX SOPRANO PACRI
+WALTER STANLEY IRWIN CORNETA GEDORE EZPHASE PIRELLI CLAMPER STECK WOMER FIBERSUL
+FIBERWAN CANARE NEUTRICK LOGITECH SANDISK KODAK META DGM LUXCEO SAMSUNG QSC ELG
 `.trim().split(/\s+/));
 
 // Ruído de descrição de licitação/ERP. São atributos de CONFERÊNCIA, não de BUSCA.
@@ -191,7 +197,7 @@ const ROTULO_MARCA  = /^(marca|fabricante|fab)$/i;
 const ROTULO_MODELO = /^(modelo|mod)$/i;
 const ROTULO_PN     = /^(pn|p\/n|part\s*number|ref|ref\.|refer[eê]ncia)$/i;
 
-const UNIDADE_SEGUINTE = /^(BTU|BTUS|BTU'S|MM|CM|M|MT|MTS|METROS?|V|VAC|VDC|A|AMP|AMPERES?|W|KW|KVA|HZ|KG|G|TB|GB|MB|RPM|LUMENS?|LM|OHMS?|POL|POLEGADAS?|UN|PCS|LITROS?|L)$/i;
+const UNIDADE_SEGUINTE = /^(BTU|BTUS|BTU'S|MM|CM|M|MT|MTS|METROS?|V|VAC|VDC|A|AMP|AMPERES?|W|KW|KVA|HZ|MHZ|GHZ|KG|G|TB|GB|MB|RPM|LUMENS?|LM|OHMS?|POL|POLEGADAS?|UN|PCS|PAGINAS?|LITROS?|L|AH|CV|UF|GRAUS?)$/i;
 
 const norm = (s) => String(s || "").replace(/\s+/g, " ").trim();
 const semAcento = (s) => String(s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
@@ -207,11 +213,15 @@ function codigoInterno(tok, codigoCliente = "") {
   if (/^[A-Z]{2,}\.[A-Z0-9.\-\/]+$/.test(t)) return true;   // UC.105058, AUXELE.MATELE...
   if (/^\d{2}\.\d{3}\.\d{3}$/.test(t)) return true;         // 27.063.625
   if (/^0\d{2,3}$/.test(t)) return true;                    // 0001..0011 (linha)
+  if (/^0\d{7,}$/.test(t)) return true;                     // 0121000061, 0130000713
+  if (/^(MEST|MPAT|REQ|SC|RC)[0-9]/.test(t)) return true;   // MEST205012
   if (/^(NCM|UNSPSC)$/.test(t)) return true;
   return false;
 }
 
 /** Parte as specs em pares rótulo→valor. Separadores reais: | ; , — e quebra. */
+const COMPAT = /\bcompat[íi]ve(l|is)\b|\bequivalente\b|\bsimilar\b|\bou\s+superior\b/i;
+
 function pares(sp) {
   const out = [];
   String(sp || "").split(/[|;\n]|\s+—\s+/).forEach((p) => {
@@ -235,13 +245,13 @@ function pareceMPN(t, { numericoOk = true } = {}) {
   if (u.length < 4 || u.length > 24) return false;
   // Atributo técnico disfarçado de código. Medido: "36000 BTU", "3000K",
   // "220/380VAC", "200X100MM", "2,5MM" viravam PN e destruíam a busca.
-  if (/^\d+([.,]\d+)?\s*(MM|CM|M|V|A|W|KW|KVA|TB|GB|MB|KG|HZ|VAC|VDC|VCC|KA|KV|K|U|P|POL|BTU|RPM|LM|NM|OHM)$/.test(u)) return false;
+  if (/^\d+([.,]\d+)?\s*(MM|CM|M|V|A|W|KW|KVA|TB|GB|MB|KG|HZ|VAC|VDC|VCC|KA|KV|K|U|P|POL|BTU|RPM|LM|NM|OHM|MHZ|GHZ|KHZ|MT|MTS|METRO|METROS|AH|MAH|CV|UF)$/.test(u)) return false;
   if (/^\d+[XÃ]\d+/.test(u)) return false;                 // 200X100MM
   if (/^\d+([.,]\d+)?\/\d+/.test(u)) return false;        // 220/380VAC, 127/220V
   if (/^(NBR|IP|CAT|ABNT|IEC|USB|HDMI|SATA|RGB|LED|PVC|EPR|CFOA|SM|MM|OM|UTP|FTP)\d*[A-Z]?$/.test(u)) return false;
   const temL = /[A-Z]/.test(u), temD = /[0-9]/.test(u);
   if (temL && temD) return true;              // C7976A, FG-40F, SDJS800, KTS34-5M-S
-  if (numericoOk && /^\d{5,9}$/.test(u)) return true;       // 44051108, 4820160, 26024
+  if (numericoOk && /^\d{5,12}$/.test(u)) return true;       // 44051108, 4820160, 26024
   return false;
 }
 
@@ -288,6 +298,7 @@ function termoBusca(item) {
   // 1) Rótulos das specs — mas só os que passam no teste de validade.
   for (const { rot, val } of pares(sp)) {
     if (ROTULO_BANIDO.test(rot)) continue;
+    if (COMPAT.test(rot) || COMPAT.test(val)) continue;   // "Compatível com motor MWM 6.12TCA"
     const v = val.split(/[,/]/)[0].trim();          // "T11A120 / T11A120AL" -> primeiro
     if (!v || v.split(/\s+/).length > 4) continue;  // "8mm, 25 unidades, plástica" não é PN
     if (ROTULO_MARCA.test(rot)  && !marca)  marca  = v;
@@ -301,7 +312,12 @@ function termoBusca(item) {
     }
   }
 
-  // 2) Marca reconhecida no texto (descrição final tem prioridade sobre a original).
+  // 2) Marca reconhecida no texto. Se a descrição final já traz uma marca, ela
+  //    manda — anexar a da spec produzia "UNIDUTE ... DAISA Wetzel", duas marcas
+  //    contraditórias no mesmo termo.
+  const marcaNaDesc = norm(d).split(/\s+/)
+    .map((t) => semAcento(limpaTok(t)).toUpperCase()).find((t) => MARCAS.has(t));
+  if (marcaNaDesc) marca = marcaNaDesc;
   if (!marca) {
     for (const fonte of [d, o]) {
       // Só token separado por ESPAÇO. "LC/APC/SM" é polimento de fibra, não a
@@ -313,10 +329,29 @@ function termoBusca(item) {
     }
   }
 
-  // 3) Código com cara de MPN no texto, quando as specs não deram um válido.
+  // 3) Código com cara de MPN no texto. A descrição final tem PRIORIDADE sobre o
+  //    rótulo: quando o operador corrige o item, ele corrige a descrição e a spec
+  //    fica velha (medido: spec "WD241PURP" contra descrição "WD260PURP" 26TB).
+  const noTextoFinal = (() => {
+    const mm = COMPAT.exec(d);
+    const tk = norm(mm ? d.slice(0, mm.index) : d).split(/\s+/);
+    const c = tk.map(limpaTok).filter((t, i) => {
+      if (!t || codigoInterno(t, cc)) return false;
+      if (MARCAS.has(semAcento(t).toUpperCase())) return false;
+      const prox = limpaTok(tk[i + 1] || "");
+      if (/^\d+$/.test(t) && UNIDADE_SEGUINTE.test(prox)) return false;
+      return pareceMPN(t);
+    });
+    return c.length ? c[c.length - 1] : "";
+  })();
+  if (noTextoFinal) pn = noTextoFinal;
+
   if (!pn) {
     for (const fonte of [d, o]) {
-      const toks = norm(fonte).split(/\s+/);
+      // Corta o texto no "compatível com": o que vem depois identifica o
+      // equipamento em que o item se aplica, não o item.
+      const m = COMPAT.exec(fonte);
+      const toks = norm(m ? fonte.slice(0, m.index) : fonte).split(/\s+/);
       const cand = toks.map(limpaTok).filter((t, i) => {
         if (!t || codigoInterno(t, cc)) return false;
         if (MARCAS.has(semAcento(t).toUpperCase())) return false;
