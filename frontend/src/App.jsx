@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import Docs from "./Docs.jsx";
 import Propostas from "./Propostas.jsx";
 import OrdensCompra from "./OrdensCompra.jsx";
@@ -9,7 +9,7 @@ import {
   CONF, brl, btnPrimary, btnGhost, Eyebrow, StateLabel, PageHeader,
   CertaintyStrip, Sidebar,
   IconUpload, IconBolt, IconArrow, IconDownload, IconCheck, IconLink, IconX,
-  IconGoogle, IconBell, lerContato } from "./kist-ui.jsx";
+  IconGoogle, IconBell, IconSearch, lerContato } from "./kist-ui.jsx";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
@@ -145,6 +145,226 @@ const CONTATO_PH = {
   outro:    "como se chega nele",
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TERMO DE BUSCA — monta a query que os atalhos de marketplace disparam.
+//
+// O chip mandava `descricao_final` inteira. Descrição de proposta é texto
+// COMERCIAL: carrega atributos que servem pra CONFERIR o item, não pra ACHAR.
+// "REGUA TOMADA PRETA 127/220V CA 10A 3 TOMADAS 2 POLOS + TERRA 1,2M 26024 FC"
+// não acha nada; "regua 3 tomadas 26024" acha.
+//
+// PRINCÍPIO: só reordena e poda o que o cliente deu. NUNCA inventa identificador
+// — foi o chute de MPN que produziu o GSA-M278 do blueprint.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Marcas mineradas do histórico (produtos + specs rotuladas pelo operador).
+// Serve pra decidir se um código tem lastro: código sozinho é ambíguo, código
+// COM fabricante é identificação.
+const MARCAS = new Set(`
+INTELBRAS CLAMPER ICLAMPER PIAL LEGRAND BTICINO WETZEL PIX WOMER SCHNEIDER AVANT ELG
+SPECTRUS FIBERWAN NEUTRIK SANDISK DATATON EDWARDS VONDER WEG FURUKAWA INTRAL SMS SIL
+TRAMONTINA NEXANS BOSCH OSRAM CEMAR FABRIMAR STECK DAISA DEWALT VENTISOL IMPLASTEC
+TASCO OUROLUX FIBERSUL BELZER APC TP-LINK GRACO FAME NORTON GEDORE TIGRE INTELLI
+MINIPA INPOL MAKITA LOGITECH PHILIPS STARRETT STANLEY IRWIN SEGURIMAX FOXLUX SOPRANO
+NOTIFIER KIDDE VIGILANT FORTINET ZYXEL GRANDSTREAM EIZO AXIS HIKVISION DAHUA UBIQUITI
+MIKROTIK FLUKE SIEMENS ABB LUTRON PRYSMIAN HP DELL EPSON SAMSUNG LG SONY CANON BROTHER
+UGREEN KODAK MOKA SIMINICS MICROSEMI D2W ITCOMTECH ELITECH MASTERCOOL ADATA ICOM MINOX
+MOES DECA DJI CANARE SECCON SCANIA MWM OWA HARDEN ROSSI NESFER MTM STARTEC ORANGE
+SEAGATE TOSHIBA ACER ASUS INTEL AMD NIKE JORDAN LAIRD JEVIN MXT VBOX PIER
+`.trim().split(/\s+/));
+
+// Ruído de descrição de licitação/ERP. São atributos de CONFERÊNCIA, não de BUSCA.
+const RUIDO = new Set(`
+TIPO APLICACAO APLICAÇÃO CARACTERISTICA CARACTERÍSTICA REFERENCIA REFERÊNCIA
+CAPACIDADE NATIVA TENSAO TENSÃO COMUTACAO COMUTAÇÃO NUMERO NÚMERO QUANTIDADE
+MATERIAL COMPRIMENTO LARGURA ALTURA DIAMETRO DIÂMETRO ESPESSURA MEDIDA DIMENSAO DIMENSÃO
+FABRICACAO FABRICAÇÃO ACABAMENTO FORNECIDA FORNECIDO CONFORME PADRAO PADRÃO
+UNIDADE UNIDADES UNID UN PECAS PEÇAS PECA PEÇA CAIXA CX PCT KIT
+COR SEM COM DE DA DO DAS DOS EM PARA POR NA NO E OU A O AS OS
+ORIGINAL NOVO NOVA MODELO MARCA FAB FABRICANTE OBS OBSERVACAO OBSERVAÇÃO
+GRAU PROTECAO PROTEÇÃO OPERACAO OPERAÇÃO FAIXA CLASSE SERIE SÉRIE
+`.trim().split(/\s+/));
+
+// Rótulos cujo VALOR nunca é identificador de fabricante.
+const ROTULO_BANIDO = /^(pn\s*interno|c[oó]digo\s*interno|c[oó]d|c[oó]d\.?\s*produto|ncm|unspsc|rc|requisi[cç][aã]o|entrega|endere[cç]o|cep|prazo|local|obs|observa[cç][aã]o|valor|total|pre[cç]o|item)$/i;
+const ROTULO_MARCA  = /^(marca|fabricante|fab)$/i;
+const ROTULO_MODELO = /^(modelo|mod)$/i;
+const ROTULO_PN     = /^(pn|p\/n|part\s*number|ref|ref\.|refer[eê]ncia)$/i;
+
+const UNIDADE_SEGUINTE = /^(BTU|BTUS|BTU'S|MM|CM|M|MT|MTS|METROS?|V|VAC|VDC|A|AMP|AMPERES?|W|KW|KVA|HZ|KG|G|TB|GB|MB|RPM|LUMENS?|LM|OHMS?|POL|POLEGADAS?|UN|PCS|LITROS?|L)$/i;
+
+const norm = (s) => String(s || "").replace(/\s+/g, " ").trim();
+const semAcento = (s) => String(s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+
+/** Código de registro interno do cliente — NUNCA vai pra busca.
+ *  Formas medidas no banco: UC.109710, ES.118176, AUXELE.MATELE.MPS-65/2MTM,
+ *  27.063.625 (mesmo prefixo em produtos diferentes), 0001..0011 (nº de linha). */
+function codigoInterno(tok, codigoCliente = "") {
+  const t = String(tok || "").trim().toUpperCase();
+  if (!t) return true;
+  const cc = String(codigoCliente || "").trim().toUpperCase();
+  if (cc && t === cc) return true;                    // é o código do ERP do cliente
+  if (/^[A-Z]{2,}\.[A-Z0-9.\-\/]+$/.test(t)) return true;   // UC.105058, AUXELE.MATELE...
+  if (/^\d{2}\.\d{3}\.\d{3}$/.test(t)) return true;         // 27.063.625
+  if (/^0\d{2,3}$/.test(t)) return true;                    // 0001..0011 (linha)
+  if (/^(NCM|UNSPSC)$/.test(t)) return true;
+  return false;
+}
+
+/** Parte as specs em pares rótulo→valor. Separadores reais: | ; , — e quebra. */
+function pares(sp) {
+  const out = [];
+  String(sp || "").split(/[|;\n]|\s+—\s+/).forEach((p) => {
+    const m = p.match(/^\s*([^:]{1,28}?)\s*:\s*(.+)$/);
+    if (m) out.push({ rot: m[1].trim(), val: m[2].trim() });
+  });
+  return out;
+}
+
+/** Token com cara de identificador de fabricante: mistura letra e dígito, ou
+ *  código numérico longo. Precisa ter 4+ chars pra não pegar "10A"/"2P". */
+function limpaTok(t) {
+  let u = String(t || "");
+  if (u.includes("(") && !u.includes(")")) u = u.split("(")[0];
+  if (u.includes("=")) u = u.split("=").pop();   // "L=200X100MM" -> "200X100MM"
+  return u.replace(/^[^\wÀ-ú]+|[^\wÀ-ú%"'\)\]]+$/g, "");
+}
+
+function pareceMPN(t, { numericoOk = true } = {}) {
+  const u = limpaTok(t).toUpperCase().replace(/^[^A-Z0-9]+|[^A-Z0-9\-\/\.]+$/g, "");
+  if (u.length < 4 || u.length > 24) return false;
+  // Atributo técnico disfarçado de código. Medido: "36000 BTU", "3000K",
+  // "220/380VAC", "200X100MM", "2,5MM" viravam PN e destruíam a busca.
+  if (/^\d+([.,]\d+)?\s*(MM|CM|M|V|A|W|KW|KVA|TB|GB|MB|KG|HZ|VAC|VDC|VCC|KA|KV|K|U|P|POL|BTU|RPM|LM|NM|OHM)$/.test(u)) return false;
+  if (/^\d+[XÃ]\d+/.test(u)) return false;                 // 200X100MM
+  if (/^\d+([.,]\d+)?\/\d+/.test(u)) return false;        // 220/380VAC, 127/220V
+  if (/^(NBR|IP|CAT|ABNT|IEC|USB|HDMI|SATA|RGB|LED|PVC|EPR|CFOA|SM|MM|OM|UTP|FTP)\d*[A-Z]?$/.test(u)) return false;
+  const temL = /[A-Z]/.test(u), temD = /[0-9]/.test(u);
+  if (temL && temD) return true;              // C7976A, FG-40F, SDJS800, KTS34-5M-S
+  if (numericoOk && /^\d{5,9}$/.test(u)) return true;       // 44051108, 4820160, 26024
+  return false;
+}
+
+/** PN rotulado pode ser puramente alfabético com hífen: SIGA-CR, MPS-65/2.
+ *  Só recusa palavra comum solta. */
+function pnRotuladoValido(v) {
+  const u = semAcento(v).toUpperCase();
+  if (pareceMPN(v)) return true;
+  return /^[A-Z]{2,}[\-\/][A-Z0-9\-\/]+$/.test(u);
+}
+
+/** Poda: tira ruído de licitação, código interno e excesso. Mantém a ordem. */
+function podar(txt, codigoCliente, teto = 8) {
+  const brutos = norm(txt).split(/\s+/);
+  const vistos = new Set();
+  const keep = [];
+  for (const b of brutos) {
+    const limpo = b.replace(/^[^\wÀ-ú%"']+|[^\wÀ-ú%"']+$/g, "");
+    if (!limpo) continue;
+    const up = semAcento(limpo).toUpperCase();
+    if (RUIDO.has(up)) continue;
+    if (codigoInterno(limpo, codigoCliente)) continue;
+    if (up.length === 1 && !/\d/.test(up)) continue;
+    if (vistos.has(up)) continue;                 // "TIPO X ... TIPO L" duplicado
+    vistos.add(up);
+    keep.push(limpo);
+    if (keep.length >= teto) break;
+  }
+  return keep.join(" ");
+}
+
+/**
+ * Monta o termo de busca do item.
+ * @returns {{termo:string, motivo:string}} motivo = como chegou nele (pro operador entender)
+ */
+function termoBusca(item) {
+  const d  = norm(item.descricao_final || item.d || "");
+  const o  = norm(item.descricao_original || item.o || "");
+  const sp = norm(item.specs_complementares || item.sp || "");
+  const cc = norm(item.codigo_cliente || item.cc || "");
+
+  let marca = "", modelo = "", pn = "";
+
+  // 1) Rótulos das specs — mas só os que passam no teste de validade.
+  for (const { rot, val } of pares(sp)) {
+    if (ROTULO_BANIDO.test(rot)) continue;
+    const v = val.split(/[,/]/)[0].trim();          // "T11A120 / T11A120AL" -> primeiro
+    if (!v || v.split(/\s+/).length > 4) continue;  // "8mm, 25 unidades, plástica" não é PN
+    if (ROTULO_MARCA.test(rot)  && !marca)  marca  = v;
+    else if (ROTULO_MODELO.test(rot) && !modelo && !codigoInterno(v, cc)) modelo = v;
+    else if (ROTULO_PN.test(rot) && !pn && !codigoInterno(v, cc) && pnRotuladoValido(v)) {
+      // Numérico puro vindo SÓ das specs é quase sempre código do ERP do cliente
+      // (medido: "PN: 1017265" num item cujo código real, na descrição, era 615040).
+      // Se o número não aparece no texto que o cliente escreveu, não é do fabricante.
+      const soNumero = /^\d+$/.test(v);
+      if (!soNumero || `${d} ${o}`.includes(v)) pn = v;
+    }
+  }
+
+  // 2) Marca reconhecida no texto (descrição final tem prioridade sobre a original).
+  if (!marca) {
+    for (const fonte of [d, o]) {
+      // Só token separado por ESPAÇO. "LC/APC/SM" é polimento de fibra, não a
+      // marca APC — quebrar por barra criava esse falso positivo.
+      const hit = norm(fonte).split(/\s+/)
+        .map((t) => semAcento(limpaTok(t)).toUpperCase())
+        .find((t) => MARCAS.has(t));
+      if (hit) { marca = hit; break; }
+    }
+  }
+
+  // 3) Código com cara de MPN no texto, quando as specs não deram um válido.
+  if (!pn) {
+    for (const fonte of [d, o]) {
+      const toks = norm(fonte).split(/\s+/);
+      const cand = toks.map(limpaTok).filter((t, i) => {
+        if (!t || codigoInterno(t, cc)) return false;
+        if (MARCAS.has(semAcento(t).toUpperCase())) return false;
+        // Número seguido de unidade é grandeza, não código: "36000 BTU'S",
+        // "5000 PAGINAS", "100 METROS". Sem olhar o vizinho, viravam PN.
+        const prox = limpaTok(toks[i + 1] || "");
+        if (/^\d+$/.test(t) && UNIDADE_SEGUINTE.test(prox)) return false;
+        return pareceMPN(t);
+      });
+      if (cand.length) { pn = cand[cand.length - 1]; break; }   // o do fim é o do fabricante
+    }
+  }
+
+  const ident = pn || modelo;
+
+  // Já contém este texto? (compara sem acento, por token)
+  const contem = (base, alvo) => {
+    const A = semAcento(base).toUpperCase();
+    return semAcento(alvo).toUpperCase().split(/\s+/).every((t) => A.includes(t));
+  };
+  const juntar = (base, extra) => (contem(base, extra) ? base : norm(`${base} ${extra}`));
+
+  // 4) Decisão. Marca + identificador é o par que acha. Código órfão é ambíguo,
+  //    marca sozinha é genérica demais — nenhum dos dois basta isolado.
+  if (marca && ident) {
+    // Código numérico puro (4820160, 58014021) é frágil sozinho: sem a categoria,
+    // um dígito trocado vira outro produto. Alfanumérico (SDJS800) se sustenta.
+    const fraco = /^\d+$/.test(limpaTok(ident));
+    let cat = fraco ? podar(d || o, cc, 1) : "";
+    // "DJI DJI 4640022" / "62329 SMS 62329": a categoria pode ser a própria marca
+    // ou o próprio código quando a descrição já começa por eles.
+    if (cat && (contem(marca, cat) || contem(ident, cat))) cat = "";
+    return { termo: norm(`${cat} ${marca} ${ident}`), motivo: "fabricante + código" };
+  }
+
+  if (ident) {
+    const cat = podar(d || o, cc, 3);
+    return { termo: juntar(cat, ident), motivo: "código + categoria" };
+  }
+
+  if (marca) {
+    const base = podar(d || o, cc, 6);
+    return { termo: juntar(base, marca.split(/\s+/)[0]), motivo: "descrição + fabricante" };
+  }
+
+  return { termo: podar(d || o, cc, 8), motivo: "descrição podada" };
+}
+
 // Marketplaces para pesquisa rápida por item (chip na cor da marca).
 // Cada url() recebe a descrição do item e monta a busca já preenchida.
 const MARKETPLACES = [
@@ -158,6 +378,22 @@ const MARKETPLACES = [
 // ── Linha de item da revisão ───────────────────────────────────────────────
 function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, cnpj, propostaId, onSalvar }) {
   // ── Alerta ────────────────────────────────────────────────────────────
+  // ── Termo de busca ────────────────────────────────────────────────────
+  // O que os atalhos disparam. Fica VISÍVEL e editável na própria linha: se
+  // ficar escondido em gaveta ninguém confere, e o termo erra em silêncio —
+  // que é o problema que essa feature existe pra resolver.
+  const [termoTocado, setTermoTocado] = useState(false);
+  const [termo, setTermo] = useState(() => termoBusca(item).termo);
+  // useMemo: a linha re-renderiza a cada tecla (preço, quantidade, descrição) e
+  // o parser não precisa rodar de novo quando nada que ele lê mudou.
+  const termoAuto = useMemo(() => termoBusca(item),
+    [item.descricao_final, item.descricao_original, item.specs_complementares, item.codigo_cliente]);
+  useEffect(() => {
+    // Enquanto o operador não editar, o termo acompanha a descrição/specs.
+    // Depois que ele edita, a escolha dele manda — ele é a hierarquia superior.
+    if (!termoTocado) setTermo(termoAuto.termo);
+  }, [termoAuto.termo, termoTocado]);
+
   const [mostrarAlerta, setMostrarAlerta] = useState(false);
   const [alertaTexto, setAlertaTexto] = useState(() => item.alerta_produto?.texto || "");
   const [alertaLinks, setAlertaLinks] = useState(() => (item.alerta_produto?.links || []).join("\n"));
@@ -528,7 +764,7 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
               onChange={(e) => onChange(index, "descricao_final", e.target.value)}
             />
             {/* Buscar no Google */}
-            <a href={`https://www.google.com/search?q=${encodeURIComponent(item.descricao_final)}`}
+            <a href={`https://www.google.com/search?q=${encodeURIComponent(termo || item.descricao_final)}`}
               target="_blank" rel="noopener noreferrer"
               title="Buscar no Google"
               className="flex-shrink-0 rounded-md p-1 text-faint/60 transition-colors hover:bg-paper hover:text-ink"
@@ -538,7 +774,7 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
             {/* Pesquisa rápida por marketplace */}
             {MARKETPLACES.map((mp) => (
               <a key={mp.nome}
-                href={mp.url(item.descricao_final)}
+                href={mp.url(termo || item.descricao_final)}
                 target="_blank" rel="noopener noreferrer"
                 title={`Buscar em ${mp.nome}`}
                 className="flex h-[18px] min-w-[18px] flex-shrink-0 items-center justify-center rounded-[5px] px-[3px] text-[9px] font-bold leading-none transition-opacity hover:opacity-80"
@@ -561,6 +797,28 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
           </div>
           <div className="mt-0.5 flex flex-wrap items-center gap-2 pl-1.5">
             <StateLabel conf={confianca} />
+            {/* Termo que vai para os atalhos de busca. Não é a descrição da
+                proposta — é a query. Editável; o que ele digitar é o que busca. */}
+            <span className="flex min-w-0 flex-1 items-center gap-1"
+              title={`O que os atalhos vão buscar (${termoAuto.motivo}). Pode editar.`}>
+              <IconSearch size={11} className="flex-shrink-0 text-faint/50" />
+              <input
+                value={termo}
+                onChange={(e) => { setTermoTocado(true); setTermo(e.target.value); }}
+                placeholder="termo de busca"
+                spellCheck={false}
+                className="min-w-0 flex-1 rounded bg-transparent px-1 py-0.5 font-mono text-[10.5px]
+                           text-faint outline-none transition-colors placeholder:text-faint/50
+                           hover:bg-paper focus:bg-paper focus:text-ink" />
+              {termoTocado && (
+                <button
+                  onClick={() => { setTermoTocado(false); setTermo(termoAuto.termo); }}
+                  title="Voltar ao termo sugerido pelo sistema"
+                  className="flex-shrink-0 text-[10px] text-faint/60 hover:text-ink">
+                  ↺
+                </button>
+              )}
+            </span>
             {/* Código do item no ERP do cliente. É a chave que liga o mesmo produto
                 entre as abas do pedido — mostrar dá ao operador como conferir a
                 herança de preço sem abrir o e-mail de novo. */}
