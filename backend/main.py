@@ -69,7 +69,7 @@ except Exception:
 import hashlib as _hashlib_ext
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.28"
+VERSAO_BACKEND = "3.29"
 
 app = FastAPI(title="Kist Cotações API", version=VERSAO_BACKEND)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -2830,6 +2830,36 @@ def _itens_payload(payload):
     return [_norm_item_payload(i) for i in (payload.get("itens") or [])]
 
 
+def _snapshot_match(i):
+    """Campos do match que precisam SOBREVIVER ao save do rascunho.
+
+    O match é feito uma vez, na geração (/extrair). Este snapshot é foto: ao
+    reabrir, a tela lê o que está aqui — não roda matching, não consulta
+    `produtos`, não chama IA. Item que saiu sem match volta sem match.
+
+    Devolve dict vazio quando não há nada a gravar, para nunca sobrescrever com
+    None uma ficha que já está no banco (o insert é precedido de delete, então o
+    valor que chega é o valor que fica).
+    """
+    out = {}
+
+    ficha = i.get("banco")
+    if isinstance(ficha, dict) and ficha:
+        out["banco_ficha"] = ficha
+
+    try:
+        _bid = i.get("banco_id")
+        if _bid not in (None, "", 0, "0", False):
+            out["banco_id"] = int(_bid)
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(i.get("identico"), bool):
+        out["identico"] = i["identico"]
+
+    return out
+
+
 @app.post("/salvar-proposta")
 async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)):
     """Upsert de proposta e itens. status: 'rascunho' | 'confirmada'.
@@ -2896,9 +2926,21 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
             "fornecedor_canal":     i.get("fornecedor_canal", ""),
             "fornecedor_contato":   i.get("fornecedor_contato", ""),
             "sku_fornecedor":       i.get("sku_fornecedor", ""),
-            "obs_interna":          i.get("obs_interna", ""),
+            # O front chama este campo de `obs` (é o nome que sai do /extrair e o
+            # que a tela edita). Ler só "obs_interna" gravava vazio SEMPRE — por
+            # isso só 33 de 1.993 itens tinham obs. Aceita os dois nomes.
+            "obs_interna":          i.get("obs_interna") or i.get("obs") or "",
             "datasheet_id":         i.get("datasheet_id") or None,
             "apresentacao_id":      i.get("apresentacao_id") or None,
+            # ── SNAPSHOT DO MATCH (não recalcula nada na reabertura) ──────────
+            # O match roda UMA vez, na geração. Estes três campos existiam só em
+            # memória e morriam no save:
+            #   banco_ficha -> a comparação que o operador precisa ver de novo;
+            #   banco_id    -> âncora do /upsert-precos (sem ela o CSV de um
+            #                  rascunho reaberto insere linha gêmea em produtos);
+            #   identico    -> match token a token x apenas semântico.
+            # Foto do dia: quem lê, lê como está. Item sem match continua sem match.
+            **_snapshot_match(i),
         } for i in itens]
         sb.table("itens_proposta").insert(rows).execute()
 

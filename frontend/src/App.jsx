@@ -1111,7 +1111,19 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
               {item.banco ? (
                 <div className="rounded-lg border border-line2 bg-surface p-3">
                   <div className="flex items-start justify-between gap-2">
-                    <div className="eyebrow text-[9px] font-semibold uppercase text-faint">O banco propõe</div>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <div className="eyebrow text-[9px] font-semibold uppercase text-faint">O banco propõe</div>
+                      {/* Ficha de proposta ANTIGA, anterior ao snapshot: reconstruída
+                          a partir do nó de memória validado (a mesma memória que o
+                          matching usa), com o dado do produto de HOJE. Não é a foto
+                          do dia — e o operador precisa saber disso antes de decidir. */}
+                      {item.banco.reconstruida && (
+                        <span title="Proposta anterior ao registro da ficha. Reconstruída pelo nó de memória validado deste cliente; os valores são os do banco hoje, não os do dia da proposta."
+                          className="rounded-md border border-line2 bg-paper px-1.5 py-0.5 text-[10px] font-medium text-amber">
+                          reconstruída da memória
+                        </span>
+                      )}
+                    </div>
                     <button
                       onClick={usarFichaBanco}
                       title="Usar este preço: traz venda, custo e origem (a descrição do cliente é preservada)"
@@ -2147,6 +2159,16 @@ export default function App() {
         preco_custo:          Number(it.preco_custo) || 0,
         frete_vinda:          Number(it.frete_vinda) || 0,
         confianca_match:      it.confianca_match || "nenhuma",
+        // ── SNAPSHOT DO MATCH ────────────────────────────────────────────────
+        // A ficha do banco, o vínculo com a linha (banco_id) e o `identico` são
+        // FOTO da geração, gravados no save. Aqui a gente só lê de volta: o match
+        // NÃO roda de novo ao reabrir um rascunho. Sem isto, o operador via o selo
+        // EXATO na linha e "Sem item correspondente no banco" na gaveta — e o
+        // banco_id perdido fazia o CSV do rascunho reaberto criar linha gêmea
+        // em `produtos` (o mecanismo da duplicata do W50).
+        banco:                it.banco_ficha || null,
+        banco_id:             it.banco_id || null,
+        identico:             typeof it.identico === "boolean" ? it.identico : undefined,
         // id da linha e datasheet vinculado: SAO persistidos, e sem trazer de
         // volta o selo morre no reload e o operador regera o mesmo documento.
         id:                   it.id || null,
