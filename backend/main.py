@@ -69,9 +69,28 @@ except Exception:
 import hashlib as _hashlib_ext
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.29"
+VERSAO_BACKEND = "3.30"
 
-app = FastAPI(title="Kist Cotações API", version=VERSAO_BACKEND)
+_API_DESC = """
+API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
+`/ml/notificacoes`) exigem o header `Authorization: Bearer <credencial>`.
+
+**Duas credenciais são aceitas:**
+
+* **ID token do Google** — é o que a interface web usa. Expira em ~1h e exige um
+  operador logado no navegador.
+* **Chave de API** (`kist_sk_...`) — para sistemas externos e agentes. Não expira,
+  é revogável, e roda **como o operador dono da chave**: tudo que ela gravar sai
+  com o e-mail dele, e o custo de IA some no consumo dele.
+
+**Escopos da chave:** `leitura` (só GET) · `escrita` (GET + POST/PUT/PATCH) ·
+`admin` (tudo, inclusive DELETE e rotinas de lote). Chave sem escopo suficiente
+recebe **403** com a explicação, sem executar nada.
+
+Confira sua credencial em `GET /api/whoami`.
+""".strip()
+
+app = FastAPI(title="Kist Cotações API", version=VERSAO_BACKEND, description=_API_DESC)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -103,6 +122,94 @@ async def _marcar_usuario(request: Request, call_next):
     return await call_next(request)
 
 
+# Rotinas de lote: um agente em laço não pode disparar isso sozinho.
+# DELETE é admin por regra fixa no código, não por lista — apagar proposta ou OC
+# não pode depender de uma config que alguém edita sem perceber o alcance.
+_ROTAS_ADMIN_FALLBACK = [
+    "POST /ordens-compra/alimentar-banco-lote",
+    "POST /ordens-compra/arquivar-antigas",
+    "POST /chamados/arquivar-concluidos",
+    "POST /chamados/anexos/limpar-orfaos",
+]
+_rotas_admin_cache: dict = {"v": None, "ate": 0.0}
+
+def _norm_rota(s: str) -> str:
+    """'  post  /Ordens-Compra/x/ ' -> 'POST /Ordens-Compra/x'.
+
+    Só o MÉTODO vira maiúsculo. Caminho de URL é case-sensitive: um `.upper()`
+    no conjunto todo faz a comparação nunca casar e a rota admin passa batido —
+    falha silenciosa, e do lado errado.
+    """
+    partes = str(s).strip().split(None, 1)
+    if len(partes) != 2:
+        return str(s).strip()
+    metodo, caminho = partes[0].upper(), partes[1].strip()
+    if len(caminho) > 1 and caminho.endswith("/"):
+        caminho = caminho.rstrip("/")
+    return f"{metodo} {caminho}"
+
+def _rotas_admin() -> list:
+    """Lista de rotas que exigem escopo admin (runtime, via config_kist)."""
+    agora = time.time()
+    if _rotas_admin_cache["v"] is not None and _rotas_admin_cache["ate"] > agora:
+        return _rotas_admin_cache["v"]
+    rotas = [_norm_rota(x) for x in _ROTAS_ADMIN_FALLBACK]
+    try:
+        r = get_supabase().table("config_kist").select("valor").eq(
+            "chave", "api_rotas_admin").limit(1).execute()
+        if r.data:
+            import json as _jra
+            v = r.data[0].get("valor")
+            v = _jra.loads(v) if isinstance(v, str) else v
+            if isinstance(v, list) and v:
+                # União, nunca substituição: config mal editada pode ESQUECER uma
+                # rota, e esquecer aqui significa abrir. O fallback é o piso.
+                rotas = sorted(set(rotas) | {_norm_rota(x) for x in v})
+    except Exception:
+        pass   # config fora do ar não afrouxa a regra: fica o fallback
+    _rotas_admin_cache["v"] = rotas
+    _rotas_admin_cache["ate"] = agora + 300
+    return rotas
+
+def _nega_escopo(msg: str):
+    return JSONResponse(
+        status_code=403,
+        content={"detail": msg},
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+@app.middleware("http")
+async def _guarda_escopo_api(request: Request, call_next):
+    """Aplica o escopo da chave de API ANTES de a rota rodar.
+
+    Middleware e não Depends de propósito: assim nenhuma das 52 assinaturas de
+    endpoint muda — o risco de mexer em rota que já funciona é maior que o
+    benefício. Requisição com ID token do Google (operador na tela) passa reta:
+    `_escopo_do_request` devolve None e nada aqui se aplica.
+    """
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    try:
+        escopo = _escopo_do_request(request.headers.get("authorization") or "")
+    except Exception:
+        escopo = None
+    if escopo is None or escopo == "admin":
+        return await call_next(request)
+
+    metodo = request.method.upper()
+    if _norm_rota(f"{metodo} {request.url.path}") in _rotas_admin() or metodo == "DELETE":
+        return _nega_escopo(
+            f"Esta rota exige escopo 'admin'. Sua chave tem '{escopo}'."
+        )
+    if metodo in ("GET", "HEAD"):
+        return await call_next(request)
+    if metodo in ("POST", "PUT", "PATCH") and escopo == "escrita":
+        return await call_next(request)
+    return _nega_escopo(
+        f"Sua chave tem escopo '{escopo}' e esta rota exige escrita ({metodo})."
+    )
+
+
 @app.exception_handler(Exception)
 async def _erro_nao_tratado(request: Request, exc: Exception):
     """Erro não tratado precisa voltar COM cabeçalho CORS.
@@ -123,7 +230,80 @@ USUARIOS_PERMITIDOS = set(os.environ.get("USUARIOS_PERMITIDOS", "leonardobarrey@
 security = HTTPBearer()
 _token_cache: dict = {}
 
+# ── Chaves de API (chamado #18) ───────────────────────────────────────────────
+# O backend sempre foi uma API; o que faltava era uma credencial que não fosse o
+# ID token do Google (expira em ~1h e exige humano no navegador). A chave entra
+# pelo MESMO header Bearer e é resolvida pela MESMA função — por isso as 52 rotas
+# protegidas ganham acesso programático sem que nenhuma assinatura mude.
+#
+# A chave NÃO tem identidade própria: ela roda como o operador dono. Isso é
+# deliberado. `usuario_email` viaja para propostas, itens, produtos e alimenta o
+# match_memoria; uma identidade "api@kist" criaria um operador fantasma no
+# aprendizado e quebraria a rastreabilidade que custou a v3.20 para existir.
+API_KEY_PREFIXO = "kist_sk_"
+_API_ESCOPOS = ("leitura", "escrita", "admin")
+_api_key_cache: dict = {}          # sha256 -> (email, escopo, expira_em_epoch)
+_API_KEY_TTL = 300                 # 5 min: revogação por SQL vale no próximo ciclo
+
+def _hash_api_key(token: str) -> str:
+    return _hashlib_ext.sha256(token.encode("utf-8")).hexdigest()
+
+def _resolver_api_key(token: str):
+    """Devolve (email, escopo) da chave, ou levanta 401/403.
+
+    Guarda só o SHA-256 no banco — a chave em claro existe uma única vez, na
+    geração. Comparação por `compare_digest` (tempo constante).
+    """
+    agora = time.time()
+    h = _hash_api_key(token)
+    em_cache = _api_key_cache.get(h)
+    if em_cache and em_cache[2] > agora:
+        return em_cache[0], em_cache[1]
+    try:
+        # RPC security definer: quem chama NÃO lê a tabela `api_chaves`, só
+        # confirma um hash que já possui. A anon key do Supabase, se vazar,
+        # não entrega a lista de chaves. A RPC também carimba `ultimo_uso_em`.
+        r = get_supabase().rpc("api_chave_resolver", {"p_hash": h}).execute()
+        linhas = r.data or []
+    except Exception as e:
+        # Banco fora não vira porta aberta.
+        raise HTTPException(status_code=503, detail=f"Não foi possível validar a chave: {e}")
+    if not linhas:
+        raise HTTPException(status_code=401, detail="Chave de API inválida.")
+    ch = linhas[0]
+    if (not ch.get("ativa")) or ch.get("revogada"):
+        raise HTTPException(status_code=403, detail="Chave de API revogada.")
+    email = (ch.get("usuario_email") or "").lower()
+    if email not in USUARIOS_PERMITIDOS:
+        # Operador saiu da lista de permitidos → a chave dele morre junto.
+        raise HTTPException(status_code=403, detail=f"Acesso negado para {email}")
+    escopo = (ch.get("escopo") or "leitura").lower()
+    if escopo not in _API_ESCOPOS:
+        escopo = "leitura"
+    if len(_api_key_cache) > 200:
+        _api_key_cache.clear()
+    _api_key_cache[h] = (email, escopo, agora + _API_KEY_TTL)
+    return email, escopo
+
+def _escopo_do_request(auth_header: str):
+    """Escopo da credencial do request, ou None se não for chave de API.
+
+    None = ID token do Google (operador na tela) → sem restrição de escopo,
+    exatamente como sempre foi.
+    """
+    if not auth_header or not auth_header.lower().startswith("bearer "):
+        return None
+    token = auth_header.split(" ", 1)[1].strip()
+    if not token.startswith(API_KEY_PREFIXO):
+        return None
+    try:
+        return _resolver_api_key(token)[1]
+    except HTTPException:
+        return None   # credencial ruim: quem recusa é a dependência da rota, não o guarda
+
 def _verificar_token_str(token: str) -> str:
+    if token.startswith(API_KEY_PREFIXO):
+        return _resolver_api_key(token)[0]
     if token in _token_cache:
         return _token_cache[token]
     try:
@@ -592,6 +772,34 @@ def health():
 @app.get("/ping")
 def ping():
     return {"pong": True}
+
+@app.get("/api/whoami")
+def whoami(request: Request, usuario: str = Depends(verificar_token)):
+    """Quem sou eu, com esta credencial? Rota barata, sem efeito colateral.
+
+    É o primeiro teste de qualquer integração: confirma que a chave vale, sob
+    qual operador ela grava e o que ela pode fazer — antes de disparar rota cara.
+    """
+    auth = request.headers.get("authorization") or ""
+    token = auth.split(" ", 1)[1].strip() if " " in auth else ""
+    if token.startswith(API_KEY_PREFIXO):
+        _, escopo = _resolver_api_key(token)
+        credencial = "api_key"
+        metodos = {"leitura": ["GET"],
+                   "escrita": ["GET", "POST", "PUT", "PATCH"],
+                   "admin":   ["GET", "POST", "PUT", "PATCH", "DELETE"]}.get(escopo, ["GET"])
+    else:
+        escopo, credencial = "sem_restricao", "google_oauth"
+        metodos = ["GET", "POST", "PUT", "PATCH", "DELETE"]
+    return {
+        "usuario_email": usuario,
+        "credencial": credencial,
+        "escopo": escopo,
+        "metodos_permitidos": metodos,
+        "rotas_somente_admin": _rotas_admin() if credencial == "api_key" else [],
+        "versao_backend": VERSAO_BACKEND,
+        "docs": "/docs",
+    }
 
 @app.get("/ia-uso")
 def ia_uso_resumo(dias: int = 30, por: str = "usuario",
