@@ -62,6 +62,18 @@ except Exception:
     _ia = None
     _IA_USO_OK = False
 
+# ── Log por requisição da API (v3.31) ────────────────────────────────────────
+# `ia_uso` responde "quanto o Fábio gastou"; não responde "quanto a INTEGRAÇÃO
+# do Fábio gastou", porque a chave roda como o operador dono e as duas coisas
+# dividem o mesmo e-mail. Este log fecha a lacuna, e o `req_id` amarra a cada
+# requisição as chamadas de IA que ela disparou.
+try:
+    import api_log as _apilog
+    _API_LOG_OK = True
+except Exception:
+    _apilog = None
+    _API_LOG_OK = False
+
 # Versão do backend. O núcleo do Analista guarda a versão que ele descreve; se as
 # duas divergirem, o agente é avisado de que o conhecimento dele está atrasado.
 # Conhecimento velho não avisa que é velho — ele responde com a mesma confiança
@@ -69,7 +81,7 @@ except Exception:
 import hashlib as _hashlib_ext
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.30"
+VERSAO_BACKEND = "3.31"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -180,34 +192,91 @@ def _nega_escopo(msg: str):
 
 @app.middleware("http")
 async def _guarda_escopo_api(request: Request, call_next):
-    """Aplica o escopo da chave de API ANTES de a rota rodar.
+    """Aplica o escopo da chave de API e REGISTRA a requisição.
 
     Middleware e não Depends de propósito: assim nenhuma das 52 assinaturas de
     endpoint muda — o risco de mexer em rota que já funciona é maior que o
     benefício. Requisição com ID token do Google (operador na tela) passa reta:
-    `_escopo_do_request` devolve None e nada aqui se aplica.
+    a credencial não é chave, nada aqui se aplica e nada é logado.
+
+    É o middleware MAIS EXTERNO, então mede a latência real e enxerga também os
+    403 que ele mesmo devolve — o operador precisa ver quando a integração está
+    esbarrando em limite de escopo, não só quando ela dá erro.
     """
     if request.method == "OPTIONS":
         return await call_next(request)
+
     try:
-        escopo = _escopo_do_request(request.headers.get("authorization") or "")
+        escopo, email, chave_id = _credencial_do_request(
+            request.headers.get("authorization") or "")
     except Exception:
-        escopo = None
-    if escopo is None or escopo == "admin":
+        escopo, email, chave_id = None, "", None
+
+    # Não é chave de API → caminho histórico, intocado.
+    if escopo is None:
+        if _IA_USO_OK:
+            try:
+                _ia.set_origem("tela")
+            except Exception:
+                pass
         return await call_next(request)
 
+    req_id = ""
+    if _API_LOG_OK:
+        try:
+            req_id = _apilog.novo_req_id()
+        except Exception:
+            req_id = ""
+    if _IA_USO_OK:
+        try:
+            _ia.set_origem("api")
+            _ia.set_req_id(req_id)
+        except Exception:
+            pass
+
     metodo = request.method.upper()
-    if _norm_rota(f"{metodo} {request.url.path}") in _rotas_admin() or metodo == "DELETE":
-        return _nega_escopo(
-            f"Esta rota exige escopo 'admin'. Sua chave tem '{escopo}'."
-        )
-    if metodo in ("GET", "HEAD"):
-        return await call_next(request)
-    if metodo in ("POST", "PUT", "PATCH") and escopo == "escrita":
-        return await call_next(request)
-    return _nega_escopo(
-        f"Sua chave tem escopo '{escopo}' e esta rota exige escrita ({metodo})."
-    )
+    t0 = time.time()
+
+    def _logar(status: int, bloqueado: bool = False, motivo: str = ""):
+        if not _API_LOG_OK:
+            return
+        try:
+            _apilog.registrar(
+                req_id=req_id, chave_id=chave_id, usuario_email=email,
+                escopo=escopo, metodo=metodo, rota=request.url.path,
+                status=status, ms=int((time.time() - t0) * 1000),
+                bloqueado=bloqueado, motivo=motivo,
+                user_agent=request.headers.get("user-agent") or "",
+                ip=(request.headers.get("x-forwarded-for") or "").split(",")[0].strip(),
+            )
+        except Exception:
+            pass
+
+    # Credencial de chave que não resolveu: registra a tentativa e deixa a
+    # dependência da rota devolver o 401/403 oficial.
+    if escopo == "invalida":
+        resp = await call_next(request)
+        _logar(resp.status_code, motivo="credencial invalida")
+        return resp
+
+    if escopo != "admin":
+        if _norm_rota(f"{metodo} {request.url.path}") in _rotas_admin() or metodo == "DELETE":
+            motivo = f"Esta rota exige escopo 'admin'. Sua chave tem '{escopo}'."
+            _logar(403, bloqueado=True, motivo=motivo)
+            return _nega_escopo(motivo)
+        if metodo not in ("GET", "HEAD") and not (
+                metodo in ("POST", "PUT", "PATCH") and escopo == "escrita"):
+            motivo = f"Sua chave tem escopo '{escopo}' e esta rota exige escrita ({metodo})."
+            _logar(403, bloqueado=True, motivo=motivo)
+            return _nega_escopo(motivo)
+
+    try:
+        resp = await call_next(request)
+    except Exception:
+        _logar(500, motivo="excecao nao tratada")
+        raise
+    _logar(resp.status_code)
+    return resp
 
 
 @app.exception_handler(Exception)
@@ -249,16 +318,16 @@ def _hash_api_key(token: str) -> str:
     return _hashlib_ext.sha256(token.encode("utf-8")).hexdigest()
 
 def _resolver_api_key(token: str):
-    """Devolve (email, escopo) da chave, ou levanta 401/403.
+    """Devolve (email, escopo, chave_id) da chave, ou levanta 401/403.
 
     Guarda só o SHA-256 no banco — a chave em claro existe uma única vez, na
-    geração. Comparação por `compare_digest` (tempo constante).
+    geração.
     """
     agora = time.time()
     h = _hash_api_key(token)
     em_cache = _api_key_cache.get(h)
-    if em_cache and em_cache[2] > agora:
-        return em_cache[0], em_cache[1]
+    if em_cache and em_cache[3] > agora:
+        return em_cache[0], em_cache[1], em_cache[2]
     try:
         # RPC security definer: quem chama NÃO lê a tabela `api_chaves`, só
         # confirma um hash que já possui. A anon key do Supabase, se vazar,
@@ -280,26 +349,33 @@ def _resolver_api_key(token: str):
     escopo = (ch.get("escopo") or "leitura").lower()
     if escopo not in _API_ESCOPOS:
         escopo = "leitura"
+    chave_id = ch.get("id")
     if len(_api_key_cache) > 200:
         _api_key_cache.clear()
-    _api_key_cache[h] = (email, escopo, agora + _API_KEY_TTL)
-    return email, escopo
+    _api_key_cache[h] = (email, escopo, chave_id, agora + _API_KEY_TTL)
+    return email, escopo, chave_id
 
-def _escopo_do_request(auth_header: str):
-    """Escopo da credencial do request, ou None se não for chave de API.
+def _credencial_do_request(auth_header: str):
+    """(escopo, email, chave_id) da chave de API, ou (None, "", None).
 
-    None = ID token do Google (operador na tela) → sem restrição de escopo,
-    exatamente como sempre foi.
+    None = ID token do Google (operador na tela) → sem restrição de escopo e
+    sem log de API, exatamente como sempre foi.
     """
     if not auth_header or not auth_header.lower().startswith("bearer "):
-        return None
+        return None, "", None
     token = auth_header.split(" ", 1)[1].strip()
     if not token.startswith(API_KEY_PREFIXO):
-        return None
+        return None, "", None
     try:
-        return _resolver_api_key(token)[1]
+        email, escopo, chave_id = _resolver_api_key(token)
+        return escopo, email, chave_id
     except HTTPException:
-        return None   # credencial ruim: quem recusa é a dependência da rota, não o guarda
+        # Credencial ruim: quem recusa é a dependência da rota, não o guarda.
+        # Marca como chave para o log registrar a tentativa.
+        return "invalida", "", None
+
+def _escopo_do_request(auth_header: str):
+    return _credencial_do_request(auth_header)[0]
 
 def _verificar_token_str(token: str) -> str:
     if token.startswith(API_KEY_PREFIXO):
@@ -358,6 +434,14 @@ def get_supabase():
     global _supabase_client
     if _supabase_client is None:
         _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        if _API_LOG_OK:
+            try:
+                # FÁBRICA, não este singleton: o log roda em thread própria e
+                # precisa da sua própria conexão. Mesma lição do chamado #16 —
+                # o que observa a operação não divide socket com a operação.
+                _apilog.configurar(lambda: create_client(SUPABASE_URL, SUPABASE_KEY))
+            except Exception:
+                pass
     return _supabase_client
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
@@ -769,6 +853,58 @@ def _alerta_do_candidato(banco_desc, todos_candidatos):
 def health():
     return {"status": "ok"}
 
+@app.get("/api-uso")
+def api_uso_resumo(dias: int = 30, por: str = "rota",
+                   usuario: str = Depends(verificar_token)):
+    """Uso da API por chave, com o custo de IA que cada requisição gerou.
+
+    `por`: 'rota' | 'usuario' | 'dia' | 'status' | 'chave'.
+
+    O custo vem do `ia_uso` amarrado pelo `req_id`: cada linha diz quantas
+    requisições, quantas foram barradas por escopo, e quantos dólares de
+    Anthropic aquilo custou. É a resposta para "quanto a integração gastou",
+    que o /ia-uso sozinho não dá.
+    """
+    dias = max(1, min(int(dias or 30), 365))
+    por = (por or "rota").strip().lower()
+    if por not in ("rota", "usuario", "dia", "status", "chave"):
+        por = "rota"
+    try:
+        r = get_supabase().rpc("api_uso_resumo", {"p_dias": dias, "p_por": por}).execute()
+        linhas = r.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"api_uso indisponível: {e}")
+    return {
+        "dias": dias, "por": por, "linhas": linhas,
+        "requisicoes_total": sum(int(x.get("requisicoes") or 0) for x in linhas),
+        "bloqueadas_total": sum(int(x.get("bloqueadas") or 0) for x in linhas),
+        "custo_ia_total_usd": round(sum(float(x.get("custo_ia_usd") or 0) for x in linhas), 4),
+    }
+
+
+@app.get("/api-uso/detalhe")
+def api_uso_detalhe(limite: int = 100, chave_id: int = 0, so_bloqueadas: int = 0,
+                    usuario: str = Depends(verificar_token)):
+    """As últimas requisições da API, uma a uma. Para investigar, não para medir.
+
+    Serve à pergunta "o que a integração fez às 16h54?" — inclusive as tentativas
+    barradas por escopo, que são o sinal de que ela está batendo em limite.
+    """
+    limite = max(1, min(int(limite or 100), 500))
+    try:
+        q = get_supabase().table("api_uso_log").select(
+            "criado_em,req_id,chave_id,usuario_email,escopo,metodo,rota,status,ms,bloqueado,motivo"
+        ).order("criado_em", desc=True).limit(limite)
+        if chave_id:
+            q = q.eq("chave_id", int(chave_id))
+        if int(so_bloqueadas or 0):
+            q = q.eq("bloqueado", True)
+        linhas = q.execute().data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"api_uso_log indisponível: {e}")
+    return {"linhas": linhas, "total": len(linhas)}
+
+
 @app.get("/ping")
 def ping():
     return {"pong": True}
@@ -783,7 +919,7 @@ def whoami(request: Request, usuario: str = Depends(verificar_token)):
     auth = request.headers.get("authorization") or ""
     token = auth.split(" ", 1)[1].strip() if " " in auth else ""
     if token.startswith(API_KEY_PREFIXO):
-        _, escopo = _resolver_api_key(token)
+        _, escopo, _chave_id = _resolver_api_key(token)
         credencial = "api_key"
         metodos = {"leitura": ["GET"],
                    "escrita": ["GET", "POST", "PUT", "PATCH"],
@@ -806,13 +942,20 @@ def ia_uso_resumo(dias: int = 30, por: str = "usuario",
                   usuario: str = Depends(verificar_token)):
     """Consumo de tokens e custo da API, agregado.
 
-    `por`: 'usuario' | 'etapa' | 'usuario_etapa' | 'funcao' | 'modelo' | 'dia'.
+    `por`: 'usuario' | 'etapa' | 'usuario_etapa' | 'funcao' | 'modelo' | 'dia'
+           | 'origem' | 'usuario_origem' | 'origem_funcao'.
+
+    'origem' separa TELA de API — a chave de API roda como o operador dono, então
+    sem isso o gasto do operador e o da integração dele ficam somados no mesmo
+    e-mail e não há como saber quem consumiu o quê.
+
     Lê a RPC `ia_uso_resumo` (agregação fica no Postgres — trazer linha a linha
     para agregar no Python seria puxar dezenas de milhares de registros).
     """
     dias = max(1, min(int(dias or 30), 365))
     por = (por or "usuario").strip().lower()
-    if por not in ("usuario", "etapa", "usuario_etapa", "funcao", "modelo", "dia"):
+    if por not in ("usuario", "etapa", "usuario_etapa", "funcao", "modelo", "dia",
+                   "origem", "usuario_origem", "origem_funcao"):
         por = "usuario"
     sb = get_supabase()
     try:
