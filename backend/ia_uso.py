@@ -37,6 +37,13 @@ from typing import Any, Dict, Optional
 
 # ── Estado do módulo ──────────────────────────────────────────────────────────
 _USUARIO: contextvars.ContextVar[str] = contextvars.ContextVar("ia_usuario", default="")
+# De onde partiu a chamada: 'tela' (operador no navegador), 'api' (chave kist_sk_)
+# ou 'sistema' (rotina interna, sem requisição HTTP).
+_ORIGEM:  contextvars.ContextVar[str] = contextvars.ContextVar("ia_origem", default="")
+# Id da requisição HTTP que originou a chamada. É o que liga o custo de IA a UMA
+# chamada da API, em api_uso_log.req_id — sem isso o custo só é atribuível ao
+# operador, e operador e integração dele compartilham o mesmo e-mail.
+_REQ_ID:  contextvars.ContextVar[str] = contextvars.ContextVar("ia_req_id", default="")
 _criar_supabase = None        # fábrica injetada pelo main.py
 _sb_proprio = None            # cliente DEDICADO desta thread — ver nota abaixo
 _sb_lock = threading.Lock()
@@ -131,6 +138,34 @@ def get_usuario() -> str:
         return _USUARIO.get() or "(sistema)"
     except Exception:
         return "(sistema)"
+
+
+def set_origem(origem: str) -> None:
+    try:
+        _ORIGEM.set((origem or "").strip().lower())
+    except Exception:
+        pass
+
+
+def get_origem() -> str:
+    try:
+        return _ORIGEM.get() or "sistema"
+    except Exception:
+        return "sistema"
+
+
+def set_req_id(req_id: str) -> None:
+    try:
+        _REQ_ID.set((req_id or "").strip())
+    except Exception:
+        pass
+
+
+def get_req_id() -> str:
+    try:
+        return _REQ_ID.get() or ""
+    except Exception:
+        return ""
 
 
 def configurar(criar_supabase) -> None:
@@ -259,6 +294,7 @@ def registrar(modelo: str, uso: Any, ms: int, ok: bool,
 
         linha = {
             "usuario_email": get_usuario(),
+            "origem": get_origem(),
             "modulo": modulo, "funcao": funcao, "etapa": etapa,
             "modelo": modelo or "?",
             "tokens_in": t_in, "tokens_out": t_out,
@@ -268,6 +304,9 @@ def registrar(modelo: str, uso: Any, ms: int, ok: bool,
             "ms": int(ms), "ok": bool(ok),
             "erro": (erro or "")[:300],
         }
+        rid = get_req_id()
+        if rid:
+            linha["req_id"] = rid
         if extra:
             linha["detalhe"] = extra
         _fila.put_nowait(linha)
