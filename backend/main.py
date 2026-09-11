@@ -79,9 +79,10 @@ except Exception:
 # Conhecimento velho não avisa que é velho — ele responde com a mesma confiança
 # e erra. Este número é a única coisa que impede isso.
 import hashlib as _hashlib_ext
+import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.31"
+VERSAO_BACKEND = "3.33"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -903,6 +904,346 @@ def api_uso_detalhe(limite: int = 100, chave_id: int = 0, so_bloqueadas: int = 0
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"api_uso_log indisponível: {e}")
     return {"linhas": linhas, "total": len(linhas)}
+
+
+# ── BLUEPRINT AGENTES (v3.32) ────────────────────────────────────────────────
+# Registro vivo de todo agente autônomo que opera sobre a Kist, de qualquer dono
+# e qualquer plataforma. Duas camadas que só valem juntas:
+#   DECLARAÇÃO — o que o agente diz que é e faz (/agentes/registrar).
+#   EVENTOS    — o que ele realmente fez (/agentes/eventos), append-only.
+# Agente que declara uma coisa e faz outra aparece no cruzamento. Sozinha, a
+# declaração é papel; sozinho, o evento não tem contexto.
+
+def _slug_agente(s: str) -> str:
+    s = unicodedata.normalize("NFKD", (s or "").strip().lower())
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    return s[:60]
+
+def _agente_por_slug(sb, slug: str, dono: str):
+    r = sb.table("agentes").select("*").eq("slug", slug).limit(1).execute()
+    if not r.data:
+        return None
+    ag = r.data[0]
+    # Um dono não enxerga nem escreve no agente do outro. Admin vê tudo.
+    if ag.get("dono_email") != dono and dono not in ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="Este agente pertence a outro operador.")
+    return ag
+
+
+@app.post("/agentes/registrar")
+def agentes_registrar(payload: dict, request: Request,
+                      usuario: str = Depends(verificar_token)):
+    """O agente se declara: quem é, o que faz, a que sistemas alcança.
+
+    Upsert por `slug` — reenviar é como o agente se mantém atualizado, e é o
+    comportamento esperado (blueprint que envelhece não serve para governar).
+
+    O DONO NUNCA vem do payload: é carimbado da credencial. Agente não escolhe
+    de quem ele é, senão o registro deixa de ser prova de nada.
+    """
+    sb = get_supabase()
+    nome = (payload.get("nome") or "").strip()
+    if not nome:
+        raise HTTPException(status_code=422, detail="`nome` é obrigatório.")
+    slug = _slug_agente(payload.get("slug") or nome)
+    if not slug:
+        raise HTTPException(status_code=422, detail="`slug` inválido.")
+
+    autonomia = (payload.get("autonomia") or "").strip().lower() or None
+    if autonomia and autonomia not in ("supervisionado", "misto", "autonomo"):
+        raise HTTPException(status_code=422,
+            detail="`autonomia` deve ser supervisionado, misto ou autonomo.")
+    status = (payload.get("status") or "ativo").strip().lower()
+    if status not in ("ativo", "pausado", "desativado", "em_teste"):
+        status = "ativo"
+
+    pai_id = None
+    pai = (payload.get("agente_pai") or "").strip()
+    if pai:
+        rp = sb.table("agentes").select("id,dono_email").eq("slug", _slug_agente(pai)).limit(1).execute()
+        if rp.data:
+            pai_id = rp.data[0]["id"]
+
+    existente = sb.table("agentes").select("id,dono_email").eq("slug", slug).limit(1).execute()
+    if existente.data and existente.data[0].get("dono_email") != usuario and usuario not in ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail=f"O slug '{slug}' já pertence a outro operador.")
+
+    # Qual chave declarou este agente. Amarra o blueprint ao rastro do api_uso_log.
+    chave_id = None
+    try:
+        auth = request.headers.get("authorization") or ""
+        tok = auth.split(" ", 1)[1].strip() if " " in auth else ""
+        if tok.startswith(API_KEY_PREFIXO):
+            chave_id = _resolver_api_key(tok)[2]
+    except Exception:
+        pass
+
+    linha = {
+        "slug": slug, "nome": nome, "dono_email": usuario,
+        "plataforma": (payload.get("plataforma") or "")[:120] or None,
+        "modelo": (payload.get("modelo") or "")[:120] or None,
+        "papel": (payload.get("papel") or "")[:300] or None,
+        "descricao": (payload.get("descricao") or "")[:4000] or None,
+        "gatilho": (payload.get("gatilho") or "")[:600] or None,
+        "autonomia": autonomia, "status": status,
+        "versao": (payload.get("versao") or "")[:40] or None,
+        "agente_pai": pai_id, "chave_id": chave_id,
+        # RECEITA — o que permite replicar o agente, não só descrevê-lo.
+        "instrucoes": (payload.get("instrucoes") or "")[:20000] or None,
+        "ferramentas": payload.get("ferramentas") if isinstance(payload.get("ferramentas"), list) else None,
+        "parametros": payload.get("parametros") if isinstance(payload.get("parametros"), dict) else None,
+        "regras": payload.get("regras") if isinstance(payload.get("regras"), list) else None,
+        "limitacoes": (payload.get("limitacoes") or "")[:4000] or None,
+        "como_replicar": (payload.get("como_replicar") or "")[:8000] or None,
+        "detalhe": payload.get("detalhe") if isinstance(payload.get("detalhe"), dict) else None,
+        "atualizado_em": _dt_ext.utcnow().isoformat(),
+        "ultimo_report": _dt_ext.utcnow().isoformat(),
+    }
+    try:
+        if existente.data:
+            ag_id = existente.data[0]["id"]
+            sb.table("agentes").update(linha).eq("id", ag_id).execute()
+        else:
+            ins = sb.table("agentes").insert(linha).execute()
+            ag_id = ins.data[0]["id"]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Falha ao registrar agente: {e}")
+
+    # Tarefas e acessos: substituição completa quando vierem, para o blueprint
+    # refletir o estado ATUAL do agente e não o acúmulo histórico. Ausente no
+    # payload = não mexe (permite report parcial).
+    n_t = n_a = 0
+    tarefas = payload.get("tarefas")
+    if isinstance(tarefas, list):
+        try:
+            sb.table("agentes_tarefas").delete().eq("agente_id", ag_id).execute()
+            linhas = []
+            for t in tarefas[:100]:
+                if not isinstance(t, dict) or not (t.get("nome") or "").strip():
+                    continue
+                crit = (t.get("criticidade") or "").strip().lower()
+                linhas.append({
+                    "agente_id": ag_id, "nome": (t["nome"] or "")[:200],
+                    "descricao": (t.get("descricao") or "")[:2000] or None,
+                    "gatilho": (t.get("gatilho") or "")[:400] or None,
+                    "frequencia": (t.get("frequencia") or "")[:120] or None,
+                    "sistemas": t.get("sistemas") if isinstance(t.get("sistemas"), list) else None,
+                    "escreve": bool(t.get("escreve")),
+                    "criticidade": crit if crit in ("baixa", "media", "alta") else None,
+                    "metrica_sucesso": (t.get("metrica_sucesso") or "")[:400] or None,
+                    "passos": t.get("passos") if isinstance(t.get("passos"), (list, dict)) else None,
+                    "entradas": (t.get("entradas") or "")[:1000] or None,
+                    "saidas": (t.get("saidas") or "")[:1000] or None,
+                    "regras": t.get("regras") if isinstance(t.get("regras"), list) else None,
+                    "erros_conhecidos": (t.get("erros_conhecidos") or "")[:2000] or None,
+                    "exige_aprovacao": bool(t.get("exige_aprovacao")),
+                    "ativa": bool(t.get("ativa", True)),
+                    "detalhe": t.get("detalhe") if isinstance(t.get("detalhe"), dict) else None,
+                })
+            if linhas:
+                sb.table("agentes_tarefas").insert(linhas).execute()
+            n_t = len(linhas)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Agente salvo, mas falhou nas tarefas: {e}")
+
+    acessos = payload.get("acessos")
+    if isinstance(acessos, list):
+        try:
+            sb.table("agentes_acessos").delete().eq("agente_id", ag_id).execute()
+            linhas = []
+            for x in acessos[:100]:
+                if not isinstance(x, dict) or not (x.get("sistema") or "").strip():
+                    continue
+                esc = (x.get("escopo") or "").strip().lower()
+                linhas.append({
+                    "agente_id": ag_id, "sistema": (x["sistema"] or "")[:200],
+                    "tipo_credencial": (x.get("tipo_credencial") or "")[:120] or None,
+                    "escopo": esc if esc in ("leitura", "escrita", "admin") else None,
+                    "finalidade": (x.get("finalidade") or "")[:600] or None,
+                    "dados_sensiveis": bool(x.get("dados_sensiveis")),
+                    "observacao": (x.get("observacao") or "")[:600] or None,
+                })
+            if linhas:
+                sb.table("agentes_acessos").insert(linhas).execute()
+            n_a = len(linhas)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Agente salvo, mas falhou nos acessos: {e}")
+
+    return {"ok": True, "slug": slug, "agente_id": ag_id, "dono_email": usuario,
+            "tarefas": n_t, "acessos": n_a,
+            "obs": "Reenvie este registro sempre que suas tarefas ou acessos mudarem."}
+
+
+@app.post("/agentes/eventos")
+def agentes_eventos(payload: dict, usuario: str = Depends(verificar_token)):
+    """O agente reporta o que fez. Aceita um evento ou uma lista.
+
+    Append-only de propósito: evento não se edita nem se apaga. Um diário que
+    pode ser reescrito não serve para auditar nada.
+    """
+    sb = get_supabase()
+    bruto = payload.get("eventos")
+    if not isinstance(bruto, list):
+        bruto = [payload]
+    if not bruto:
+        raise HTTPException(status_code=422, detail="Nenhum evento recebido.")
+    if len(bruto) > 200:
+        raise HTTPException(status_code=422, detail="Máximo de 200 eventos por chamada.")
+
+    cache_ag = {}
+    linhas = []
+    for ev in bruto:
+        if not isinstance(ev, dict):
+            continue
+        slug = _slug_agente(ev.get("agente") or ev.get("agente_slug") or payload.get("agente") or "")
+        ag_id = None
+        if slug:
+            if slug not in cache_ag:
+                ag = _agente_por_slug(sb, slug, usuario)
+                cache_ag[slug] = ag["id"] if ag else None
+            ag_id = cache_ag[slug]
+        tipo = (ev.get("tipo") or "execucao").strip().lower()
+        if tipo not in ("execucao", "decisao", "erro", "bloqueio", "aprovacao_pendente",
+                        "aprendizado", "inicio", "fim"):
+            tipo = "execucao"
+        st = (ev.get("status") or "").strip().lower()
+        linhas.append({
+            "agente_id": ag_id, "agente_slug": slug or None, "dono_email": usuario,
+            "tarefa": (ev.get("tarefa") or "")[:200] or None,
+            "tipo": tipo,
+            "status": st if st in ("ok", "erro", "parcial", "pendente", "ignorado") else None,
+            "resumo": (ev.get("resumo") or "")[:2000] or None,
+            "referencia": (ev.get("referencia") or "")[:120] or None,
+            "itens": int(ev["itens"]) if str(ev.get("itens") or "").strip().isdigit() else None,
+            "ms": int(ev["ms"]) if str(ev.get("ms") or "").strip().isdigit() else None,
+            "custo_usd": float(ev["custo_usd"]) if ev.get("custo_usd") not in (None, "") else None,
+            "req_id": (ev.get("req_id") or "")[:32] or None,
+            "detalhe": ev.get("detalhe") if isinstance(ev.get("detalhe"), dict) else None,
+        })
+    if not linhas:
+        raise HTTPException(status_code=422, detail="Nenhum evento válido.")
+    try:
+        sb.table("agentes_eventos").insert(linhas).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Falha ao gravar eventos: {e}")
+    desconhecidos = sorted({l["agente_slug"] for l in linhas
+                            if l["agente_slug"] and l["agente_id"] is None})
+    saida = {"ok": True, "gravados": len(linhas)}
+    if desconhecidos:
+        saida["aviso"] = ("Estes agentes não estão registrados e o evento ficou sem vínculo: "
+                          + ", ".join(desconhecidos) + ". Chame /agentes/registrar primeiro.")
+    return saida
+
+
+@app.get("/agentes")
+def agentes_listar(todos: int = 0, usuario: str = Depends(verificar_token)):
+    """Os agentes registrados. Por padrão os seus; `todos=1` para admin ver a casa toda."""
+    sb = get_supabase()
+    try:
+        q = sb.table("agentes").select("*").order("dono_email").order("slug")
+        if not (int(todos or 0) and usuario in ADMIN_EMAILS):
+            q = q.eq("dono_email", usuario)
+        linhas = q.execute().data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Falha ao listar agentes: {e}")
+    return {"agentes": linhas, "total": len(linhas)}
+
+
+@app.get("/agentes/painel")
+def agentes_painel(dias: int = 7, dono: str = "", todos: int = 0,
+                   usuario: str = Depends(verificar_token)):
+    """O painel: o declarado ao lado do medido, por agente.
+
+    `silencio` é o campo que mais importa no dia a dia — agente que parou de
+    reportar não avisa que parou.
+    """
+    dias = max(1, min(int(dias or 7), 365))
+    alvo = None
+    if int(todos or 0) and usuario in ADMIN_EMAILS:
+        alvo = None
+    elif dono and usuario in ADMIN_EMAILS:
+        alvo = dono.strip().lower()
+    else:
+        alvo = usuario
+    try:
+        r = get_supabase().rpc("agentes_painel", {"p_dias": dias, "p_dono": alvo}).execute()
+        linhas = r.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Painel indisponível: {e}")
+    return {
+        "dias": dias, "dono": alvo or "(todos)", "agentes": linhas,
+        "eventos_total": sum(int(x.get("eventos") or 0) for x in linhas),
+        "erros_total": sum(int(x.get("erros") or 0) for x in linhas),
+        "pendentes_total": sum(int(x.get("pendentes") or 0) for x in linhas),
+        "custo_medido_total_usd": round(sum(float(x.get("custo_medido") or 0) for x in linhas), 4),
+    }
+
+
+@app.get("/agentes/eventos")
+def agentes_eventos_listar(limite: int = 100, agente: str = "", tipo: str = "",
+                           so_erros: int = 0, todos: int = 0,
+                           usuario: str = Depends(verificar_token)):
+    """Linha do tempo dos eventos. É o feed do dashboard em tempo real."""
+    limite = max(1, min(int(limite or 100), 500))
+    try:
+        q = get_supabase().table("agentes_eventos").select(
+            "id,criado_em,agente_slug,dono_email,tarefa,tipo,status,resumo,referencia,itens,ms,custo_usd,req_id"
+        ).order("criado_em", desc=True).limit(limite)
+        if not (int(todos or 0) and usuario in ADMIN_EMAILS):
+            q = q.eq("dono_email", usuario)
+        if agente:
+            q = q.eq("agente_slug", _slug_agente(agente))
+        if tipo:
+            q = q.eq("tipo", tipo.strip().lower())
+        if int(so_erros or 0):
+            q = q.eq("status", "erro")
+        linhas = q.execute().data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Falha ao ler eventos: {e}")
+    return {"eventos": linhas, "total": len(linhas)}
+
+
+@app.get("/agentes/{slug}")
+def agentes_detalhe(slug: str, usuario: str = Depends(verificar_token)):
+    """Ficha completa de um agente: declaração, tarefas, acessos e últimos eventos."""
+    sb = get_supabase()
+    ag = _agente_por_slug(sb, _slug_agente(slug), usuario)
+    if not ag:
+        raise HTTPException(status_code=404, detail=f"Agente '{slug}' não registrado.")
+    try:
+        tarefas = sb.table("agentes_tarefas").select("*").eq("agente_id", ag["id"]).order("nome").execute().data or []
+        acessos = sb.table("agentes_acessos").select("*").eq("agente_id", ag["id"]).order("sistema").execute().data or []
+        eventos = sb.table("agentes_eventos").select(
+            "criado_em,tarefa,tipo,status,resumo,referencia,itens,ms,custo_usd"
+        ).eq("agente_id", ag["id"]).order("criado_em", desc=True).limit(50).execute().data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Falha ao montar a ficha: {e}")
+    return {"agente": ag, "tarefas": tarefas, "acessos": acessos, "eventos_recentes": eventos}
+
+
+@app.get("/agentes/{slug}/receita")
+def agentes_receita(slug: str, usuario: str = Depends(verificar_token)):
+    """A ficha de replicação: tudo que é preciso para recriar este agente.
+
+    Instruções, ferramentas, parâmetros, regras, e o passo a passo de cada
+    rotina — sem ids internos e sem vínculo de chave, para poder ser levada
+    para outra conta ou outro dono. É o que transforma o blueprint de
+    inventário em receita.
+    """
+    sb = get_supabase()
+    s = _slug_agente(slug)
+    ag = _agente_por_slug(sb, s, usuario)
+    if not ag:
+        raise HTTPException(status_code=404, detail=f"Agente '{slug}' não registrado.")
+    try:
+        r = sb.rpc("agente_receita", {"p_slug": s}).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Falha ao montar a receita: {e}")
+    receita = r.data if not isinstance(r.data, list) else (r.data[0] if r.data else None)
+    if not receita:
+        raise HTTPException(status_code=404, detail=f"Agente '{slug}' sem receita.")
+    return receita
 
 
 @app.get("/ping")
