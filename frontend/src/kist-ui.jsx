@@ -174,10 +174,12 @@ export function Sidebar({ active, onNavigate, usuario, stats, onLogout, isAdmin,
     { k: "propostas",   label: "Propostas",         Icon: IconList },
     { k: "ordens",      label: "Ordens de compra",  Icon: IconBoard },
     { k: "requisicoes", label: "Requisições",       Icon: IconChat },
-    ...(isAdmin ? [
-      { k: "agentes",  label: "Agentes",        Icon: IconAgentes },
-      { k: "chamados", label: "Admin chamados", Icon: IconInbox },
-    ] : []),
+    // Agentes é de TODOS: quem conserta o agente parado é o dono dele, não o
+    // admin. O backend já filtra por dono — sem `todos=1`, cada um vê só os
+    // seus. Painel que só o chefe enxerga vira fiscalização; painel que o dono
+    // enxerga vira ferramenta.
+    { k: "agentes",     label: "Agentes",          Icon: IconAgentes },
+    ...(isAdmin ? [{ k: "chamados", label: "Admin chamados", Icon: IconInbox }] : []),
     { k: "docs",        label: "Docs",              Icon: IconBook },
   ];
   const inicial = (usuario?.nome || "?").trim().charAt(0).toUpperCase();

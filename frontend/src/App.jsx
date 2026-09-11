@@ -2368,7 +2368,7 @@ export default function App() {
             onNovaOCProcessada={() => setNovaOCPayload(null)} />
         ) : pagina === "requisicoes" ? (
           <Analista token={token} usuario={usuario} onAlertasChange={carregarAlertas} />
-        ) : pagina === "agentes" && isAdmin ? (
+        ) : pagina === "agentes" ? (
           <Agentes token={token} usuario={usuario} isAdmin={isAdmin} />
         ) : pagina === "chamados" && isAdmin ? (
           <ChamadosAdmin token={token} usuario={usuario} />
