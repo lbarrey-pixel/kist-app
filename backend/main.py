@@ -82,7 +82,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.36"
+VERSAO_BACKEND = "3.38"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -1494,6 +1494,147 @@ def funcoes_sistema(usuario: str = Depends(verificar_token)):
     out += [f"{m} {p}" + (f" — {doc}" if doc else "") for m, p, doc in rotas]
     out.append("\nDELETE e rotinas de lote exigem escopo admin. Detalhe: /docs (caro, nao carregue inteiro)")
     return "\n".join(out)
+
+
+@app.get("/rastreios/pendentes.txt", response_class=PlainTextResponse)
+def rastreios_pendentes_txt(dias: int = 120, sem_rastreio: int = 0,
+                            usuario: str = Depends(verificar_token)):
+    """A fila do bot de rastreio: o que ainda não fechou o ciclo de entrega.
+
+    Texto compacto porque é a rota que um agente lê todo dia — em JSON isso
+    custaria alguns milhares de tokens por leitura, reenviados a cada passo.
+
+    `sem_rastreio=1` traz só as OCs sobre as quais ainda não se sabe nada, que
+    é por onde o bot deve começar.
+    """
+    dias = max(1, min(int(dias or 120), 730))
+    try:
+        r = get_supabase().rpc("rastreios_pendentes", {"p_dias": dias}).execute()
+        linhas = r.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:120])
+    if int(sem_rastreio or 0):
+        linhas = [l for l in linhas if not l.get("rastreio_id")]
+    if not linhas:
+        return "nada pendente"
+    out = [f"{len(linhas)} pendentes | oc dias cliente uf po status transp codigo situacao"]
+    for l in linhas:
+        out.append(" ".join(str(x) for x in [
+            l.get("oc_id"), f"{l.get('dias_parada')}d",
+            (l.get("cliente") or "?")[:28].replace(" ", "_"),
+            l.get("uf") or "-", l.get("numero_po") or "-", l.get("status") or "-",
+            l.get("transportadora") or "-", l.get("codigo") or "-",
+            (l.get("situacao") or "-")[:40].replace(" ", "_"),
+        ]))
+    return "\n".join(out)
+
+
+@app.post("/rastreios")
+def rastreios_gravar(payload: dict, usuario: str = Depends(verificar_token)):
+    """O agente reporta o que descobriu sobre um volume.
+
+    `sentido`: 'entrada' (fornecedor -> Kist) ou 'saida' (Kist -> cliente).
+    Upsert por (oc_id, sentido, codigo) — reportar de novo atualiza a situação,
+    que é o comportamento esperado de quem acompanha todo dia.
+
+    `situacao` fica em TEXTO LIVRE de propósito: cada transportadora fala de um
+    jeito e normalizar isso cedo perde informação. `confianca='baixa'` quando o
+    agente achou algo parecido mas não tem certeza de que é desta OC — é melhor
+    registrar a dúvida do que inventar certeza ou não registrar nada.
+    """
+    sentido = (payload.get("sentido") or "").strip().lower()
+    if sentido not in ("entrada", "saida"):
+        raise HTTPException(status_code=422, detail="sentido: entrada ou saida")
+    try:
+        oc_id = int(payload.get("oc_id") or 0)
+    except Exception:
+        oc_id = 0
+    if not oc_id:
+        raise HTTPException(status_code=422, detail="oc_id obrigatorio")
+
+    sb = get_supabase()
+    try:
+        if not (sb.table("ordens_compra").select("id").eq("id", oc_id).limit(1).execute().data):
+            raise HTTPException(status_code=404, detail=f"OC {oc_id} nao existe")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:120])
+
+    conf = (payload.get("confianca") or "").strip().lower()
+    fonte = (payload.get("fonte") or "").strip().lower()
+    linha = {
+        "oc_id": oc_id, "sentido": sentido,
+        "transportadora": (payload.get("transportadora") or "")[:120] or None,
+        "codigo": (payload.get("codigo") or "")[:80] or None,
+        "url": (payload.get("url") or "")[:600] or None,
+        "situacao": (payload.get("situacao") or "")[:300] or None,
+        "previsao": (payload.get("previsao") or None) or None,
+        "entregue_em": (payload.get("entregue_em") or None) or None,
+        "fonte": fonte if fonte in ("email", "site", "manual", "api") else None,
+        "confianca": conf if conf in ("alta", "media", "baixa") else None,
+        "agente_slug": _slug_agente(payload.get("agente") or "") or None,
+        "obs": (payload.get("obs") or "")[:600] or None,
+        "detalhe": payload.get("detalhe") if isinstance(payload.get("detalhe"), dict) else None,
+        "verificado_em": _dt_ext.utcnow().isoformat(),
+    }
+    try:
+        q = (sb.table("rastreios").select("id").eq("oc_id", oc_id).eq("sentido", sentido))
+        if linha["codigo"]:
+            q = q.eq("codigo", linha["codigo"])
+        existente = q.limit(1).execute().data or []
+        if existente:
+            sb.table("rastreios").update(linha).eq("id", existente[0]["id"]).execute()
+            rid = existente[0]["id"]
+        else:
+            linha["criado_em"] = _dt_ext.utcnow().isoformat()
+            rid = (sb.table("rastreios").insert(linha).execute().data or [{}])[0].get("id")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:120])
+    return {"ok": 1, "id": rid}
+
+
+@app.get("/rastreios")
+def rastreios_listar(oc_id: int = 0, abertos: int = 0, limite: int = 100,
+                     usuario: str = Depends(verificar_token)):
+    """Rastreios gravados. `abertos=1` traz só os que ainda não foram entregues."""
+    limite = max(1, min(int(limite or 100), 500))
+    try:
+        q = get_supabase().table("rastreios").select("*").order("criado_em", desc=True).limit(limite)
+        if oc_id:
+            q = q.eq("oc_id", int(oc_id))
+        if int(abertos or 0):
+            q = q.is_("entregue_em", "null")
+        linhas = q.execute().data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:120])
+    return {"rastreios": linhas, "total": len(linhas)}
+
+
+@app.get("/markup", response_class=PlainTextResponse)
+def markup_referencia(cnpj: str = "", usuario: str = Depends(verificar_token)):
+    """A faixa de markup que a Kist praticou com este cliente.
+
+    Agrupa pela RAIZ do CNPJ (8 dígitos), porque filial é o mesmo cliente
+    comercial: Convergint tem 5 CNPJs, Maersk 9, Igreja Universal mais de 8.
+    Sem massa suficiente, cai na faixa global e diz que caiu.
+
+    NÃO decide preço. Entrega o que foi praticado para o humano decidir — a
+    dispersão dentro do mesmo cliente é grande e o item de nicho não se
+    precifica como commodity.
+    """
+    try:
+        r = get_supabase().rpc("markup_sugerido",
+                               {"p_cnpj": cnpj or None, "p_min_amostra": 8}).execute()
+        linhas = r.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:120])
+    if not linhas:
+        return "sem dados"
+    d = linhas[0]
+    return (f"fonte {d.get('fonte')} amostra {d.get('amostra')}\n"
+            f"p25 {d.get('p25')} mediana {d.get('mediana')} p75 {d.get('p75')} p90 {d.get('p90')}\n"
+            f"fator sobre o custo; mediana e ponto de partida, nao decisao")
 
 
 @app.get("/ping")
