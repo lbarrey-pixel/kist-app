@@ -1,7 +1,7 @@
 import os, csv, io, re, time, base64 as _b64
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional, List
@@ -82,7 +82,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.33"
+VERSAO_BACKEND = "3.34"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -932,7 +932,7 @@ def _agente_por_slug(sb, slug: str, dono: str):
 
 
 @app.post("/agentes/registrar")
-def agentes_registrar(payload: dict, request: Request,
+def agentes_registrar(payload: dict, request: Request, v: int = 0,
                       usuario: str = Depends(verificar_token)):
     """O agente se declara: quem é, o que faz, a que sistemas alcança.
 
@@ -942,6 +942,7 @@ def agentes_registrar(payload: dict, request: Request,
     O DONO NUNCA vem do payload: é carimbado da credencial. Agente não escolhe
     de quem ele é, senão o registro deixa de ser prova de nada.
     """
+    verboso = v
     sb = get_supabase()
     nome = (payload.get("nome") or "").strip()
     if not nome:
@@ -1070,9 +1071,13 @@ def agentes_registrar(payload: dict, request: Request,
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Agente salvo, mas falhou nos acessos: {e}")
 
-    return {"ok": True, "slug": slug, "agente_id": ag_id, "dono_email": usuario,
-            "tarefas": n_t, "acessos": n_a,
-            "obs": "Reenvie este registro sempre que suas tarefas ou acessos mudarem."}
+    # Resposta mínima por padrão: cada token daqui volta no contexto do agente a
+    # cada passo seguinte. `v=1` para a versão explicada (uso humano).
+    if int(verboso or 0):
+        return {"ok": True, "slug": slug, "agente_id": ag_id, "dono_email": usuario,
+                "tarefas": n_t, "acessos": n_a,
+                "obs": "Reenvie este registro sempre que suas tarefas ou acessos mudarem."}
+    return {"ok": 1, "slug": slug, "t": n_t, "a": n_a}
 
 
 @app.post("/agentes/eventos")
@@ -1129,10 +1134,9 @@ def agentes_eventos(payload: dict, usuario: str = Depends(verificar_token)):
         raise HTTPException(status_code=500, detail=f"Falha ao gravar eventos: {e}")
     desconhecidos = sorted({l["agente_slug"] for l in linhas
                             if l["agente_slug"] and l["agente_id"] is None})
-    saida = {"ok": True, "gravados": len(linhas)}
+    saida = {"ok": 1, "n": len(linhas)}
     if desconhecidos:
-        saida["aviso"] = ("Estes agentes não estão registrados e o evento ficou sem vínculo: "
-                          + ", ".join(desconhecidos) + ". Chame /agentes/registrar primeiro.")
+        saida["nao_registrado"] = desconhecidos
     return saida
 
 
@@ -1244,6 +1248,112 @@ def agentes_receita(slug: str, usuario: str = Depends(verificar_token)):
     if not receita:
         raise HTTPException(status_code=404, detail=f"Agente '{slug}' sem receita.")
     return receita
+
+
+# ── ECONOMIA DE TOKENS (v3.34) ───────────────────────────────────────────────
+# Tudo abaixo existe por uma razão só: o que a nossa API devolve entra no
+# contexto do agente e é REENVIADO a cada passo do laço dele. Uma resposta de
+# 200 tokens, em 12 chamadas, custa ~15.600 tokens acumulados; a mesma resposta
+# em 8 tokens custa 624. O custo cresce de forma quadrática no tamanho da
+# resposta, não linear. Por isso as rotas de agente respondem no mínimo possível
+# por padrão, e só falam mais quando explicitamente pedido (`v=1`).
+
+@app.post("/agentes/ev", response_class=PlainTextResponse)
+async def agentes_ev_texto(request: Request, usuario: str = Depends(verificar_token)):
+    """Reporte de eventos em texto puro. A via barata.
+
+    Corpo = uma linha por evento, campos separados por `|`, na ordem:
+
+        slug|tarefa|status|referencia|itens|ms|usd|resumo
+
+    Só `slug` é obrigatório; o resto pode vir vazio (`kepler|||||||parou`).
+    Linhas em branco e começadas por `#` são ignoradas.
+
+    Custa cerca de metade dos tokens do JSON equivalente, e a resposta é
+    literalmente `ok N`. Aceita até 200 linhas.
+    """
+    try:
+        corpo = (await request.body()).decode("utf-8", errors="replace")
+    except Exception:
+        raise HTTPException(status_code=422, detail="corpo ilegivel")
+    linhas_txt = [l.strip() for l in corpo.splitlines()
+                  if l.strip() and not l.strip().startswith("#")]
+    if not linhas_txt:
+        raise HTTPException(status_code=422, detail="vazio")
+    if len(linhas_txt) > 200:
+        raise HTTPException(status_code=422, detail="max 200")
+
+    sb = get_supabase()
+    cache_ag, linhas, ruins = {}, [], 0
+    for l in linhas_txt:
+        p = [c.strip() for c in l.split("|")]
+        p += [""] * (8 - len(p))
+        slug = _slug_agente(p[0])
+        if not slug:
+            ruins += 1
+            continue
+        if slug not in cache_ag:
+            ag = _agente_por_slug(sb, slug, usuario)
+            cache_ag[slug] = ag["id"] if ag else None
+        st = p[2].lower()
+        # status é o campo que mais erra digitação; 'erro' também vira tipo.
+        linhas.append({
+            "agente_id": cache_ag[slug], "agente_slug": slug, "dono_email": usuario,
+            "tarefa": p[1][:200] or None,
+            "tipo": "erro" if st == "erro" else "execucao",
+            "status": st if st in ("ok", "erro", "parcial", "pendente", "ignorado") else None,
+            "referencia": p[3][:120] or None,
+            "itens": int(p[4]) if p[4].isdigit() else None,
+            "ms": int(p[5]) if p[5].isdigit() else None,
+            "custo_usd": float(p[6]) if _num(p[6]) else None,
+            "resumo": p[7][:2000] or None,
+        })
+    if not linhas:
+        raise HTTPException(status_code=422, detail="nenhuma linha valida")
+    try:
+        sb.table("agentes_eventos").insert(linhas).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:120])
+    fora = sorted({l["agente_slug"] for l in linhas if l["agente_id"] is None})
+    saida = f"ok {len(linhas)}"
+    if ruins:
+        saida += f" ign {ruins}"
+    if fora:
+        saida += " nao-registrado:" + ",".join(fora)
+    return saida
+
+
+def _num(s: str) -> bool:
+    try:
+        float(s)
+        return True
+    except Exception:
+        return False
+
+
+@app.get("/agentes/painel.txt", response_class=PlainTextResponse)
+def agentes_painel_txt(dias: int = 7, todos: int = 0,
+                       usuario: str = Depends(verificar_token)):
+    """O painel em texto de largura fixa. Mesma informação, ~1/5 dos tokens.
+
+    Uma linha por agente: slug, eventos, erros, pendentes, custo medido e há
+    quanto tempo está calado.
+    """
+    dias = max(1, min(int(dias or 7), 365))
+    alvo = None if (int(todos or 0) and usuario in ADMIN_EMAILS) else usuario
+    try:
+        r = get_supabase().rpc("agentes_painel", {"p_dias": dias, "p_dono": alvo}).execute()
+        linhas = r.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:120])
+    if not linhas:
+        return "sem agentes"
+    out = ["slug ev err pend usd calado"]
+    for a in linhas:
+        cal = str(a.get("silencio") or "").split(".")[0] or "-"
+        out.append(f"{a.get('slug')} {a.get('eventos') or 0} {a.get('erros') or 0} "
+                   f"{a.get('pendentes') or 0} {a.get('custo_medido') or 0} {cal}")
+    return "\n".join(out)
 
 
 @app.get("/ping")
