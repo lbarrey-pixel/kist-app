@@ -4,6 +4,7 @@ import Propostas from "./Propostas.jsx";
 import OrdensCompra from "./OrdensCompra.jsx";
 import Analista from "./Analista.jsx";
 import ChamadosAdmin from "./ChamadosAdmin.jsx";
+import Agentes from "./Agentes.jsx";
 import { DatasheetBotao, DatasheetLote, DatasheetBaixarTodos } from "./Datasheet.jsx";
 import {
   CONF, brl, btnPrimary, btnGhost, Eyebrow, StateLabel, PageHeader,
@@ -2367,6 +2368,8 @@ export default function App() {
             onNovaOCProcessada={() => setNovaOCPayload(null)} />
         ) : pagina === "requisicoes" ? (
           <Analista token={token} usuario={usuario} onAlertasChange={carregarAlertas} />
+        ) : pagina === "agentes" && isAdmin ? (
+          <Agentes token={token} usuario={usuario} isAdmin={isAdmin} />
         ) : pagina === "chamados" && isAdmin ? (
           <ChamadosAdmin token={token} usuario={usuario} />
         ) : (
