@@ -82,7 +82,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.35"
+VERSAO_BACKEND = "3.36"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -1137,6 +1137,9 @@ def agentes_eventos(payload: dict, usuario: str = Depends(verificar_token)):
     saida = {"ok": 1, "n": len(linhas)}
     if desconhecidos:
         saida["nao_registrado"] = desconhecidos
+    vistos = {l["agente_slug"] for l in linhas if l["agente_slug"]}
+    if any(_ctx_desatualizado(sb, sl) for sl in vistos):
+        saida["ctx"] = "mudou"
     return saida
 
 
@@ -1320,6 +1323,11 @@ async def agentes_ev_texto(request: Request, usuario: str = Depends(verificar_to
         saida += f" ign {ruins}"
     if fora:
         saida += " nao-registrado:" + ",".join(fora)
+    # O agente não precisa lembrar de conferir: avisamos na resposta que ele já
+    # ia receber. `ctx!` = releia /contexto, a base mudou desde sua última leitura.
+    vistos = {l["agente_slug"] for l in linhas if l["agente_slug"]}
+    if any(_ctx_desatualizado(sb, sl) for sl in vistos):
+        saida += " ctx!"
     return saida
 
 
@@ -1356,6 +1364,37 @@ def agentes_painel_txt(dias: int = 7, todos: int = 0,
     return "\n".join(out)
 
 
+def _assinatura_ctx(sb) -> str:
+    """Assinatura atual da base de conhecimento. Vazio se indisponível."""
+    try:
+        r = sb.rpc("conhecimento_versao", {}).execute()
+        d = (r.data or [{}])[0] if isinstance(r.data, list) else (r.data or {})
+        return (d.get("assinatura") or "")[:32]
+    except Exception:
+        return ""
+
+
+def _ctx_desatualizado(sb, slug: str) -> bool:
+    """O agente leu uma versão anterior à atual?
+
+    Mecanismo, não confiança: o backend compara e AVISA na resposta da chamada
+    que o agente já ia fazer de qualquer jeito. Custa ~4 tokens e não depende de
+    ele lembrar de conferir.
+    """
+    if not slug:
+        return False
+    try:
+        atual = _assinatura_ctx(sb)
+        if not atual:
+            return False
+        r = sb.table("agentes").select("ctx_visto").eq("slug", slug).limit(1).execute()
+        if not r.data:
+            return False
+        return (r.data[0].get("ctx_visto") or "") != atual
+    except Exception:
+        return False
+
+
 @app.get("/versao", response_class=PlainTextResponse)
 def versao_sistema(usuario: str = Depends(verificar_token)):
     """A rota mais barata do sistema. Diz SE algo mudou, sem trafegar conteúdo.
@@ -1376,7 +1415,7 @@ def versao_sistema(usuario: str = Depends(verificar_token)):
 
 
 @app.get("/contexto", response_class=PlainTextResponse)
-def contexto_agentes(secoes: str = "", indice: int = 0,
+def contexto_agentes(secoes: str = "", indice: int = 0, agente: str = "",
                      usuario: str = Depends(verificar_token)):
     """A base de conhecimento da Kist, em texto puro e seccionada.
 
@@ -1408,6 +1447,18 @@ def contexto_agentes(secoes: str = "", indice: int = 0,
         if not linhas:
             raise HTTPException(status_code=404,
                                 detail="secao inexistente; veja /contexto?indice=1")
+    # Leitura completa marca o agente como em dia. Leitura parcial não marca: ele
+    # viu um pedaço, não a base.
+    if agente and not pedidas:
+        try:
+            sb = get_supabase()
+            assin = _assinatura_ctx(sb)
+            if assin:
+                sb.table("agentes").update(
+                    {"ctx_visto": assin, "ctx_visto_em": _dt_ext.utcnow().isoformat()}
+                ).eq("slug", _slug_agente(agente)).eq("dono_email", usuario).execute()
+        except Exception:
+            pass
     blocos = [f"## {l['secao']} (v{l['versao']}) — {l['titulo']}\n{l['conteudo']}"
               for l in linhas]
     return "\n\n".join(blocos)
