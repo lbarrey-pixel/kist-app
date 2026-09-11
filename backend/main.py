@@ -82,7 +82,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.34"
+VERSAO_BACKEND = "3.35"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -1353,6 +1353,95 @@ def agentes_painel_txt(dias: int = 7, todos: int = 0,
         cal = str(a.get("silencio") or "").split(".")[0] or "-"
         out.append(f"{a.get('slug')} {a.get('eventos') or 0} {a.get('erros') or 0} "
                    f"{a.get('pendentes') or 0} {a.get('custo_medido') or 0} {cal}")
+    return "\n".join(out)
+
+
+@app.get("/versao", response_class=PlainTextResponse)
+def versao_sistema(usuario: str = Depends(verificar_token)):
+    """A rota mais barata do sistema. Diz SE algo mudou, sem trafegar conteúdo.
+
+    O agente guarda a assinatura e consulta aqui antes de reler o contexto. Se a
+    assinatura não mudou, ele já sabe o que precisa saber e não paga por nada.
+    Relê tudo "por garantia" é exatamente o hábito que estoura orçamento.
+    """
+    linhas = [f"backend {VERSAO_BACKEND}"]
+    try:
+        r = get_supabase().rpc("conhecimento_versao", {}).execute()
+        d = (r.data or [{}])[0] if isinstance(r.data, list) else (r.data or {})
+        linhas.append(f"conhecimento {d.get('secoes', 0)}secoes v{d.get('versao_total', 0)} "
+                      f"{(d.get('assinatura') or '')[:12]}")
+    except Exception:
+        linhas.append("conhecimento indisponivel")
+    return "\n".join(linhas)
+
+
+@app.get("/contexto", response_class=PlainTextResponse)
+def contexto_agentes(secoes: str = "", indice: int = 0,
+                     usuario: str = Depends(verificar_token)):
+    """A base de conhecimento da Kist, em texto puro e seccionada.
+
+    `indice=1` lista as seções com versão e tamanho — poucas dezenas de tokens.
+    `secoes=regras_ouro,matching` traz só o que foi pedido.
+    Sem parâmetro, traz tudo (use uma vez, no começo; não a cada passo).
+
+    Seccionado de propósito: carregar a base inteira a cada laço é o erro caro.
+    """
+    try:
+        linhas = (get_supabase().table("conhecimento")
+                  .select("secao,titulo,conteudo,versao,ordem")
+                  .eq("publico", True).order("ordem").order("secao").execute().data or [])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:120])
+    if not linhas:
+        return "base de conhecimento vazia"
+
+    if int(indice or 0):
+        out = ["secao v tamanho titulo"]
+        for l in linhas:
+            out.append(f"{l['secao']} v{l['versao']} {len(l['conteudo'] or '')}c {l['titulo']}")
+        out.append("\nuse /contexto?secoes=a,b para trazer so o que precisa")
+        return "\n".join(out)
+
+    pedidas = {s.strip().lower() for s in secoes.split(",") if s.strip()}
+    if pedidas:
+        linhas = [l for l in linhas if l["secao"] in pedidas]
+        if not linhas:
+            raise HTTPException(status_code=404,
+                                detail="secao inexistente; veja /contexto?indice=1")
+    blocos = [f"## {l['secao']} (v{l['versao']}) — {l['titulo']}\n{l['conteudo']}"
+              for l in linhas]
+    return "\n\n".join(blocos)
+
+
+@app.get("/funcoes", response_class=PlainTextResponse)
+def funcoes_sistema(usuario: str = Depends(verificar_token)):
+    """Mapa das rotas lido do PRÓPRIO CÓDIGO por AST, agora.
+
+    Não é documentação escrita à mão, que envelhece: é o arquivo se lendo. O que
+    está aqui existe. Custa uma fração do /openapi.json, que o agente não deve
+    carregar no contexto.
+    """
+    import ast as _ast
+    try:
+        with open(__file__, encoding="utf-8") as f:
+            arvore = _ast.parse(f.read())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:120])
+    rotas = []
+    for no in arvore.body:
+        if not isinstance(no, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            continue
+        for d in no.decorator_list:
+            if (isinstance(d, _ast.Call) and isinstance(d.func, _ast.Attribute)
+                    and isinstance(d.func.value, _ast.Name) and d.func.value.id == "app"
+                    and d.func.attr in ("get", "post", "put", "patch", "delete")
+                    and d.args and isinstance(d.args[0], _ast.Constant)):
+                doc = (_ast.get_docstring(no) or "").strip().split("\n")[0]
+                rotas.append((d.func.attr.upper(), d.args[0].value, doc[:90]))
+    rotas.sort(key=lambda x: (x[1], x[0]))
+    out = [f"backend {VERSAO_BACKEND} — {len(rotas)} rotas"]
+    out += [f"{m} {p}" + (f" — {doc}" if doc else "") for m, p, doc in rotas]
+    out.append("\nDELETE e rotinas de lote exigem escopo admin. Detalhe: /docs (caro, nao carregue inteiro)")
     return "\n".join(out)
 
 
