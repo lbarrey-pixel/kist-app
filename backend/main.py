@@ -82,7 +82,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.38"
+VERSAO_BACKEND = "3.39"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -1211,134 +1211,6 @@ def agentes_eventos_listar(limite: int = 100, agente: str = "", tipo: str = "",
     return {"eventos": linhas, "total": len(linhas)}
 
 
-@app.get("/agentes/{slug}")
-def agentes_detalhe(slug: str, usuario: str = Depends(verificar_token)):
-    """Ficha completa de um agente: declaração, tarefas, acessos e últimos eventos."""
-    sb = get_supabase()
-    ag = _agente_por_slug(sb, _slug_agente(slug), usuario)
-    if not ag:
-        raise HTTPException(status_code=404, detail=f"Agente '{slug}' não registrado.")
-    try:
-        tarefas = sb.table("agentes_tarefas").select("*").eq("agente_id", ag["id"]).order("nome").execute().data or []
-        acessos = sb.table("agentes_acessos").select("*").eq("agente_id", ag["id"]).order("sistema").execute().data or []
-        eventos = sb.table("agentes_eventos").select(
-            "criado_em,tarefa,tipo,status,resumo,referencia,itens,ms,custo_usd"
-        ).eq("agente_id", ag["id"]).order("criado_em", desc=True).limit(50).execute().data or []
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Falha ao montar a ficha: {e}")
-    return {"agente": ag, "tarefas": tarefas, "acessos": acessos, "eventos_recentes": eventos}
-
-
-@app.get("/agentes/{slug}/receita")
-def agentes_receita(slug: str, usuario: str = Depends(verificar_token)):
-    """A ficha de replicação: tudo que é preciso para recriar este agente.
-
-    Instruções, ferramentas, parâmetros, regras, e o passo a passo de cada
-    rotina — sem ids internos e sem vínculo de chave, para poder ser levada
-    para outra conta ou outro dono. É o que transforma o blueprint de
-    inventário em receita.
-    """
-    sb = get_supabase()
-    s = _slug_agente(slug)
-    ag = _agente_por_slug(sb, s, usuario)
-    if not ag:
-        raise HTTPException(status_code=404, detail=f"Agente '{slug}' não registrado.")
-    try:
-        r = sb.rpc("agente_receita", {"p_slug": s}).execute()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Falha ao montar a receita: {e}")
-    receita = r.data if not isinstance(r.data, list) else (r.data[0] if r.data else None)
-    if not receita:
-        raise HTTPException(status_code=404, detail=f"Agente '{slug}' sem receita.")
-    return receita
-
-
-# ── ECONOMIA DE TOKENS (v3.34) ───────────────────────────────────────────────
-# Tudo abaixo existe por uma razão só: o que a nossa API devolve entra no
-# contexto do agente e é REENVIADO a cada passo do laço dele. Uma resposta de
-# 200 tokens, em 12 chamadas, custa ~15.600 tokens acumulados; a mesma resposta
-# em 8 tokens custa 624. O custo cresce de forma quadrática no tamanho da
-# resposta, não linear. Por isso as rotas de agente respondem no mínimo possível
-# por padrão, e só falam mais quando explicitamente pedido (`v=1`).
-
-@app.post("/agentes/ev", response_class=PlainTextResponse)
-async def agentes_ev_texto(request: Request, usuario: str = Depends(verificar_token)):
-    """Reporte de eventos em texto puro. A via barata.
-
-    Corpo = uma linha por evento, campos separados por `|`, na ordem:
-
-        slug|tarefa|status|referencia|itens|ms|usd|resumo
-
-    Só `slug` é obrigatório; o resto pode vir vazio (`kepler|||||||parou`).
-    Linhas em branco e começadas por `#` são ignoradas.
-
-    Custa cerca de metade dos tokens do JSON equivalente, e a resposta é
-    literalmente `ok N`. Aceita até 200 linhas.
-    """
-    try:
-        corpo = (await request.body()).decode("utf-8", errors="replace")
-    except Exception:
-        raise HTTPException(status_code=422, detail="corpo ilegivel")
-    linhas_txt = [l.strip() for l in corpo.splitlines()
-                  if l.strip() and not l.strip().startswith("#")]
-    if not linhas_txt:
-        raise HTTPException(status_code=422, detail="vazio")
-    if len(linhas_txt) > 200:
-        raise HTTPException(status_code=422, detail="max 200")
-
-    sb = get_supabase()
-    cache_ag, linhas, ruins = {}, [], 0
-    for l in linhas_txt:
-        p = [c.strip() for c in l.split("|")]
-        p += [""] * (8 - len(p))
-        slug = _slug_agente(p[0])
-        if not slug:
-            ruins += 1
-            continue
-        if slug not in cache_ag:
-            ag = _agente_por_slug(sb, slug, usuario)
-            cache_ag[slug] = ag["id"] if ag else None
-        st = p[2].lower()
-        # status é o campo que mais erra digitação; 'erro' também vira tipo.
-        linhas.append({
-            "agente_id": cache_ag[slug], "agente_slug": slug, "dono_email": usuario,
-            "tarefa": p[1][:200] or None,
-            "tipo": "erro" if st == "erro" else "execucao",
-            "status": st if st in ("ok", "erro", "parcial", "pendente", "ignorado") else None,
-            "referencia": p[3][:120] or None,
-            "itens": int(p[4]) if p[4].isdigit() else None,
-            "ms": int(p[5]) if p[5].isdigit() else None,
-            "custo_usd": float(p[6]) if _num(p[6]) else None,
-            "resumo": p[7][:2000] or None,
-        })
-    if not linhas:
-        raise HTTPException(status_code=422, detail="nenhuma linha valida")
-    try:
-        sb.table("agentes_eventos").insert(linhas).execute()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)[:120])
-    fora = sorted({l["agente_slug"] for l in linhas if l["agente_id"] is None})
-    saida = f"ok {len(linhas)}"
-    if ruins:
-        saida += f" ign {ruins}"
-    if fora:
-        saida += " nao-registrado:" + ",".join(fora)
-    # O agente não precisa lembrar de conferir: avisamos na resposta que ele já
-    # ia receber. `ctx!` = releia /contexto, a base mudou desde sua última leitura.
-    vistos = {l["agente_slug"] for l in linhas if l["agente_slug"]}
-    if any(_ctx_desatualizado(sb, sl) for sl in vistos):
-        saida += " ctx!"
-    return saida
-
-
-def _num(s: str) -> bool:
-    try:
-        float(s)
-        return True
-    except Exception:
-        return False
-
-
 @app.get("/agentes/painel.txt", response_class=PlainTextResponse)
 def agentes_painel_txt(dias: int = 7, todos: int = 0,
                        usuario: str = Depends(verificar_token)):
@@ -1635,6 +1507,194 @@ def markup_referencia(cnpj: str = "", usuario: str = Depends(verificar_token)):
     return (f"fonte {d.get('fonte')} amostra {d.get('amostra')}\n"
             f"p25 {d.get('p25')} mediana {d.get('mediana')} p75 {d.get('p75')} p90 {d.get('p90')}\n"
             f"fator sobre o custo; mediana e ponto de partida, nao decisao")
+
+
+@app.get("/agentes/{slug}")
+def agentes_detalhe(slug: str, usuario: str = Depends(verificar_token)):
+    """Ficha completa de um agente: declaração, tarefas, acessos e últimos eventos."""
+    sb = get_supabase()
+    ag = _agente_por_slug(sb, _slug_agente(slug), usuario)
+    if not ag:
+        raise HTTPException(status_code=404, detail=f"Agente '{slug}' não registrado.")
+    try:
+        tarefas = sb.table("agentes_tarefas").select("*").eq("agente_id", ag["id"]).order("nome").execute().data or []
+        acessos = sb.table("agentes_acessos").select("*").eq("agente_id", ag["id"]).order("sistema").execute().data or []
+        eventos = sb.table("agentes_eventos").select(
+            "criado_em,tarefa,tipo,status,resumo,referencia,itens,ms,custo_usd"
+        ).eq("agente_id", ag["id"]).order("criado_em", desc=True).limit(50).execute().data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Falha ao montar a ficha: {e}")
+    return {"agente": ag, "tarefas": tarefas, "acessos": acessos, "eventos_recentes": eventos}
+
+
+@app.get("/agentes/{slug}/receita")
+def agentes_receita(slug: str, usuario: str = Depends(verificar_token)):
+    """A ficha de replicação: tudo que é preciso para recriar este agente.
+
+    Instruções, ferramentas, parâmetros, regras, e o passo a passo de cada
+    rotina — sem ids internos e sem vínculo de chave, para poder ser levada
+    para outra conta ou outro dono. É o que transforma o blueprint de
+    inventário em receita.
+    """
+    sb = get_supabase()
+    s = _slug_agente(slug)
+    ag = _agente_por_slug(sb, s, usuario)
+    if not ag:
+        raise HTTPException(status_code=404, detail=f"Agente '{slug}' não registrado.")
+    try:
+        r = sb.rpc("agente_receita", {"p_slug": s}).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Falha ao montar a receita: {e}")
+    receita = r.data if not isinstance(r.data, list) else (r.data[0] if r.data else None)
+    if not receita:
+        raise HTTPException(status_code=404, detail=f"Agente '{slug}' sem receita.")
+    return receita
+
+
+# ── ECONOMIA DE TOKENS (v3.34) ───────────────────────────────────────────────
+# Tudo abaixo existe por uma razão só: o que a nossa API devolve entra no
+# contexto do agente e é REENVIADO a cada passo do laço dele. Uma resposta de
+# 200 tokens, em 12 chamadas, custa ~15.600 tokens acumulados; a mesma resposta
+# em 8 tokens custa 624. O custo cresce de forma quadrática no tamanho da
+# resposta, não linear. Por isso as rotas de agente respondem no mínimo possível
+# por padrão, e só falam mais quando explicitamente pedido (`v=1`).
+
+@app.post("/agentes/ev", response_class=PlainTextResponse)
+async def agentes_ev_texto(request: Request, usuario: str = Depends(verificar_token)):
+    """Reporte de eventos em texto puro. A via barata.
+
+    Corpo = uma linha por evento, campos separados por `|`, na ordem:
+
+        slug|tarefa|status|referencia|itens|ms|usd|resumo
+
+    Só `slug` é obrigatório; o resto pode vir vazio (`kepler|||||||parou`).
+    Linhas em branco e começadas por `#` são ignoradas.
+
+    Custa cerca de metade dos tokens do JSON equivalente, e a resposta é
+    literalmente `ok N`. Aceita até 200 linhas.
+    """
+    try:
+        corpo = (await request.body()).decode("utf-8", errors="replace")
+    except Exception:
+        raise HTTPException(status_code=422, detail="corpo ilegivel")
+    linhas_txt = [l.strip() for l in corpo.splitlines()
+                  if l.strip() and not l.strip().startswith("#")]
+    if not linhas_txt:
+        raise HTTPException(status_code=422, detail="vazio")
+    if len(linhas_txt) > 200:
+        raise HTTPException(status_code=422, detail="max 200")
+
+    sb = get_supabase()
+    cache_ag, linhas, ruins = {}, [], 0
+    for l in linhas_txt:
+        p = [c.strip() for c in l.split("|")]
+        p += [""] * (8 - len(p))
+        slug = _slug_agente(p[0])
+        if not slug:
+            ruins += 1
+            continue
+        if slug not in cache_ag:
+            ag = _agente_por_slug(sb, slug, usuario)
+            cache_ag[slug] = ag["id"] if ag else None
+        st = p[2].lower()
+        # status é o campo que mais erra digitação; 'erro' também vira tipo.
+        linhas.append({
+            "agente_id": cache_ag[slug], "agente_slug": slug, "dono_email": usuario,
+            "tarefa": p[1][:200] or None,
+            "tipo": "erro" if st == "erro" else "execucao",
+            "status": st if st in ("ok", "erro", "parcial", "pendente", "ignorado") else None,
+            "referencia": p[3][:120] or None,
+            "itens": int(p[4]) if p[4].isdigit() else None,
+            "ms": int(p[5]) if p[5].isdigit() else None,
+            "custo_usd": float(p[6]) if _num(p[6]) else None,
+            "resumo": p[7][:2000] or None,
+        })
+    if not linhas:
+        raise HTTPException(status_code=422, detail="nenhuma linha valida")
+    try:
+        sb.table("agentes_eventos").insert(linhas).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:120])
+    fora = sorted({l["agente_slug"] for l in linhas if l["agente_id"] is None})
+    saida = f"ok {len(linhas)}"
+    if ruins:
+        saida += f" ign {ruins}"
+    if fora:
+        saida += " nao-registrado:" + ",".join(fora)
+    # O agente não precisa lembrar de conferir: avisamos na resposta que ele já
+    # ia receber. `ctx!` = releia /contexto, a base mudou desde sua última leitura.
+    vistos = {l["agente_slug"] for l in linhas if l["agente_slug"]}
+    if any(_ctx_desatualizado(sb, sl) for sl in vistos):
+        saida += " ctx!"
+    return saida
+
+
+def _num(s: str) -> bool:
+    try:
+        float(s)
+        return True
+    except Exception:
+        return False
+
+
+@app.get("/funcoes.txt", response_class=PlainTextResponse)
+def funcoes_sistema_txt(usuario: str = Depends(verificar_token)):
+    """Mesmo conteúdo de `/funcoes`.
+
+    Existe porque os agentes procuraram `.txt` por conta própria: viram
+    `/agentes/painel.txt` e generalizaram o padrão. Convenção que o usuário
+    deduz sozinho é convenção que deve funcionar — 404 aqui é atrito nosso,
+    não erro dele.
+    """
+    return funcoes_sistema(usuario=usuario)
+
+
+@app.get("/propostas.txt", response_class=PlainTextResponse)
+def propostas_txt(dias: int = 60, sem_oc: int = 0, limite: int = 200,
+                  usuario: str = Depends(verificar_token)):
+    """Propostas em texto compacto — a lista que o bot de follow-up precisa.
+
+    `sem_oc=1` traz só as que nunca viraram ordem de compra, que é a definição
+    operacional de "não fechou". Não é o mesmo que "o cliente não respondeu" —
+    isso o sistema não sabe, só a caixa de e-mail sabe.
+    """
+    dias = max(1, min(int(dias or 60), 365))
+    limite = max(1, min(int(limite or 200), 500))
+    sb = get_supabase()
+    try:
+        corte = (_dt_ext.utcnow() - _td_ext(days=dias)).isoformat()
+        linhas = (sb.table("propostas")
+                  .select("numero_proposta,cliente,cnpj,total_itens,valor_total_estimado,"
+                          "data_geracao,usuario_email,status")
+                  .gte("data_geracao", corte)
+                  .order("data_geracao", desc=True).limit(limite).execute().data or [])
+        pos = set()
+        if int(sem_oc or 0):
+            for o in (sb.table("ordens_compra").select("numero_po,cliente").execute().data or []):
+                if o.get("numero_po"):
+                    pos.add(str(o["numero_po"]).strip())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:120])
+    if int(sem_oc or 0):
+        linhas = [l for l in linhas if str(l.get("numero_proposta") or "").strip() not in pos]
+    if not linhas:
+        return "nada"
+    out = [f"{len(linhas)} propostas | numero dias cliente cnpj itens valor status"]
+    for l in linhas:
+        dt = str(l.get("data_geracao") or "")[:10]
+        try:
+            d = (_dt_ext.utcnow().date() - _dt_ext.fromisoformat(dt).date()).days
+        except Exception:
+            d = "?"
+        out.append(" ".join(str(x) for x in [
+            l.get("numero_proposta") or "-", f"{d}d",
+            (l.get("cliente") or "?")[:26].replace(" ", "_"),
+            (l.get("cnpj") or "-").replace(" ", ""),
+            l.get("total_itens") or 0,
+            round(float(l.get("valor_total_estimado") or 0), 2),
+            l.get("status") or "-",
+        ]))
+    return "\n".join(out)
 
 
 @app.get("/ping")
