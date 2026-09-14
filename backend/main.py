@@ -82,7 +82,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.39"
+VERSAO_BACKEND = "3.41"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -145,6 +145,42 @@ _ROTAS_ADMIN_FALLBACK = [
     "POST /chamados/anexos/limpar-orfaos",
 ]
 _rotas_admin_cache: dict = {"v": None, "ate": 0.0}
+
+# Rotas que a TELA usa mas a CHAVE DE API não alcança. Não é questão de
+# permissão, é de julgamento: o operador olha o resultado do motor de busca e
+# descarta em dois segundos se for lixo; o agente pega o número e segue. Medido
+# em 60 dias: 1.107 buscas, o log diz 70% de acerto, mas só 14% viraram custo
+# real numa proposta — e cada uma leva 33 segundos. Ferramenta com esse
+# aproveitamento é sofrível para o humano e perigosa para o agente.
+# Editável em runtime via config_kist['api_rotas_bloqueadas'].
+_ROTAS_BLOQUEADAS_API_FALLBACK = [
+    "POST /ficha-internet",
+]
+_rotas_bloq_cache: dict = {"v": None, "ate": 0.0}
+
+def _rotas_bloqueadas_api() -> list:
+    """Rotas vetadas para chave de API (a tela continua usando normalmente)."""
+    agora = time.time()
+    if _rotas_bloq_cache["v"] is not None and _rotas_bloq_cache["ate"] > agora:
+        return _rotas_bloq_cache["v"]
+    rotas = [_norm_rota(x) for x in _ROTAS_BLOQUEADAS_API_FALLBACK]
+    try:
+        r = get_supabase().table("config_kist").select("valor").eq(
+            "chave", "api_rotas_bloqueadas").limit(1).execute()
+        if r.data:
+            import json as _jrb
+            v = r.data[0].get("valor")
+            v = _jrb.loads(v) if isinstance(v, str) else v
+            if isinstance(v, list):
+                # Aqui a config SUBSTITUI o fallback (ao contrário das rotas
+                # admin): desbloquear precisa ser possível sem deploy, e uma
+                # lista vazia é uma decisão legítima — "liberei tudo de novo".
+                rotas = [_norm_rota(x) for x in v]
+    except Exception:
+        pass
+    _rotas_bloq_cache["v"] = rotas
+    _rotas_bloq_cache["ate"] = agora + 300
+    return rotas
 
 def _norm_rota(s: str) -> str:
     """'  post  /Ordens-Compra/x/ ' -> 'POST /Ordens-Compra/x'.
@@ -260,8 +296,19 @@ async def _guarda_escopo_api(request: Request, call_next):
         _logar(resp.status_code, motivo="credencial invalida")
         return resp
 
+    # Veto por rota vale para QUALQUER escopo, inclusive admin: não é
+    # hierarquia, é adequação da ferramenta ao agente.
+    rota_norm = _norm_rota(f"{metodo} {request.url.path}")
+    if rota_norm in _rotas_bloqueadas_api():
+        motivo = (f"{rota_norm} não está disponível para chave de API. "
+                  "Use sua própria busca e traga o preço com a origem (link ou "
+                  "fornecedor + contato). Se o item não tiver preço público, "
+                  "registre como 'sob consulta' com o link do fabricante.")
+        _logar(403, bloqueado=True, motivo=motivo)
+        return _nega_escopo(motivo)
+
     if escopo != "admin":
-        if _norm_rota(f"{metodo} {request.url.path}") in _rotas_admin() or metodo == "DELETE":
+        if rota_norm in _rotas_admin() or metodo == "DELETE":
             motivo = f"Esta rota exige escopo 'admin'. Sua chave tem '{escopo}'."
             _logar(403, bloqueado=True, motivo=motivo)
             return _nega_escopo(motivo)
@@ -852,6 +899,7 @@ def _alerta_do_candidato(banco_desc, todos_candidatos):
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
+    """Vivo? Rota aberta, sem autenticacao."""
     return {"status": "ok"}
 
 @app.get("/api-uso")
@@ -1337,12 +1385,19 @@ def contexto_agentes(secoes: str = "", indice: int = 0, agente: str = "",
 
 
 @app.get("/funcoes", response_class=PlainTextResponse)
-def funcoes_sistema(usuario: str = Depends(verificar_token)):
+def funcoes_sistema(rota: str = "", usuario: str = Depends(verificar_token)):
     """Mapa das rotas lido do PRÓPRIO CÓDIGO por AST, agora.
 
+    Sem parâmetro: o índice, uma linha por rota.
+    `?rota=/ficha-internet`: o CONTRATO daquela rota — parâmetros aceitos e a
+    documentação inteira, com o payload mínimo quando houver.
+
+    O detalhe existe porque adivinhar payload custa caro: 13 das 22 chamadas ao
+    /ficha-internet falharam por formato, a 10s cada. Uma consulta de 200 tokens
+    aqui evita meia dúzia de tentativas erradas numa rota de 10 segundos.
+
     Não é documentação escrita à mão, que envelhece: é o arquivo se lendo. O que
-    está aqui existe. Custa uma fração do /openapi.json, que o agente não deve
-    carregar no contexto.
+    está aqui existe.
     """
     import ast as _ast
     try:
@@ -1350,7 +1405,8 @@ def funcoes_sistema(usuario: str = Depends(verificar_token)):
             arvore = _ast.parse(f.read())
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)[:120])
-    rotas = []
+
+    achadas = []
     for no in arvore.body:
         if not isinstance(no, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
             continue
@@ -1359,12 +1415,47 @@ def funcoes_sistema(usuario: str = Depends(verificar_token)):
                     and isinstance(d.func.value, _ast.Name) and d.func.value.id == "app"
                     and d.func.attr in ("get", "post", "put", "patch", "delete")
                     and d.args and isinstance(d.args[0], _ast.Constant)):
-                doc = (_ast.get_docstring(no) or "").strip().split("\n")[0]
-                rotas.append((d.func.attr.upper(), d.args[0].value, doc[:90]))
-    rotas.sort(key=lambda x: (x[1], x[0]))
-    out = [f"backend {VERSAO_BACKEND} — {len(rotas)} rotas"]
+                achadas.append((d.func.attr.upper(), d.args[0].value, no))
+
+    alvo = (rota or "").strip()
+    if alvo:
+        # Casa por caminho exato ou por sufixo, para o agente não precisar
+        # acertar barra inicial nem método.
+        sel = [(m, p, n) for m, p, n in achadas
+               if p == alvo or p.lstrip("/") == alvo.lstrip("/")]
+        if not sel:
+            sel = [(m, p, n) for m, p, n in achadas if alvo.lstrip("/") in p.lstrip("/")]
+        if not sel:
+            raise HTTPException(status_code=404,
+                                detail=f"rota '{alvo}' nao existe; veja GET /funcoes")
+        out = []
+        for m, p, n in sel[:4]:
+            out.append(f"{m} {p}")
+            params = []
+            for a, padrao in zip(n.args.args[::-1], (n.args.defaults or [])[::-1]):
+                if a.arg in ("usuario", "request", "payload"):
+                    continue
+                try:
+                    v = _ast.literal_eval(padrao)
+                except Exception:
+                    v = "?"
+                params.append(f"{a.arg}={v!r}" if v != "" else a.arg)
+            if params:
+                out.append("params: " + ", ".join(reversed(params)))
+            corpo = ast.unparse(n)
+            if "payload" in corpo and m in ("POST", "PUT", "PATCH"):
+                out.append("corpo: JSON (veja o payload abaixo)")
+            doc = (_ast.get_docstring(n) or "").strip()
+            out.append(doc if doc else "(sem documentacao)")
+            out.append("")
+        return "\n".join(out).rstrip()
+
+    rotas = sorted(((m, p, (_ast.get_docstring(n) or "").strip().split("\n")[0][:88])
+                    for m, p, n in achadas), key=lambda x: (x[1], x[0]))
+    out = [f"backend {VERSAO_BACKEND} — {len(rotas)} rotas",
+           "detalhe de uma rota (params + payload): GET /funcoes?rota=/caminho", ""]
     out += [f"{m} {p}" + (f" — {doc}" if doc else "") for m, p, doc in rotas]
-    out.append("\nDELETE e rotinas de lote exigem escopo admin. Detalhe: /docs (caro, nao carregue inteiro)")
+    out.append("\nDELETE e rotinas de lote exigem escopo admin.")
     return "\n".join(out)
 
 
@@ -1699,6 +1790,7 @@ def propostas_txt(dias: int = 60, sem_oc: int = 0, limite: int = 200,
 
 @app.get("/ping")
 def ping():
+    """Pong. Rota aberta, sem autenticacao."""
     return {"pong": True}
 
 @app.get("/api/whoami")
@@ -1839,6 +1931,7 @@ def proxima_proposta(usuario: str = Depends(verificar_token)):
 
 @app.get("/banco/stats")
 def banco_stats(usuario: str = Depends(verificar_token)):
+    """Tamanho do banco de precos: total e quantos estao desatualizados (90d)."""
     sb = get_supabase()
     try:
         total = sb.table('produtos').select('id', count='exact').execute()
@@ -3376,6 +3469,19 @@ def _aprender_memoria(sb, pares: list, cliente: str, cnpj: str = "") -> dict:
 
 @app.post("/upsert-precos")
 async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
+    """Devolve os precos da proposta ao banco. E o que faz o banco crescer.
+
+    PAYLOAD MINIMO:
+      {"proposta": "1050851", "cliente": "CONVERGINT", "cnpj": "58619404000814",
+       "itens": [{"banco_id": 5226, "descricao_original": "...",
+                  "preco_un": 2990.0, "preco_custo": 1980.0, "unidade": "UN",
+                  "fornecedor": "Dimensional", "link_fornecedor": "https://...",
+                  "fornecedor_canal": "link", "fornecedor_contato": "https://..."}]}
+
+    `banco_id` e a ancora: sem ele o sistema cria produto novo e o banco duplica.
+    Preco estimado vai SEM fornecedor e SEM link — sao esses campos que
+    transformam um numero em custo oficial.
+    """
     sb = get_supabase()
     proposta = payload.get("proposta", "")
     cliente  = payload.get("cliente", "")
@@ -3598,6 +3704,13 @@ def _consulta_receita(cnpj_digitos: str) -> dict:
         return {}
 
 
+# CONTRATO do /gerar-csv (comentário, não docstring: a função é INVARIANTE e seu
+# hash AST não pode mudar — nem por documentação. Quem precisa do payload
+# consulta a seção `ciclo` em GET /contexto):
+#   {"proposta": "1050851", "cliente": "...", "cnpj": "...",
+#    "itens": [{"descricao_final": "...", "quantidade": 10, "unidade": "UN",
+#               "preco_un": 250.0, "specs_complementares": ""}]}
+#   Devolve text/csv. 45 colunas, decimal vírgula, BOM+UTF-8. Bytes opacos.
 @app.post("/gerar-csv")
 async def gerar_csv(payload: dict, usuario: str = Depends(verificar_token)):
     COLUNAS = [
@@ -3845,18 +3958,18 @@ async def conferir(payload: dict, usuario: str = Depends(verificar_token)):
 # aumentar workers, porque cada worker sozinho continuaria travando o próprio loop.
 # NÃO reconverter para `async def` sem antes tornar as chamadas internas assíncronas.
 def ficha_internet(payload: dict, usuario: str = Depends(verificar_token)):
-    """Referência de preço na internet para UM item SEM match no banco.
+    """Preco de referencia na internet para UM item sem match no banco.
 
-    Chamado pelo frontend item a item, de forma assíncrona (FORA do /extrair): a
-    tela sobe na hora com o matching do banco, e cada ficha da internet preenche
-    sua 3ª coluna quando fica pronta. Um item que falha não derruba os outros.
+    PAYLOAD MINIMO:
+      {"item": {"descricao": "CABO FLEXIVEL 2,5MM AZUL 750V",
+                "specs_complementares": "", "quantidade": 100, "unidade": "M"},
+       "cnpj": "58619404000814"}
 
-    O motor faz camada 2 (cache de fichas, TTL 24h) -> camada 3 (cascata de busca
-    + julgamento). A camada 1 (banco de preços) é o matching que já roda no
-    /extrair — por isso este endpoint só é chamado para item sem match.
+    `item.descricao` (ou `descricao_original`) e OBRIGATORIA — faltar ela e o
+    erro mais comum aqui. `cnpj` e opcional e melhora o aprendizado por cliente.
 
-    NÃO escreve preço no banco: devolve referência. O que migra pra `produtos` é
-    sempre o preço que o operador lança (fluxo normal de /salvar-proposta).
+    UM item por chamada, e SO para confianca_match em baixa/nenhuma/diferente/
+    inconclusivo. E a rota mais cara do sistema: ~10s e busca web paga.
     """
     if not _MOTOR_PRECOS_OK:
         raise HTTPException(503, "Motor de preços indisponível (backend/motor_precos.py ausente)")
@@ -5744,6 +5857,11 @@ class AnalistaChatIn(BaseModel):
 
 @app.post("/analista/chat")
 async def analista_chat(payload: AnalistaChatIn, usuario: str = Depends(verificar_token)):
+    """Conversa com o Analista de Negocios interno (contexto do sistema).
+
+    PAYLOAD MINIMO:
+      {"mensagens": [{"role": "user", "content": "..."}], "operador_nome": ""}
+    """
     sb = get_supabase()
     claude = get_claude()
     apelido = APELIDOS.get(usuario, "")
@@ -5827,6 +5945,14 @@ class ChamadoIn(BaseModel):
 
 @app.post("/chamados")
 async def criar_chamado(payload: ChamadoIn, usuario: str = Depends(verificar_token)):
+    """Abre um chamado.
+
+    PAYLOAD MINIMO:
+      {"tipo": "bug", "titulo": "...", "descricao_operador": "...",
+       "area": "proposta", "prioridade": "media"}
+
+    tipo: bug|melhoria · area: proposta|banco|login|outro · prioridade: baixa|media|alta
+    """
     sb = get_supabase()
     status = "ja_suportada" if payload.ja_suportado else "aberto"
     row = {
@@ -5871,6 +5997,7 @@ async def criar_chamado(payload: ChamadoIn, usuario: str = Depends(verificar_tok
 @app.get("/chamados")
 async def listar_chamados(status: Optional[str] = None, arquivados: bool = False,
                           usuario: str = Depends(verificar_token)):
+    """Chamados abertos. Query: status, arquivados. Admin ve os de todos."""
     sb = get_supabase()
     is_admin = usuario in ADMIN_EMAILS
     q = sb.table("chamados").select("*")
@@ -5898,6 +6025,7 @@ class ChamadoUpdate(BaseModel):
 @app.put("/chamados/{chamado_id}")
 async def atualizar_chamado(chamado_id: int, payload: ChamadoUpdate,
                             usuario: str = Depends(verificar_token)):
+    """Atualiza um chamado.\n\n    PAYLOAD: {"status": "...", "resolucao": "...", "prioridade": "...",\n              "area": "...", "arquivado": false, "titulo": "..."}"""
     if usuario not in ADMIN_EMAILS:
         raise HTTPException(status_code=403, detail="Só o admin pode gerenciar chamados.")
     sb = get_supabase()
@@ -6479,6 +6607,7 @@ async def anexo_ler(anexo_id: int, usuario: str = Depends(verificar_token)):
 
 @app.get("/chamados/anexos")
 async def listar_anexos_sessao(sessao_id: str, usuario: str = Depends(verificar_token)):
+    """Anexos de uma sessao do analista. Query: sessao_id."""
     sb = get_supabase()
     r = sb.table("chamado_anexos").select("id,nome,status,tamanho,leitura")\
         .eq("sessao_id", sessao_id).eq("operador_email", usuario).order("id").execute()
@@ -7138,6 +7267,7 @@ async def datasheet_reprovar(ds_id: int, payload: dict,
 
 @app.get("/datasheets/{ds_id}")
 async def datasheet_ver(ds_id: int, usuario: str = Depends(verificar_token)):
+    """Um datasheet pelo id, com conteudo e status de aprovacao."""
     sb = get_supabase()
     r = sb.table("datasheets").select("*").eq("id", ds_id).limit(1).execute()
     if not r.data:
@@ -7285,6 +7415,7 @@ async def datasheet_zip(payload: DatasheetZipIn, usuario: str = Depends(verifica
 
 @app.delete("/datasheets/{ds_id}")
 async def datasheet_excluir(ds_id: int, usuario: str = Depends(verificar_token)):
+    """Remove um datasheet. Escopo admin."""
     sb = get_supabase()
     r = sb.table("datasheets").select("*").eq("id", ds_id).limit(1).execute()
     if not r.data:
