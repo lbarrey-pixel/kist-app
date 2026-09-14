@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.48"
+VERSAO_BACKEND = "3.49"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -1959,7 +1959,7 @@ def tiny_teste(caminho: str = "/contatos", cru: int = 0, limite: int = 1,
 
 
 @app.post("/propostas/exportar-tiny")
-def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verificar_token)):
+async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verificar_token)):
     """Lança a proposta como ORÇAMENTO (proposta comercial) no Tiny.
 
     PAYLOAD MINIMO:
@@ -2085,9 +2085,26 @@ def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verificar_toke
         except Exception:
             pass   # o orçamento já existe no Tiny; perder o vínculo não o desfaz
 
-    return {"ok": 1, "tiny_id": tiny_id, "tiny_numero": tiny_num,
-            "itens": len(linhas), "contato_id": contato["id"],
-            "cliente_tiny": contato.get("nome") or contato.get("razaoSocial")}
+    # ALIMENTA O BANCO DE PREÇOS. Exportar para o ERP é o mesmo marco comercial
+    # que gerar o CSV — a proposta foi fechada —, então tem que ensinar o banco
+    # igual. Sem isto, quem usasse só este caminho deixaria o banco parado, e o
+    # banco que cresce sozinho é metade do valor do sistema.
+    #
+    # Roda DEPOIS do Tiny aceitar e nunca derruba a exportação: o orçamento já
+    # existe lá, e falhar em aprender não desfaz o que foi feito.
+    banco = None
+    if any(float(i.get("preco_un") or i.get("preco_venda") or 0) > 0 for i in itens):
+        try:
+            banco = await upsert_precos(payload, usuario=usuario)
+        except Exception as e:
+            banco = {"erro": str(e)[:150]}
+
+    saida = {"ok": 1, "tiny_id": tiny_id, "tiny_numero": tiny_num,
+             "itens": len(linhas), "contato_id": contato["id"],
+             "cliente_tiny": contato.get("nome") or contato.get("razaoSocial")}
+    if banco:
+        saida["banco"] = banco
+    return saida
 
 
 @app.get("/fornecedores.txt", response_class=PlainTextResponse)

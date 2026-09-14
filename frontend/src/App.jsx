@@ -2574,7 +2574,11 @@ export default function App() {
                       {tinyEnvio.cliente_tiny || "o cliente"} — número{" "}
                       <span className="font-mono">{tinyEnvio.tiny_numero || tinyEnvio.tiny_id}</span>,{" "}
                       {tinyEnvio.itens} {tinyEnvio.itens === 1 ? "item" : "itens"}.
-                      Revise antes de enviar ao cliente.
+                      {tinyEnvio.banco && !tinyEnvio.banco.erro && (
+                        <> Banco de preços: {tinyEnvio.banco.atualizados || 0} atualizados,{" "}
+                        {tinyEnvio.banco.inseridos || 0} novos.</>
+                      )}
+                      {" "}Revise antes de enviar ao cliente.
                     </span>
                     {tinyEnvio.tiny_id && (
                       /* O PDF é gerado PELO Tiny: documento comercial da Kist sai
