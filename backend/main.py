@@ -82,7 +82,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.41"
+VERSAO_BACKEND = "3.42"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -1786,6 +1786,83 @@ def propostas_txt(dias: int = 60, sem_oc: int = 0, limite: int = 200,
             l.get("status") or "-",
         ]))
     return "\n".join(out)
+
+
+@app.get("/clientes.txt", response_class=PlainTextResponse)
+def clientes_carteira_txt(dias: int = 0, min_propostas: int = 1,
+                          usuario: str = Depends(verificar_token)):
+    """A carteira do operador: clientes que ELE cotou, com o markup de cada um.
+
+    Derivada das propostas, não é cadastro paralelo — cadastro paralelo envelhece
+    e diverge; isto reflete o que aconteceu de fato.
+
+    Agrupa pela RAIZ do CNPJ (8 dígitos): filial é o mesmo cliente comercial.
+    `markup` é o efetivo, na ordem manual > histórico > padrão 1,59; a coluna
+    `fonte` diz qual valeu, para o agente saber se está usando o markup DAQUELE
+    cliente ou o da casa.
+
+    `dias=90` limita a quem cotou nos últimos 90 dias.
+    """
+    min_propostas = max(1, min(int(min_propostas or 1), 50))
+    try:
+        r = get_supabase().rpc("carteira_clientes",
+                               {"p_usuario": usuario, "p_min_propostas": min_propostas}).execute()
+        linhas = r.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:120])
+    if int(dias or 0):
+        linhas = [l for l in linhas if (l.get("dias_sem_cotar") or 9999) <= int(dias)]
+    if not linhas:
+        return "carteira vazia"
+    out = [f"{len(linhas)} clientes | raiz cliente cnpjs props dias markup fonte"]
+    for l in linhas:
+        out.append(" ".join(str(x) for x in [
+            l.get("raiz_cnpj"),
+            (l.get("cliente") or "?")[:34].replace(" ", "_"),
+            l.get("cnpjs"), l.get("propostas"),
+            f"{l.get('dias_sem_cotar')}d",
+            l.get("markup_efetivo"), l.get("fonte"),
+        ]))
+    return "\n".join(out)
+
+
+@app.post("/clientes/markup")
+def clientes_markup_definir(payload: dict, usuario: str = Depends(verificar_token)):
+    """Fixa o markup de um cliente, sobrepondo o histórico.
+
+    PAYLOAD: {"cnpj": "58.619.404/0008-14", "markup": 1.72, "obs": "combinado em set/26"}
+
+    `markup` nulo remove o ajuste e volta a valer a mediana do histórico.
+    O ajuste é POR OPERADOR: o markup do Leonardo não muda o do Fábio.
+    """
+    dig = re.sub(r"\D", "", str(payload.get("cnpj") or ""))[:8]
+    if len(dig) < 8:
+        raise HTTPException(status_code=422, detail="cnpj invalido")
+    mk = payload.get("markup")
+    sb = get_supabase()
+    try:
+        if mk in (None, "", 0):
+            sb.table("clientes_markup").delete().eq("raiz_cnpj", dig).eq(
+                "usuario_email", usuario).execute()
+            return {"ok": 1, "raiz": dig, "markup": None}
+        mk = float(mk)
+        if not (0.5 <= mk <= 10):
+            raise HTTPException(status_code=422, detail="markup fora de 0.5-10")
+        linha = {"raiz_cnpj": dig, "usuario_email": usuario, "markup": mk,
+                 "obs": (payload.get("obs") or "")[:300] or None,
+                 "atualizado_em": _dt_ext.utcnow().isoformat()}
+        existe = sb.table("clientes_markup").select("raiz_cnpj").eq(
+            "raiz_cnpj", dig).eq("usuario_email", usuario).limit(1).execute().data
+        if existe:
+            sb.table("clientes_markup").update(linha).eq("raiz_cnpj", dig).eq(
+                "usuario_email", usuario).execute()
+        else:
+            sb.table("clientes_markup").insert(linha).execute()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:120])
+    return {"ok": 1, "raiz": dig, "markup": mk}
 
 
 @app.get("/ping")
