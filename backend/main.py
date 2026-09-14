@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.47"
+VERSAO_BACKEND = "3.48"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -2088,6 +2088,158 @@ def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verificar_toke
     return {"ok": 1, "tiny_id": tiny_id, "tiny_numero": tiny_num,
             "itens": len(linhas), "contato_id": contato["id"],
             "cliente_tiny": contato.get("nome") or contato.get("razaoSocial")}
+
+
+@app.get("/fornecedores.txt", response_class=PlainTextResponse)
+def fornecedores_txt(vertical: str = "", limite: int = 60, sem_canal: int = 0,
+                     usuario: str = Depends(verificar_token)):
+    """Onde a Kist COMPRA cada coisa, com o canal de cotação de cada fornecedor.
+
+    Derivado do livro fiscal de entradas — é de quem se comprou, não onde se
+    pesquisou preço. São coisas diferentes: 86% do dinheiro de compra foi para
+    fornecedores que o mapa de links não conhecia.
+
+    Colunas: cnpj vertical fantasia canal dominio itens valor de_quem
+    `vertical=cabos` filtra. `sem_canal=1` traz os que ainda não têm canal de
+    cotação preenchido — a lacuna que só quem compra sabe fechar.
+    """
+    limite = max(1, min(int(limite or 60), 400))
+    try:
+        q = get_supabase().table("fornecedores").select(
+            "cnpj,razao_social,fantasia,ncm_principal,canal,dominio,contato,"
+            "exige_login,itens_comprados,valor_comprado,de_quem,uf"
+        ).order("valor_comprado", desc=True).limit(limite)
+        linhas = q.execute().data or []
+        mapa = {r["capitulo"]: r["vertical"] for r in
+                (get_supabase().table("ncm_vertical").select("capitulo,vertical")
+                 .execute().data or [])}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:150])
+    if vertical:
+        v = vertical.strip().lower()
+        linhas = [l for l in linhas if mapa.get(l.get("ncm_principal") or "") == v]
+    if int(sem_canal or 0):
+        linhas = [l for l in linhas if not (l.get("canal") or "").strip()]
+    if not linhas:
+        return "nenhum fornecedor"
+    out = ["cnpj vertical fornecedor canal dominio itens valor de_quem"]
+    for l in linhas:
+        nome = (l.get("fantasia") or l.get("razao_social") or "?")[:30].replace(" ", "_")
+        out.append(" ".join(str(x) for x in [
+            l.get("cnpj"), mapa.get(l.get("ncm_principal") or "", "-"), nome,
+            l.get("canal") or "-", l.get("dominio") or "-",
+            l.get("itens_comprados") or 0,
+            round(float(l.get("valor_comprado") or 0)),
+            l.get("de_quem") or "-",
+        ]))
+    return "\n".join(out)
+
+
+@app.post("/fornecedores/enriquecer")
+def fornecedores_enriquecer(payload: dict, usuario: str = Depends(verificar_token)):
+    """Preenche fantasia, UF, município e CNAE consultando a Receita.
+
+    PAYLOAD: {"limite": 30}  ou  {"cnpjs": ["10672188000178", "..."]}
+
+    Consulta a BrasilAPI um a um, com pausa — é serviço público e gratuito, e
+    martelar em rajada é o jeito de perder o acesso. Por isso `limite` baixo:
+    rode algumas vezes em vez de uma vez grande.
+
+    Quem falha fica como estava e volta na lista da próxima chamada. Nunca
+    inventa dado: sem resposta da Receita, o campo continua vazio.
+    """
+    sb = get_supabase()
+    cnpjs = payload.get("cnpjs")
+    if not isinstance(cnpjs, list) or not cnpjs:
+        lim = max(1, min(int(payload.get("limite") or 25), 60))
+        try:
+            faltam = (sb.table("fornecedores").select("cnpj")
+                      .is_("fantasia", "null")
+                      .order("valor_comprado", desc=True).limit(lim).execute().data or [])
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)[:150])
+        cnpjs = [f["cnpj"] for f in faltam]
+    if not cnpjs:
+        return {"ok": 1, "processados": 0, "obs": "todos ja enriquecidos"}
+
+    ok = falha = 0
+    achados = []
+    for c in cnpjs[:60]:
+        dig = re.sub(r"\D", "", str(c))
+        if len(dig) != 14:
+            falha += 1
+            continue
+        d = _consulta_receita(dig)
+        if not d:
+            falha += 1
+            time.sleep(0.4)
+            continue
+        fantasia = (d.get("nome_fantasia") or "").strip() or (d.get("razao_social") or "").strip()
+        linha = {
+            "fantasia": fantasia[:120] or None,
+            "uf": (d.get("uf") or "")[:2] or None,
+            "municipio": (d.get("municipio") or "")[:80] or None,
+            "cnae": str(d.get("cnae_fiscal") or "")[:10] or None,
+            "cnae_desc": (d.get("cnae_fiscal_descricao") or "")[:160] or None,
+            "atualizado_em": _dt_ext.utcnow().isoformat(),
+            "atualizado_por": usuario,
+        }
+        # A Receita às vezes traz e-mail — é exatamente o canal de cotação que
+        # falta no cadastro. Só preenche se ainda estiver vazio: o que o
+        # operador souber vale mais que o cadastro fiscal.
+        email = (d.get("email") or "").strip().lower()
+        if email and "@" in email:
+            linha["contato"] = email[:120]
+            linha["canal"] = "email"
+            linha["dominio"] = email.split("@")[-1][:120]
+        try:
+            sb.table("fornecedores").update(linha).eq("cnpj", dig).execute()
+            ok += 1
+            achados.append({"cnpj": dig, "fantasia": fantasia[:40],
+                            "cnae": linha["cnae_desc"], "uf": linha["uf"]})
+        except Exception:
+            falha += 1
+        time.sleep(0.4)
+    return {"ok": 1, "enriquecidos": ok, "falharam": falha, "amostra": achados[:10]}
+
+
+@app.post("/fornecedores/anotar")
+def fornecedores_anotar(payload: dict, usuario: str = Depends(verificar_token)):
+    """Registra o que só quem compra sabe: canal, domínio, contato, de quem é.
+
+    PAYLOAD: {"cnpj": "10672188000178", "canal": "portal", "dominio": "standnetwork.com.br",
+              "contato": "vendas@...", "exige_login": true, "de_quem": "leonardo",
+              "condicoes": "30 dias", "observacao": "..."}
+
+    `canal`: portal | email | whatsapp | telefone | representante | marketplace.
+    `exige_login` é o campo que decide se um agente consegue consultar sozinho.
+    """
+    dig = re.sub(r"\D", "", str(payload.get("cnpj") or ""))
+    if len(dig) != 14:
+        raise HTTPException(status_code=422, detail="cnpj invalido")
+    canal = (payload.get("canal") or "").strip().lower()
+    if canal and canal not in ("portal", "email", "whatsapp", "telefone",
+                               "representante", "marketplace"):
+        raise HTTPException(status_code=422, detail="canal invalido")
+    linha = {"atualizado_em": _dt_ext.utcnow().isoformat(), "atualizado_por": usuario}
+    for campo, tam in (("dominio", 120), ("contato", 160), ("condicoes", 300),
+                       ("observacao", 600), ("de_quem", 40), ("fantasia", 120)):
+        v = (payload.get(campo) or "").strip()
+        if v:
+            linha[campo] = v[:tam]
+    if canal:
+        linha["canal"] = canal
+    if payload.get("exige_login") is not None:
+        linha["exige_login"] = bool(payload["exige_login"])
+    try:
+        r = get_supabase().table("fornecedores").update(linha).eq("cnpj", dig).execute()
+        if not (r.data or []):
+            raise HTTPException(status_code=404, detail=f"fornecedor {dig} nao cadastrado")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:150])
+    return {"ok": 1, "cnpj": dig, "campos": sorted(set(linha) - {"atualizado_em", "atualizado_por"})}
 
 
 @app.get("/ping")
