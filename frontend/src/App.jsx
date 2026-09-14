@@ -2197,6 +2197,7 @@ export default function App() {
         proposta:      prop.numero_proposta || "",
         frete:         prop.frete_recebimento || 0,
         prazo_entrega: prop.prazo_entrega || "",
+        condicao_pagamento: prop.condicao_pagamento || "",
         status:        prop.status || "rascunho",
         itens,
       }]);
@@ -2567,12 +2568,25 @@ export default function App() {
                   </>} />
 
                 {tinyEnvio?.estado === "ok" && (
-                  <div className="mt-2 rounded-lg border border-signal/40 bg-signal/10 px-3 py-2 text-[12.5px] text-ink">
-                    Proposta comercial criada no Tiny como <b>rascunho</b> para{" "}
-                    {tinyEnvio.cliente_tiny || "o cliente"} — número{" "}
-                    <span className="font-mono">{tinyEnvio.tiny_numero || tinyEnvio.tiny_id}</span>,{" "}
-                    {tinyEnvio.itens} {tinyEnvio.itens === 1 ? "item" : "itens"}.
-                    Revise no Tiny antes de enviar ao cliente.
+                  <div className="mt-2 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-signal/40 bg-signal/10 px-3 py-2 text-[12.5px] text-ink">
+                    <span>
+                      Proposta comercial criada no Tiny como <b>rascunho</b> para{" "}
+                      {tinyEnvio.cliente_tiny || "o cliente"} — número{" "}
+                      <span className="font-mono">{tinyEnvio.tiny_numero || tinyEnvio.tiny_id}</span>,{" "}
+                      {tinyEnvio.itens} {tinyEnvio.itens === 1 ? "item" : "itens"}.
+                      Revise antes de enviar ao cliente.
+                    </span>
+                    {tinyEnvio.tiny_id && (
+                      /* O PDF é gerado PELO Tiny: documento comercial da Kist sai
+                         do ERP, com numeração e layout oficiais. A API v3 não expõe
+                         rota de impressão para orçamento, então abrimos o registro
+                         — de lá, imprimir ou compartilhar é um clique. */
+                      <a href={`https://erp.olist.com/orcamentos#edit/${tinyEnvio.tiny_id}`}
+                         target="_blank" rel="noopener noreferrer"
+                         className={`${btnGhost} flex-shrink-0 whitespace-nowrap`}>
+                        <IconLink size={14} /> Abrir no Tiny (imprimir / PDF)
+                      </a>
+                    )}
                   </div>
                 )}
                 {tinyEnvio?.estado === "erro" && (
@@ -2857,6 +2871,16 @@ export default function App() {
                       <input value={prop.prazo_entrega || ""}
                         onChange={(e) => { setPropostas((prev) => prev.map((p, pi) => pi === propostaIdx ? { ...p, prazo_entrega: e.target.value } : p)); _dispararAutoSave(); }}
                         placeholder="ex: 15 dias úteis"
+                        className="mt-1 w-full rounded-lg border border-line2 bg-paper px-2.5 py-1.5 text-[13px] text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
+                    </label>
+                    <label className="block">
+                      {/* Condição de pagamento: vai para o campo `condicoesComerciais`
+                          do Tiny, que deriva as parcelas sozinho a partir deste texto. */}
+                      <div className="text-[11.5px] text-sub">Condição de pagamento</div>
+                      <input value={prop.condicao_pagamento || ""}
+                        onChange={(e) => { setPropostas((prev) => prev.map((p, pi) => pi === propostaIdx ? { ...p, condicao_pagamento: e.target.value } : p)); _dispararAutoSave(); }}
+                        placeholder="ex: 30  ·  30 60 90  ·  6x"
+                        title="30 = 30 dias direto | 30 60 90 = vencimentos em 30, 60 e 90 dias | 6x = 6 parcelas a cada 30 dias"
                         className="mt-1 w-full rounded-lg border border-line2 bg-paper px-2.5 py-1.5 text-[13px] text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
                     </label>
                     <label className="block">

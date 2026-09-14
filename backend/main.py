@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.46"
+VERSAO_BACKEND = "3.47"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -2049,6 +2049,21 @@ def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verificar_toke
             "desconto": float(payload.get("desconto") or 0),
         },
     }
+
+    # Condição de pagamento. O Tiny guarda em `condicoesComerciais` com
+    # tipo "P" (parcelas) e deriva `dias` a partir do texto — confirmado lendo
+    # um orçamento real: "30" virou dias ["30"]. Mandamos `dias` junto quando o
+    # texto é uma lista de números; em formatos como "6x" deixamos o Tiny
+    # resolver, porque adivinhar a regra dele seria chute.
+    cond = (payload.get("condicao_pagamento") or "").strip()
+    if cond:
+        cc = {"tipo": "P", "parcelas": {"condicao": cond[:60]}}
+        numeros = re.findall(r"\d+", cond)
+        if numeros and re.fullmatch(r"[\d\s/,;-]+", cond):
+            cc["parcelas"]["dias"] = numeros
+            cc["parcelas"]["obs"] = [""] * len(numeros)
+        corpo["condicoesComerciais"] = cc
+
     corpo = {k: v for k, v in corpo.items() if v is not None}
 
     try:
