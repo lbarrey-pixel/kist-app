@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.43"
+VERSAO_BACKEND = "3.44"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -1932,7 +1932,8 @@ def tiny_status(usuario: str = Depends(verificar_token)):
 
 
 @app.get("/tiny/teste")
-def tiny_teste(caminho: str = "/contatos", usuario: str = Depends(verificar_token)):
+def tiny_teste(caminho: str = "/contatos", cru: int = 0, limite: int = 1,
+               usuario: str = Depends(verificar_token)):
     """Uma chamada de leitura ao Tiny, para validar a conexão de ponta a ponta.
 
     `caminho=/contatos` por padrão porque é leve e existe em qualquer conta.
@@ -1941,14 +1942,20 @@ def tiny_teste(caminho: str = "/contatos", usuario: str = Depends(verificar_toke
     if not _TINY_OK:
         raise HTTPException(status_code=503, detail="modulo tiny nao carregado")
     try:
-        d = _tiny.chamar("GET", caminho, params={"limit": 1})
+        d = _tiny.chamar("GET", caminho, params={"limit": max(1, min(int(limite or 1), 50))})
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)[:300])
+    # `cru=1` devolve a resposta inteira. O padrão resume porque é rota que
+    # agente chama, e resposta grande é reenviada ao modelo a cada passo dele —
+    # mas para MAPEAR um formato novo é preciso ver o formato inteiro.
+    if int(cru or 0):
+        return {"ok": 1, "caminho": caminho, "resposta": d}
     amostra = d
     if isinstance(d, dict):
         amostra = {k: (v if not isinstance(v, list) else f"[{len(v)} itens]")
                    for k, v in list(d.items())[:8]}
-    return {"ok": 1, "caminho": caminho, "amostra": amostra}
+    return {"ok": 1, "caminho": caminho, "amostra": amostra,
+            "obs": "use cru=1 para ver a resposta inteira"}
 
 
 @app.get("/ping")
