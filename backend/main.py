@@ -74,6 +74,16 @@ except Exception:
     _apilog = None
     _API_LOG_OK = False
 
+# ── Integração com o ERP Tiny (v3.43) ────────────────────────────────────────
+# Import protegido: se o módulo faltar, o boot não quebra e o resto do sistema
+# segue. Mesma disciplina do motor de preços.
+try:
+    import tiny as _tiny
+    _TINY_OK = True
+except Exception:
+    _tiny = None
+    _TINY_OK = False
+
 # Versão do backend. O núcleo do Analista guarda a versão que ele descreve; se as
 # duas divergirem, o agente é avisado de que o conhecimento dele está atrasado.
 # Conhecimento velho não avisa que é velho — ele responde com a mesma confiança
@@ -82,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.42"
+VERSAO_BACKEND = "3.43"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -488,6 +498,11 @@ def get_supabase():
                 # precisa da sua própria conexão. Mesma lição do chamado #16 —
                 # o que observa a operação não divide socket com a operação.
                 _apilog.configurar(lambda: create_client(SUPABASE_URL, SUPABASE_KEY))
+            except Exception:
+                pass
+        if _TINY_OK:
+            try:
+                _tiny.configurar(lambda: create_client(SUPABASE_URL, SUPABASE_KEY))
             except Exception:
                 pass
     return _supabase_client
@@ -1863,6 +1878,77 @@ def clientes_markup_definir(payload: dict, usuario: str = Depends(verificar_toke
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)[:120])
     return {"ok": 1, "raiz": dig, "markup": mk}
+
+
+@app.get("/tiny/autorizar")
+def tiny_autorizar(usuario: str = Depends(verificar_token)):
+    """Devolve o link para aprovar a Kist na sua conta Tiny. Uma vez só.
+
+    Abra o `url` no navegador JÁ LOGADO no Tiny. Depois de aprovar, o Tiny
+    volta em /tiny/callback e a conexão passa a se renovar sozinha.
+    """
+    if not _TINY_OK:
+        raise HTTPException(status_code=503, detail="modulo tiny nao carregado")
+    try:
+        return {"url": _tiny.url_autorizacao(),
+                "obs": "abra no navegador logado no Tiny; vale 15 minutos"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)[:200])
+
+
+@app.get("/tiny/callback", response_class=PlainTextResponse)
+def tiny_callback(code: str = "", state: str = "", error: str = ""):
+    """Retorno do Tiny depois da aprovação. Rota ABERTA de propósito.
+
+    O Tiny redireciona o NAVEGADOR para cá, sem o nosso header de autenticação
+    — exigir token aqui quebraria o fluxo. Quem protege é o `state`: sem o
+    valor que nós mesmos emitimos há menos de 15 minutos, nada é gravado.
+    """
+    if not _TINY_OK:
+        return "modulo tiny nao carregado"
+    if error:
+        return f"O Tiny recusou a autorizacao: {error}"
+    if not code:
+        return "sem codigo na resposta do Tiny"
+    if not _tiny.estado_valido(state):
+        return ("state invalido ou expirado. Isso protege contra alguem conectar "
+                "outra conta Tiny na nossa instalacao. Abra /tiny/autorizar de novo.")
+    try:
+        r = _tiny.trocar_codigo(code)
+    except Exception as e:
+        return f"Falhou ao trocar o codigo: {e}"
+    return ("Tiny conectado.\n"
+            f"access valido ate {r.get('expira_em')}\n"
+            f"refresh guardado: {'sim' if r.get('tem_refresh') else 'NAO'}\n\n"
+            "Pode fechar esta aba. Confira em GET /tiny/status.")
+
+
+@app.get("/tiny/status")
+def tiny_status(usuario: str = Depends(verificar_token)):
+    """Se o Tiny está conectado e por quanto tempo. Não devolve segredo nenhum."""
+    if not _TINY_OK:
+        raise HTTPException(status_code=503, detail="modulo tiny nao carregado")
+    return _tiny.estado()
+
+
+@app.get("/tiny/teste")
+def tiny_teste(caminho: str = "/contatos", usuario: str = Depends(verificar_token)):
+    """Uma chamada de leitura ao Tiny, para validar a conexão de ponta a ponta.
+
+    `caminho=/contatos` por padrão porque é leve e existe em qualquer conta.
+    Serve para descobrir a base correta da API antes de escrever qualquer coisa.
+    """
+    if not _TINY_OK:
+        raise HTTPException(status_code=503, detail="modulo tiny nao carregado")
+    try:
+        d = _tiny.chamar("GET", caminho, params={"limit": 1})
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)[:300])
+    amostra = d
+    if isinstance(d, dict):
+        amostra = {k: (v if not isinstance(v, list) else f"[{len(v)} itens]")
+                   for k, v in list(d.items())[:8]}
+    return {"ok": 1, "caminho": caminho, "amostra": amostra}
 
 
 @app.get("/ping")
