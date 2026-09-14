@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.44"
+VERSAO_BACKEND = "3.45"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -1956,6 +1956,123 @@ def tiny_teste(caminho: str = "/contatos", cru: int = 0, limite: int = 1,
                    for k, v in list(d.items())[:8]}
     return {"ok": 1, "caminho": caminho, "amostra": amostra,
             "obs": "use cru=1 para ver a resposta inteira"}
+
+
+@app.post("/propostas/exportar-tiny")
+def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verificar_token)):
+    """Lança a proposta como ORÇAMENTO (proposta comercial) no Tiny.
+
+    PAYLOAD MINIMO:
+      {"proposta": "1050851", "cliente": "...", "cnpj": "58619404000814",
+       "usuario_nome": "Leonardo", "introducao": "", "observacao": "",
+       "prazo_entrega": "", "frete": 0, "desconto": 0,
+       "itens": [{"descricao_final": "...", "quantidade": 10, "unidade": "UN",
+                  "preco_un": 250.0, "sku_fornecedor": "",
+                  "specs_complementares": ""}]}
+
+    Orçamento e não pedido de propósito: a venda só existe quando o cliente
+    aprova e devolve a PO, e o Tiny converte orçamento em pedido nesse momento.
+
+    O cliente PRECISA existir no Tiny — a rota não cadastra contato sozinha.
+    Cadastro duplicado no ERP é dor que dura anos, e o Tiny já tem 4.745
+    contatos para casar.
+    """
+    if not _TINY_OK:
+        raise HTTPException(status_code=503, detail="modulo tiny nao carregado")
+    numero = str(payload.get("proposta") or "").strip()
+    itens = payload.get("itens") or []
+    if not itens:
+        raise HTTPException(status_code=422, detail="proposta sem itens")
+    cnpj = "".join(c for c in str(payload.get("cnpj") or "") if c.isdigit())
+    if len(cnpj) < 11:
+        raise HTTPException(status_code=422, detail="CNPJ do cliente ausente ou invalido")
+
+    try:
+        contato = _tiny.achar_contato(cnpj)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"falha ao buscar contato: {str(e)[:200]}")
+    if not contato or not contato.get("id"):
+        raise HTTPException(
+            status_code=404,
+            detail=(f"cliente {_cnpj_formatado(cnpj)} nao existe no Tiny. "
+                    "Cadastre-o la primeiro — esta rota nao cria contato."))
+
+    # SKU derivado do ITEM, não do cliente: assim o mesmo produto vendido a dois
+    # clientes compartilha código, e um dia dá para olhar para trás e ver quantas
+    # vezes aquilo foi vendido.
+    def _sku(it, i):
+        s = (it.get("sku_fornecedor") or "").strip()
+        if s:
+            return s[:60]
+        base = _slug_agente(it.get("descricao_final") or it.get("descricao_original") or "")
+        return (base[:48] or f"item-{i}").upper()
+
+    linhas = []
+    for i, it in enumerate(itens, 1):
+        desc = (it.get("descricao_final") or it.get("descricao_original") or "").strip()
+        if not desc:
+            continue
+        qtd = float(it.get("quantidade") or 1)
+        val = float(it.get("preco_un") or it.get("preco_venda") or 0)
+        compl = (it.get("specs_complementares") or "").strip()
+        un = (it.get("unidade") or "UN").strip()[:6] or "UN"
+        linhas.append({
+            "produto": {"sku": _sku(it, i), "descricao": desc[:120],
+                        "tipo": "P", "unidade": un},
+            "quantidade": qtd,
+            "valorUnitario": round(val, 2),
+            "descrComplementarOrc": (f"{un} | {compl}" if compl else un)[:500],
+        })
+    if not linhas:
+        raise HTTPException(status_code=422, detail="nenhum item com descricao")
+
+    hoje = _dt_ext.utcnow().date().isoformat()
+    corpo = {
+        "contato": {"id": contato["id"]},
+        "data": hoje,
+        "situacao": "Rascunho",
+        "numeroProposta": numero or None,
+        "introducao": (payload.get("introducao") or "")[:2000] or None,
+        "observacao": (payload.get("observacao") or "")[:2000] or None,
+        "assinatura": {
+            "saudacao": "Atenciosamente,",
+            # Quem gerou na Cabine assina no Tiny. Proposta tem dono.
+            "responsavel": (payload.get("usuario_nome") or "").strip() or "Departamento de vendas",
+        },
+        "condicoesGerais": {
+            "validade": int(payload.get("validade") or 7),
+            "descricaoPrazoEntrega": (payload.get("prazo_entrega") or "")[:200] or None,
+        },
+        "itens": linhas,
+        "extras": {
+            "frete": float(payload.get("frete") or 0),
+            "desconto": float(payload.get("desconto") or 0),
+        },
+    }
+    corpo = {k: v for k, v in corpo.items() if v is not None}
+
+    try:
+        r = _tiny.criar_orcamento(corpo)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)[:400])
+
+    tiny_id = (r or {}).get("id")
+    tiny_num = str((r or {}).get("numeroProposta") or "") or None
+
+    # Amarra as duas numerações. Sem isso ninguém liga a proposta ao orçamento.
+    if numero and tiny_id:
+        try:
+            get_supabase().table("propostas").update({
+                "tiny_id": tiny_id, "tiny_numero": tiny_num,
+                "tiny_exportado_em": _dt_ext.utcnow().isoformat(),
+                "tiny_por": usuario,
+            }).eq("numero_proposta", numero).execute()
+        except Exception:
+            pass   # o orçamento já existe no Tiny; perder o vínculo não o desfaz
+
+    return {"ok": 1, "tiny_id": tiny_id, "tiny_numero": tiny_num,
+            "itens": len(linhas), "contato_id": contato["id"],
+            "cliente_tiny": contato.get("nome") or contato.get("razaoSocial")}
 
 
 @app.get("/ping")

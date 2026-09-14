@@ -1782,6 +1782,7 @@ export default function App() {
   // Resumo da última propagação de lastro entre abas (gerou CSV de uma, as outras
   // herdaram). Some ao reiniciar.
   const [propagacao, setPropagacao] = useState(null);
+  const [tinyEnvio, setTinyEnvio] = useState(null);
   // "Não importar preços sem rastreabilidade": ON pro Fábio por padrão, OFF pros demais.
   // Ele pode desmarcar. Diferente do antigo checkbox de preservar descrição (que criava
   // duas verdades no mesmo dado), este não muda o que o sistema SABE — só o que ele
@@ -2287,7 +2288,30 @@ export default function App() {
     finally { setLoading(false); setSalvandoBanco(false); }
   }
 
+  // ── Exportar direto para o Tiny (v3.45) ─────────────────────────────────
+  // Vai como ORÇAMENTO (proposta comercial), não como pedido: a venda só existe
+  // quando o cliente aprova e devolve a PO — e o Tiny converte orçamento em
+  // pedido nesse momento. O CSV continua existindo como caminho alternativo.
+  async function exportarTiny(idx) {
+    const prop = propostas[idx];
+    if (!prop) return;
+    setTinyEnvio({ estado: "enviando" });
+    try {
+      const res = await fetch(`${API}/propostas/exportar-tiny`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ ...prop, usuario_nome: usuario.nome }),
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(d.detail || `erro ${res.status}`);
+      setTinyEnvio({ estado: "ok", ...d });
+    } catch (e) {
+      setTinyEnvio({ estado: "erro", msg: String(e.message || e) });
+    }
+  }
+
   function reiniciar() {
+    setTinyEnvio(null);
     setAvisosSistema([]);
     setNotasSistema([]);
     setPropagacao(null);
@@ -2529,7 +2553,33 @@ export default function App() {
                         : loading ? "Gerando…"
                         : <><IconDownload size={15} /> Confirmar e baixar CSV{propostas.length > 1 ? ` — Proposta ${propostaIdx + 1}` : ""}</>}
                     </button>
+                    <button
+                      onClick={() => exportarTiny(propostaIdx)}
+                      disabled={loading || salvandoBanco || tinyEnvio?.estado === "enviando"}
+                      className={btnGhost}
+                      title="Cria a proposta comercial direto no Tiny, sem passar por arquivo">
+                      {tinyEnvio?.estado === "enviando"
+                        ? <><span className="inline-block animate-spin"><IconBolt size={15} /></span> Enviando…</>
+                        : tinyEnvio?.estado === "ok"
+                        ? <><IconCheck size={15} /> No Tiny: {tinyEnvio.tiny_numero || tinyEnvio.tiny_id}</>
+                        : <><IconLink size={15} /> Exportar para o Tiny</>}
+                    </button>
                   </>} />
+
+                {tinyEnvio?.estado === "ok" && (
+                  <div className="mt-2 rounded-lg border border-signal/40 bg-signal/10 px-3 py-2 text-[12.5px] text-ink">
+                    Proposta comercial criada no Tiny como <b>rascunho</b> para{" "}
+                    {tinyEnvio.cliente_tiny || "o cliente"} — número{" "}
+                    <span className="font-mono">{tinyEnvio.tiny_numero || tinyEnvio.tiny_id}</span>,{" "}
+                    {tinyEnvio.itens} {tinyEnvio.itens === 1 ? "item" : "itens"}.
+                    Revise no Tiny antes de enviar ao cliente.
+                  </div>
+                )}
+                {tinyEnvio?.estado === "erro" && (
+                  <div className="mt-2 rounded-lg border border-rose/40 bg-rose/10 px-3 py-2 text-[12.5px] text-rose">
+                    {tinyEnvio.msg}
+                  </div>
+                )}
 
                 {/* ── RASTREABILIDADE ANTES DO TINY ───────────────────────────────────
           Estes itens vão virar linha no banco de preços. Sem custo e sem origem,

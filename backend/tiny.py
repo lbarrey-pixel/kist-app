@@ -238,3 +238,78 @@ def estado() -> dict:
         base["conectado"] = None
         base["erro"] = str(e)[:150]
     return base
+
+
+# ── Orçamento (proposta comercial) ───────────────────────────────────────────
+# O Tiny chama de "orçamento" o que a Kist chama de proposta. É o conceito
+# certo: a venda só existe quando o cliente aprova e devolve a PO — e o Tiny
+# tem rota para converter orçamento em pedido nesse momento.
+
+def achar_contato(cnpj: str) -> Optional[dict]:
+    """Acha o contato pelo CNPJ. Devolve o registro ou None.
+
+    A API não documenta qual parâmetro de busca aceita, então tentamos em
+    cascata e paramos no primeiro que responder. Descobrir por tentativa aqui,
+    UMA vez, é melhor que o agente descobrir em produção a cada proposta.
+    """
+    dig = "".join(c for c in str(cnpj or "") if c.isdigit())
+    if len(dig) < 11:
+        return None
+    for chave in ("cpfCnpj", "cpf_cnpj", "codigo", "pesquisa", "nome"):
+        for valor in (dig, _cnpj_mascarado(dig)):
+            try:
+                r = chamar("GET", "/contatos", params={chave: valor, "limit": 5})
+            except Exception:
+                continue
+            itens = (r or {}).get("itens") or []
+            for c in itens:
+                doc = "".join(ch for ch in str(c.get("cpfCnpj") or "") if ch.isdigit())
+                if doc == dig:
+                    return c
+            if len(itens) == 1 and chave in ("cpfCnpj", "cpf_cnpj"):
+                return itens[0]
+    return None
+
+
+def _cnpj_mascarado(d: str) -> str:
+    if len(d) == 14:
+        return f"{d[:2]}.{d[2:5]}.{d[5:8]}/{d[8:12]}-{d[12:]}"
+    if len(d) == 11:
+        return f"{d[:3]}.{d[3:6]}.{d[6:9]}-{d[9:]}"
+    return d
+
+
+def criar_orcamento(corpo: dict) -> dict:
+    """Cria o orçamento. Se o Tiny exigir produto cadastrado, cadastra e repete.
+
+    O item pode ir com `produto` sem id — se a conta aceitar item avulso, nada
+    é cadastrado. Se recusar, criamos o produto e repetimos UMA vez. Vale a
+    tentativa: a Kist é asset light e vende o que o cliente pede, então item de
+    proposta nem sempre precisa virar cadastro permanente.
+    """
+    try:
+        return chamar("POST", "/orcamentos", json=corpo)
+    except Exception as e:
+        msg = str(e)
+        precisa_id = ("produto" in msg.lower() and
+                      any(p in msg.lower() for p in ("id", "obrigat", "required", "not found")))
+        if not precisa_id:
+            raise
+    # Segunda tentativa: cadastra cada produto e usa o id devolvido.
+    for it in corpo.get("itens", []):
+        p = it.get("produto") or {}
+        if p.get("id"):
+            continue
+        novo = chamar("POST", "/produtos", json={
+            "sku": p.get("sku"),
+            "descricao": (p.get("descricao") or "")[:120],
+            "tipo": p.get("tipo") or "P",
+            "unidade": p.get("unidade") or "UN",
+            "situacao": "A",
+            "precos": {"preco": it.get("valorUnitario") or 0},
+        })
+        pid = (novo or {}).get("id")
+        if not pid:
+            raise RuntimeError(f"não consegui cadastrar o produto {p.get('sku')} no Tiny")
+        it["produto"] = {"id": pid}
+    return chamar("POST", "/orcamentos", json=corpo)
