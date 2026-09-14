@@ -52,6 +52,12 @@ REDIRECT_URI = os.environ.get(
 # operador não entende. 90s cobre a latência do Render mais a do Tiny.
 FOLGA_S = 90
 
+# Limite do codigo do produto no Tiny. A proposta 1050862 falhou com um SKU de
+# 47 caracteres derivado da descricao ("BATERIA-SELADA-UNIPOWER-12V-12A-UNIPOWER-UP12120");
+# a mesma proposta passou com "UP-12120". Codigo curto tambem e mais util para
+# quem procura o produto na tela depois.
+LIMITE_SKU = 30
+
 _sb_factory = None
 _lock = threading.Lock()
 _estados: dict = {}          # state -> timestamp (CSRF do OAuth)
@@ -279,13 +285,35 @@ def _cnpj_mascarado(d: str) -> str:
     return d
 
 
-def criar_orcamento(corpo: dict) -> dict:
-    """Cria o orçamento. Se o Tiny exigir produto cadastrado, cadastra e repete.
+def achar_produto(sku: str) -> Optional[dict]:
+    """Procura um produto pelo código/SKU. Devolve o registro ou None.
 
-    O item pode ir com `produto` sem id — se a conta aceitar item avulso, nada
-    é cadastrado. Se recusar, criamos o produto e repetimos UMA vez. Vale a
-    tentativa: a Kist é asset light e vende o que o cliente pede, então item de
-    proposta nem sempre precisa virar cadastro permanente.
+    Existe para não tentar cadastrar o que já está lá: SKU repetido é recusado
+    pelo Tiny, e a proposta inteira falha por causa de um item que já existia.
+    Reusar também evita inflar o cadastro com o mesmo produto duas vezes.
+    """
+    s = (sku or "").strip()
+    if not s:
+        return None
+    # A API não documenta qual parâmetro de busca aceita para produto. O 409 da
+    # proposta 1050862 mostrou que `codigo`/`sku`/`pesquisa` não alcançaram um
+    # produto que existia — então tentamos mais variantes antes de desistir.
+    for chave in ("codigo", "sku", "pesquisa", "nome", "descricao", "q", "search"):
+        try:
+            r = chamar("GET", "/produtos", params={chave: s, "limit": 5})
+        except Exception:
+            continue
+        for p in (r or {}).get("itens") or []:
+            if str(p.get("sku") or "").strip().upper() == s.upper():
+                return p
+    return None
+
+
+def criar_orcamento(corpo: dict) -> dict:
+    """Cria o orçamento. Se o Tiny exigir produto cadastrado, resolve e repete.
+
+    Resolver = procurar primeiro, cadastrar só se não existir. Foi um item já
+    cadastrado que derrubou a proposta 1050862.
     """
     try:
         return chamar("POST", "/orcamentos", json=corpo)
@@ -297,7 +325,7 @@ def criar_orcamento(corpo: dict) -> dict:
         if not precisa_id:
             raise RuntimeError(f"[orcamento] {erro_orc}")
 
-    # Segunda tentativa: cadastra cada produto e usa o id devolvido.
+    # Segunda tentativa: para cada item, achar ou cadastrar o produto.
     #
     # ATENÇÃO ao campo `tipo`: ele significa coisas DIFERENTES em cada rota.
     # No ITEM do orçamento, "P" = produto (visto em orçamento real da conta).
@@ -308,22 +336,64 @@ def criar_orcamento(corpo: dict) -> dict:
         p = it.get("produto") or {}
         if p.get("id"):
             continue
+        sku = (p.get("sku") or "").strip()
+
+        # 1) já existe? usa o que está lá.
+        achado = achar_produto(sku)
+        if achado and achado.get("id"):
+            it["produto"] = {"id": achado["id"]}
+            continue
+
+        # 2) não existe (ou a busca não alcançou): cadastra.
         cadastro = {
-            "sku": p.get("sku"),
+            "sku": sku[:LIMITE_SKU],
             "descricao": (p.get("descricao") or "")[:120],
             "tipo": "S",
             "unidade": p.get("unidade") or "UN",
             "situacao": "A",
             "precos": {"preco": it.get("valorUnitario") or 0},
         }
+        pid = None
         try:
             novo = chamar("POST", "/produtos", json=cadastro)
+            pid = (novo or {}).get("id")
         except Exception as e:
-            raise RuntimeError(f"[cadastro do produto {p.get('sku')}] {e}")
-        pid = (novo or {}).get("id")
+            msg = str(e)
+            duplicado = ("409" in msg or "sku" in msg.lower()
+                         and any(x in msg.lower() for x in ("existe", "duplic", "cadastrad")))
+            if not duplicado:
+                raise RuntimeError(f"[cadastro do produto '{cadastro['sku']}'] {e}")
+
+            # O produto EXISTE mas a busca não o alcançou — o parâmetro de
+            # consulta do Tiny não é o que tentamos. Em vez de derrubar a
+            # proposta inteira por causa disso, cadastramos com sufixo.
+            #
+            # Isso cria um produto a mais no catálogo, o que é ruim mas
+            # recuperável; falhar a exportação é pior e não recupera nada. E a
+            # Kist já convive com catálogo grande por natureza: vende o que o
+            # cliente pede, não o que tem cadastrado.
+            base = cadastro["sku"][:LIMITE_SKU - 3]
+            for n in range(2, 6):
+                alt = f"{base}-{n}"
+                achado = achar_produto(alt)
+                if achado and achado.get("id"):
+                    pid = achado["id"]
+                    break
+                try:
+                    novo = chamar("POST", "/produtos", json={**cadastro, "sku": alt})
+                    pid = (novo or {}).get("id")
+                    if pid:
+                        break
+                except Exception:
+                    continue
+            if not pid:
+                raise RuntimeError(
+                    f"[cadastro do produto '{cadastro['sku']}'] já existe no Tiny e não "
+                    "consegui localizar o id. Cadastre o item manualmente ou informe "
+                    "o SKU do fornecedor no item da proposta.")
         if not pid:
             raise RuntimeError(
-                f"[cadastro do produto {p.get('sku')}] o Tiny não devolveu id: {novo}")
+                f"[cadastro do produto '{cadastro['sku']}'] o Tiny não devolveu id")
         it["produto"] = {"id": pid}
     try:
         return chamar("POST", "/orcamentos", json=corpo)

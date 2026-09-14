@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.49"
+VERSAO_BACKEND = "3.51"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -2001,11 +2001,18 @@ async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verifica
     # clientes compartilha código, e um dia dá para olhar para trás e ver quantas
     # vezes aquilo foi vendido.
     def _sku(it, i):
+        """Código do produto no Tiny. Curto de propósito.
+
+        SKU do fornecedor vence quando existe. Sem ele, deriva da descrição —
+        mas TRUNCADO: um código de 47 caracteres derrubou a proposta 1050862,
+        e a mesma passou com um curto. Código curto também é o que alguém
+        consegue procurar na tela do ERP depois.
+        """
         s = (it.get("sku_fornecedor") or "").strip()
         if s:
-            return s[:60]
+            return s[:30]
         base = _slug_agente(it.get("descricao_final") or it.get("descricao_original") or "")
-        return (base[:48] or f"item-{i}").upper()
+        return (base[:30].rstrip("-") or f"item-{i}").upper()
 
     linhas = []
     for i, it in enumerate(itens, 1):
