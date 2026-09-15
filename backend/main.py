@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.59"
+VERSAO_BACKEND = "3.60"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -4946,15 +4946,55 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
     return {"proposta_id": proposta_id, "total_itens": len(itens), "status": status}
 
 
-@app.get("/propostas/{proposta_id}/detalhe")
-async def detalhe_proposta(proposta_id: int, usuario: str = Depends(verificar_token)):
-    """Retorna proposta completa + itens para reabrir na tela de revisão."""
-    sb = get_supabase()
-    prop = sb.table("propostas").select("*").eq("id", proposta_id).limit(1).execute()
-    if not prop.data:
+# Faixas que não se cruzam: id interno vai a ~1.300; número de proposta começa em
+# 1.050.390. Por isso "id primeiro, número depois" não tem como trocar uma
+# proposta pela outra. O teto de int64 evita que um número absurdo vire erro 500
+# do PostgREST na consulta por id.
+_ID_MAX = 2**63 - 1
+
+def _resolver_proposta(sb, ref) -> dict:
+    """Linha de `propostas` a partir do id interno OU do número da proposta.
+
+    Os agentes (Kepler, bots do Leonardo) só conhecem o NÚMERO — é o que está no
+    `/propostas.txt`, no Tiny e na conversa. As rotas pediam o id interno, e o
+    agente batia em 404 no /detalhe e em lista vazia no /itens (15/09: 1050863,
+    1050878, 1050879). Não era permissão, era endereço.
+
+    Ordem: id interno; se não existir, `numero_proposta` exato. Número repetido
+    não escolhe — devolve 409 com os ids, para quem chama decidir.
+    """
+    txt = str(ref if ref is not None else "").strip()
+    if not txt:
         raise HTTPException(status_code=404, detail="Proposta não encontrada")
-    itens = sb.table("itens_proposta").select("*").eq("proposta_id", proposta_id).execute()
-    return {"proposta": prop.data[0], "itens": itens.data or []}
+    if txt.isdigit() and int(txt) <= _ID_MAX:
+        r = sb.table("propostas").select("*").eq("id", int(txt)).limit(1).execute()
+        if r.data:
+            return r.data[0]
+    r = (sb.table("propostas").select("*").eq("numero_proposta", txt)
+           .order("data_geracao", desc=True).limit(5).execute())
+    linhas = r.data or []
+    if len(linhas) > 1:
+        raise HTTPException(status_code=409, detail=(
+            f"Número {txt} aparece em mais de uma proposta (ids "
+            f"{', '.join(str(l.get('id')) for l in linhas)}). Use o id interno."))
+    if not linhas:
+        raise HTTPException(status_code=404, detail=(
+            f"Proposta '{txt}' não encontrada (procurei por id interno e por número)."))
+    return linhas[0]
+
+
+@app.get("/propostas/{proposta_id}/detalhe")
+async def detalhe_proposta(proposta_id: str, usuario: str = Depends(verificar_token)):
+    """Proposta completa + itens. Aceita o id interno OU o número da proposta.
+
+    Ex.: /propostas/1264/detalhe e /propostas/1050868/detalhe devolvem a mesma.
+    Qualquer operador lê proposta de qualquer outro — não há filtro por dono.
+    404 quando nem id nem número existem.
+    """
+    sb = get_supabase()
+    prop = _resolver_proposta(sb, proposta_id)
+    itens = sb.table("itens_proposta").select("*").eq("proposta_id", prop["id"]).execute()
+    return {"proposta": prop, "itens": itens.data or []}
 
 
 @app.get("/propostas")
@@ -5019,11 +5059,16 @@ async def listar_propostas(
 
 
 @app.get("/propostas/{proposta_id}/itens")
-async def itens_proposta(proposta_id: int, usuario: str = Depends(verificar_token)):
-    """Retorna itens de uma proposta"""
+async def itens_proposta(proposta_id: str, usuario: str = Depends(verificar_token)):
+    """Itens de uma proposta. Aceita o id interno OU o número da proposta.
+
+    404 quando a proposta não existe — antes vinha `[]`, que o agente lia como
+    "sem acesso". Lista vazia agora significa proposta existente sem itens.
+    """
     sb = get_supabase()
-    res = sb.table("itens_proposta").select("*").eq("proposta_id", proposta_id).execute()
-    return res.data
+    prop = _resolver_proposta(sb, proposta_id)
+    res = sb.table("itens_proposta").select("*").eq("proposta_id", prop["id"]).execute()
+    return res.data or []
 
 
 @app.put("/itens-proposta/{item_id}/origem")
