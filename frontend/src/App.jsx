@@ -2198,6 +2198,7 @@ export default function App() {
         frete:         prop.frete_recebimento || 0,
         prazo_entrega: prop.prazo_entrega || "",
         condicao_pagamento: prop.condicao_pagamento || "",
+        outros_itens: prop.outros_itens || "",
         status:        prop.status || "rascunho",
         itens,
       }]);
@@ -2876,6 +2877,17 @@ export default function App() {
                         onChange={(e) => { setPropostas((prev) => prev.map((p, pi) => pi === propostaIdx ? { ...p, prazo_entrega: e.target.value } : p)); _dispararAutoSave(); }}
                         placeholder="ex: 15 dias úteis"
                         className="mt-1 w-full rounded-lg border border-line2 bg-paper px-2.5 py-1.5 text-[13px] text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
+                    </label>
+                    <label className="block sm:col-span-2">
+                      {/* "Outros itens ou serviços" do orçamento: vai em
+                          extras.descricao no Tiny, que guarda como HTML.
+                          Serve para o que não é item de linha — condição de
+                          frete, escopo de serviço, observação técnica. */}
+                      <div className="text-[11.5px] text-sub">Outros itens ou serviços</div>
+                      <textarea value={prop.outros_itens || ""} rows={2}
+                        onChange={(e) => { setPropostas((prev) => prev.map((p, pi) => pi === propostaIdx ? { ...p, outros_itens: e.target.value } : p)); _dispararAutoSave(); }}
+                        placeholder="ex: Frete CIF · Instalação não inclusa · Garantia 12 meses"
+                        className="mt-1 w-full resize-y rounded-lg border border-line2 bg-paper px-2.5 py-1.5 text-[13px] text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
                     </label>
                     <label className="block">
                       {/* Condição de pagamento: vai para o campo `condicoesComerciais`

@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.58"
+VERSAO_BACKEND = "3.59"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -1997,7 +1997,8 @@ async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verifica
                 if len(cnpj) < 11:
                     cnpj = re.sub(r"\D", "", prop.get("cnpj") or "")
                 for campo in ("cliente", "rc_neg", "prazo_entrega", "usuario_nome",
-                              "condicao_pagamento", "introducao", "observacao"):
+                              "condicao_pagamento", "introducao", "observacao",
+                              "outros_itens"):
                     if not payload.get(campo) and prop.get(campo):
                         payload[campo] = prop[campo]
                 if not itens:
@@ -2085,6 +2086,16 @@ async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verifica
             "desconto": _num_br(payload.get("desconto")),
         },
     }
+
+    # "Outros itens ou serviços" do orçamento. Confirmado lendo um orçamento
+    # real: o campo é `extras.descricao` e o Tiny guarda como HTML. Texto puro
+    # vira parágrafo; se o operador já mandou HTML, respeitamos o que veio.
+    outros = (payload.get("outros_itens") or "").strip()
+    if outros:
+        if "<" not in outros:
+            outros = "".join(f"<p>{l.strip()}</p>"
+                             for l in outros.splitlines() if l.strip())
+        corpo["extras"]["descricao"] = outros[:4000]
 
     # Condição de pagamento. O Tiny guarda em `condicoesComerciais` com
     # tipo "P" (parcelas) e deriva `dias` a partir do texto — confirmado lendo
@@ -4877,6 +4888,7 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
         # que a tela e o agente mandassem. Campo novo precisa de migration E de
         # persistência — a migration sozinha não faz nada.
         "condicao_pagamento":   (payload.get("condicao_pagamento") or "").strip() or None,
+        "outros_itens":         (payload.get("outros_itens") or "").strip() or None,
         "status":               status,
         # Texto que a IA leu na extração. Só grava quando vier — reabrir uma proposta
         # e salvar de novo não pode apagar a fonte com string vazia.
