@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.51"
+VERSAO_BACKEND = "3.58"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -1457,7 +1457,7 @@ def funcoes_sistema(rota: str = "", usuario: str = Depends(verificar_token)):
                 params.append(f"{a.arg}={v!r}" if v != "" else a.arg)
             if params:
                 out.append("params: " + ", ".join(reversed(params)))
-            corpo = ast.unparse(n)
+            corpo = _ast.unparse(n)
             if "payload" in corpo and m in ("POST", "PUT", "PATCH"):
                 out.append("corpo: JSON (veja o payload abaixo)")
             doc = (_ast.get_docstring(n) or "").strip()
@@ -1979,13 +1979,42 @@ async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verifica
     """
     if not _TINY_OK:
         raise HTTPException(status_code=503, detail="modulo tiny nao carregado")
-    numero = str(payload.get("proposta") or "").strip()
+    numero = str(payload.get("proposta") or payload.get("numero_proposta") or "").strip()
     itens = payload.get("itens") or []
-    if not itens:
-        raise HTTPException(status_code=422, detail="proposta sem itens")
     cnpj = "".join(c for c in str(payload.get("cnpj") or "") if c.isdigit())
+
+    # Só o número basta. O agente acabou de salvar a proposta; exigir que ele
+    # remonte itens e CNPJ no payload é pedir que carregue no contexto (e pague
+    # por) algo que o banco já tem. Foi o que derrubou a primeira exportação do
+    # Dwight com 422.
+    if numero and (not itens or len(cnpj) < 11):
+        try:
+            sb0 = get_supabase()
+            p0 = (sb0.table("propostas").select("*")
+                  .eq("numero_proposta", numero).limit(1).execute().data or [])
+            if p0:
+                prop = p0[0]
+                if len(cnpj) < 11:
+                    cnpj = re.sub(r"\D", "", prop.get("cnpj") or "")
+                for campo in ("cliente", "rc_neg", "prazo_entrega", "usuario_nome",
+                              "condicao_pagamento", "introducao", "observacao"):
+                    if not payload.get(campo) and prop.get(campo):
+                        payload[campo] = prop[campo]
+                if not itens:
+                    itens = (sb0.table("itens_proposta").select("*")
+                             .eq("proposta_id", prop["id"]).execute().data or [])
+                    payload["itens"] = itens
+        except Exception:
+            pass
+
+    if not itens:
+        raise HTTPException(
+            status_code=422,
+            detail=(f"proposta {numero or '?'} sem itens. Salve com "
+                    "POST /salvar-proposta antes de exportar, ou mande os itens no payload."))
     if len(cnpj) < 11:
-        raise HTTPException(status_code=422, detail="CNPJ do cliente ausente ou invalido")
+        raise HTTPException(status_code=422,
+                            detail="CNPJ do cliente ausente ou invalido")
 
     try:
         contato = _tiny.achar_contato(cnpj)
@@ -2019,8 +2048,8 @@ async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verifica
         desc = (it.get("descricao_final") or it.get("descricao_original") or "").strip()
         if not desc:
             continue
-        qtd = float(it.get("quantidade") or 1)
-        val = float(it.get("preco_un") or it.get("preco_venda") or 0)
+        qtd = _num_br(it.get("quantidade"), 1)
+        val = _num_br(it.get("preco_un") or it.get("preco_venda"))
         compl = (it.get("specs_complementares") or "").strip()
         un = (it.get("unidade") or "UN").strip()[:6] or "UN"
         linhas.append({
@@ -2052,8 +2081,8 @@ async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verifica
         },
         "itens": linhas,
         "extras": {
-            "frete": float(payload.get("frete") or 0),
-            "desconto": float(payload.get("desconto") or 0),
+            "frete": _num_br(payload.get("frete")),
+            "desconto": _num_br(payload.get("desconto")),
         },
     }
 
@@ -2073,8 +2102,24 @@ async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verifica
 
     corpo = {k: v for k, v in corpo.items() if v is not None}
 
+    # Já foi exportada? Então ATUALIZA o orçamento existente em vez de criar
+    # outro. Sem isto, "regerar depois de editar" deixaria dois orçamentos no
+    # Tiny para a mesma proposta, e o cliente poderia receber o errado.
+    ja = None
+    if numero:
+        try:
+            r0 = (get_supabase().table("propostas").select("tiny_id")
+                  .eq("numero_proposta", numero).limit(1).execute().data or [])
+            ja = (r0[0].get("tiny_id") if r0 else None)
+        except Exception:
+            ja = None
+
     try:
-        r = _tiny.criar_orcamento(corpo)
+        if ja:
+            r = _tiny.atualizar_orcamento(int(ja), corpo)
+            r = {**(r or {}), "id": int(ja)}
+        else:
+            r = _tiny.criar_orcamento(corpo)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)[:400])
 
@@ -2100,13 +2145,14 @@ async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verifica
     # Roda DEPOIS do Tiny aceitar e nunca derruba a exportação: o orçamento já
     # existe lá, e falhar em aprender não desfaz o que foi feito.
     banco = None
-    if any(float(i.get("preco_un") or i.get("preco_venda") or 0) > 0 for i in itens):
+    if any(_num_br(i.get("preco_un") or i.get("preco_venda")) > 0 for i in itens):
         try:
             banco = await upsert_precos(payload, usuario=usuario)
         except Exception as e:
             banco = {"erro": str(e)[:150]}
 
     saida = {"ok": 1, "tiny_id": tiny_id, "tiny_numero": tiny_num,
+             "acao": "atualizado" if ja else "criado",
              "itens": len(linhas), "contato_id": contato["id"],
              "cliente_tiny": contato.get("nome") or contato.get("razaoSocial")}
     if banco:
@@ -2264,6 +2310,183 @@ def fornecedores_anotar(payload: dict, usuario: str = Depends(verificar_token)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)[:150])
     return {"ok": 1, "cnpj": dig, "campos": sorted(set(linha) - {"atualizado_em", "atualizado_por"})}
+
+
+@app.post("/clientes/dominios/sincronizar")
+def clientes_dominios_sincronizar(payload: dict, usuario: str = Depends(verificar_token)):
+    """Monta o filtro de caixa a partir de quem REALMENTE mandou cotação.
+
+    PAYLOAD: {} ou {"tiny": 1} para completar pelo cadastro do ERP.
+
+    Duas fontes, nesta ordem:
+
+    1. OBSERVADO — o domínio extraído do texto do e-mail que originou cada
+       proposta SUA. É dado, não palpite: `feliciorocho.org.br` para Fundação
+       Felice Rosso e `convergint.com` (sem .br) nunca sairiam de dedução.
+    2. TINY — para cliente da carteira que ainda não tem domínio observado,
+       busca o contato pelo CNPJ e lê o e-mail cadastrado.
+
+    Cliente é quem tem proposta gerada. Quem não tem é lead, e lead não entra
+    no fluxo automático.
+    """
+    sb = get_supabase()
+    novos = atualizados = 0
+    amostra = []
+
+    try:
+        obs = (sb.rpc("dominios_observados", {"p_usuario": usuario}).execute().data or [])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"falha ao ler observados: {e}")
+
+    for o in obs:
+        d = (o.get("dominio") or "").strip().lower()
+        if not d:
+            continue
+        linha = {"dominio": d, "raiz_cnpj": (o.get("raiz_cnpj") or "")[:8],
+                 "cliente": (o.get("cliente") or "")[:120] or None,
+                 "usuario_email": usuario, "origem": "observado",
+                 # observado em 2+ propostas é padrão; em 1, pode ser um contato
+                 # avulso que respondeu de outro endereço.
+                 "confianca": "alta" if int(o.get("propostas") or 0) >= 2 else "media",
+                 "propostas": int(o.get("propostas") or 0),
+                 "atualizado_em": _dt_ext.utcnow().isoformat()}
+        try:
+            existe = (sb.table("clientes_dominios").select("dominio")
+                      .eq("dominio", d).limit(1).execute().data or [])
+            if existe:
+                sb.table("clientes_dominios").update(linha).eq("dominio", d).execute()
+                atualizados += 1
+            else:
+                sb.table("clientes_dominios").insert(linha).execute()
+                novos += 1
+            amostra.append({"dominio": d, "cliente": (o.get("cliente") or "")[:26],
+                            "propostas": o.get("propostas")})
+        except Exception:
+            pass
+
+    # Complemento pelo Tiny: clientes da carteira que nenhum e-mail revelou.
+    pelo_tiny = 0
+    if int(payload.get("tiny") or 0) and _TINY_OK:
+        try:
+            carteira = (sb.rpc("carteira_clientes",
+                               {"p_usuario": usuario, "p_min_propostas": 1}).execute().data or [])
+            ja = {(x.get("raiz_cnpj") or "") for x in
+                  (sb.table("clientes_dominios").select("raiz_cnpj")
+                   .eq("usuario_email", usuario).execute().data or [])}
+        except Exception:
+            carteira, ja = [], set()
+        for c in carteira:
+            raiz = (c.get("raiz_cnpj") or "").strip()
+            if not raiz or raiz in ja:
+                continue
+            try:
+                p = (sb.table("propostas").select("cnpj")
+                     .eq("usuario_email", usuario)
+                     .order("data_geracao", desc=True).limit(400).execute().data or [])
+                cnpj = next((re.sub(r"\D", "", x.get("cnpj") or "") for x in p
+                             if re.sub(r"\D", "", x.get("cnpj") or "").startswith(raiz)), None)
+                if not cnpj:
+                    continue
+                contato = _tiny.achar_contato(cnpj)
+                email = ((contato or {}).get("email") or "").strip().lower()
+                if not email or "@" not in email:
+                    continue
+                d = email.split("@")[-1].strip()
+                if sb.rpc("dominio_generico", {"d": d}).execute().data:
+                    continue   # e-mail público não identifica empresa
+                sb.table("clientes_dominios").insert({
+                    "dominio": d, "raiz_cnpj": raiz,
+                    "cnpj": cnpj, "cliente": (c.get("cliente") or "")[:120] or None,
+                    "usuario_email": usuario, "origem": "tiny_email", "confianca": "media",
+                    "propostas": int(c.get("propostas") or 0),
+                    "atualizado_em": _dt_ext.utcnow().isoformat()}).execute()
+                pelo_tiny += 1
+                amostra.append({"dominio": d, "cliente": (c.get("cliente") or "")[:26],
+                                "propostas": c.get("propostas")})
+            except Exception:
+                continue
+
+    return {"ok": 1, "observados": len(obs), "novos": novos,
+            "atualizados": atualizados, "pelo_tiny": pelo_tiny,
+            "amostra": amostra[:15]}
+
+
+@app.get("/clientes/e-cliente", response_class=PlainTextResponse)
+def clientes_e_cliente(remetente: str = "", cnpj: str = "",
+                       usuario: str = Depends(verificar_token)):
+    """Vale abrir este e-mail? É a pergunta que o agente faz antes de gastar token.
+
+    `remetente=compras@convergint.com` responde pelo domínio.
+    `cnpj=...` responde pelo histórico de propostas — é o que decide de verdade.
+
+    Casa também por SUFIXO: `rj.universal.org.br` bate com `universal.org.br`,
+    porque cliente grande manda de subdomínio por filial. A Igreja Universal
+    aparece com 13 CNPJs sob o mesmo domínio.
+
+    Responde `cliente` ou `lead`. Lead não vira proposta automática.
+    """
+    sb = get_supabase()
+    dig = re.sub(r"\D", "", cnpj or "")
+    if dig and len(dig) >= 8:
+        try:
+            r = (sb.table("propostas").select("numero_proposta,cliente")
+                 .eq("usuario_email", usuario).ilike("cnpj", f"%{dig[:8]}%")
+                 .limit(1).execute().data or [])
+            if r:
+                return f"cliente\ncnpj {dig[:8]} tem proposta anterior\n{r[0].get('cliente') or ''}"
+        except Exception:
+            pass
+    d = (remetente or "").strip().lower()
+    if "@" in d:
+        d = d.split("@")[-1]
+    if not d:
+        return "lead\nsem remetente nem cnpj para avaliar"
+    try:
+        linhas = (sb.table("clientes_dominios")
+                  .select("dominio,cliente,confianca,propostas")
+                  .eq("usuario_email", usuario).limit(400).execute().data or [])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:150])
+    for l in linhas:
+        base = (l.get("dominio") or "").lower()
+        if d == base or d.endswith("." + base) or base.endswith("." + d):
+            return (f"cliente\ndominio {base} confianca {l.get('confianca')}\n"
+                    f"{l.get('cliente') or ''} ({l.get('propostas')} propostas)")
+    return (f"lead\n{d} nunca gerou proposta sua\n"
+            "NAO gere proposta automatica; avise o Leonardo")
+
+
+@app.get("/ping")
+
+
+@app.get("/clientes/dominios.txt", response_class=PlainTextResponse)
+def clientes_dominios_txt(usuario: str = Depends(verificar_token)):
+    """O filtro de caixa: de quais domínios vale abrir e-mail.
+
+    Uma linha por domínio, com a confiança. `alta` veio do e-mail cadastrado no
+    Tiny; `baixa` foi deduzido do nome e o agente confirma pelo CNPJ do
+    documento antes de gerar proposta.
+
+    Quem não está aqui é lead, não cliente — e lead não vira proposta
+    automática.
+    """
+    try:
+        linhas = (get_supabase().table("clientes_dominios")
+                  .select("dominio,cliente,confianca,origem,propostas,raiz_cnpj")
+                  .eq("usuario_email", usuario)
+                  .order("propostas", desc=True).limit(400).execute().data or [])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:150])
+    if not linhas:
+        return "nenhum dominio mapeado; rode POST /clientes/dominios/sincronizar"
+    out = [f"{len(linhas)} dominios | dominio confianca propostas cliente"]
+    for l in linhas:
+        out.append(" ".join(str(x) for x in [
+            l.get("dominio"), l.get("confianca") or "?",
+            l.get("propostas") or 0,
+            (l.get("cliente") or "?")[:32].replace(" ", "_"),
+        ]))
+    return "\n".join(out)
 
 
 @app.get("/ping")
@@ -4559,6 +4782,32 @@ def _norm_item_payload(it):
     return {}
 
 
+def _num_br(v, padrao=0.0):
+    """float() tolerante ao que um agente realmente manda.
+
+    `float("1.174,30")` estoura — e derrubou o /salvar-proposta com 500 em 2ms
+    no primeiro dia do Dwight. Número chega como "R$ 250,00", "1.174,30" ou
+    "10 UN" porque o agente lê da tela do fornecedor e repassa. Recusar isso
+    com erro 500 é transferir para ele um problema que é nosso de aceitar.
+    """
+    if v is None or v == "":
+        return padrao
+    if isinstance(v, (int, float)):
+        return float(v)
+    t = str(v).strip()
+    t = re.sub(r"[^\d,.\-]", "", t)          # tira R$, espaço, unidade
+    if not t:
+        return padrao
+    if "," in t and "." in t:                 # 1.174,30 -> 1174.30
+        t = t.replace(".", "").replace(",", ".")
+    elif "," in t:                            # 250,00 -> 250.00
+        t = t.replace(",", ".")
+    try:
+        return float(t)
+    except Exception:
+        return padrao
+
+
 def _itens_payload(payload):
     """Lista de itens do payload, cada um garantidamente dict."""
     return [_norm_item_payload(i) for i in (payload.get("itens") or [])]
@@ -4603,10 +4852,10 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
     sb = get_supabase()
     itens = _itens_payload(payload)
     valor_total = sum(
-        float(i.get("preco_un") or 0) * float(i.get("quantidade") or 1)
+        _num_br(i.get("preco_un")) * _num_br(i.get("quantidade"), 1)
         for i in itens
     )
-    com_preco  = sum(1 for i in itens if float(i.get("preco_un") or 0) > 0)
+    com_preco  = sum(1 for i in itens if _num_br(i.get("preco_un")) > 0)
     sem_preco  = len(itens) - com_preco
     status     = payload.get("status", "confirmada")
     numero     = str(payload.get("proposta") or payload.get("numero_proposta") or "")
@@ -4622,8 +4871,12 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
         "com_preco":            com_preco,
         "sem_preco":            sem_preco,
         "valor_total_estimado": valor_total,
-        "frete_recebimento":    float(payload.get("frete") or payload.get("frete_recebimento") or 0),
+        "frete_recebimento":    _num_br(payload.get("frete") or payload.get("frete_recebimento") or 0),
         "prazo_entrega":        payload.get("prazo_entrega") or None,
+        # Coluna criada em 15/09; sem esta linha o campo nunca gravava, por mais
+        # que a tela e o agente mandassem. Campo novo precisa de migration E de
+        # persistência — a migration sozinha não faz nada.
+        "condicao_pagamento":   (payload.get("condicao_pagamento") or "").strip() or None,
         "status":               status,
         # Texto que a IA leu na extração. Só grava quando vier — reabrir uma proposta
         # e salvar de novo não pode apagar a fonte com string vazia.
@@ -4648,11 +4901,11 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
             "descricao_original":   i.get("descricao_original", ""),
             "descricao_final":      i.get("descricao_final", ""),
             "codigo_cliente":       (i.get("codigo_cliente") or "").strip() or None,
-            "quantidade":           float(i.get("quantidade") or 1),
+            "quantidade":           _num_br(i.get("quantidade") or 1),
             "unidade":              i.get("unidade", "UN"),
-            "preco_venda":          float(i.get("preco_un") or 0),
-            "preco_custo":          float(i.get("preco_custo") or 0),
-            "frete_vinda":          float(i.get("frete_vinda") or 0),
+            "preco_venda":          _num_br(i.get("preco_un") or 0),
+            "preco_custo":          _num_br(i.get("preco_custo") or 0),
+            "frete_vinda":          _num_br(i.get("frete_vinda") or 0),
             "confianca_match":      i.get("confianca_match", ""),
             "specs_complementares": i.get("specs_complementares", ""),
             "fornecedor":           i.get("fornecedor", ""),
@@ -5597,16 +5850,16 @@ async def criar_oc(payload: dict, usuario: str = Depends(verificar_token)):
                         return v
                 return base.get(nome) or ""
 
-            custo = float(i.get("preco_custo") or 0) or float(base.get("preco_custo") or 0)
-            frete = float(i.get("frete_vinda") or 0) or float(base.get("frete_vinda") or 0)
+            custo = _num_br(i.get("preco_custo") or 0) or _num_br(base.get("preco_custo") or 0)
+            frete = _num_br(i.get("frete_vinda") or 0) or _num_br(base.get("frete_vinda") or 0)
             rows.append({
                 "oc_id":               oc_id,
                 "item_proposta_id":    i.get("item_proposta_id"),
                 "descricao":           i.get("descricao", ""),
-                "quantidade_proposta": float(i.get("quantidade_proposta") or 1),
-                "quantidade_comprar":  float(i.get("quantidade_comprar") or i.get("quantidade_proposta") or 1),
+                "quantidade_proposta": _num_br(i.get("quantidade_proposta") or 1),
+                "quantidade_comprar":  _num_br(i.get("quantidade_comprar") or i.get("quantidade_proposta") or 1),
                 "unidade":             i.get("unidade", "UN"),
-                "preco_venda":         float(i.get("preco_venda") or 0),
+                "preco_venda":         _num_br(i.get("preco_venda") or 0),
                 "preco_custo":         custo,
                 "frete_vinda":         frete,
                 # origem do preço herdada da proposta (aceita as duas nomenclaturas):
