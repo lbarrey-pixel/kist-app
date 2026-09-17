@@ -2924,7 +2924,10 @@ export default function App() {
                               {nt.tipo === "leitura_reaproveitada" ? "Leitura reaproveitada — não paguei de novo"
                                 : nt.tipo === "imagens_cortadas"   ? "Nem todas as imagens couberam"
                                 : nt.tipo === "itens_somados"      ? "Linhas repetidas — somei as quantidades"
-                                : "Anexo repetido — usei o corpo do e-mail"}
+                                : nt.tipo === "imagem_recuperada"  ? "Imagem corrompida no e-mail — li o que abriu"
+                                : nt.tipo === "imagem_ilegivel"    ? "Imagem que não abriu ficou de fora"
+                                : nt.tipo === "anexo_redundante"   ? "Anexo repetido — usei o corpo do e-mail"
+                                : "Aviso da leitura"}
                             </div>
                             <div className="mt-0.5 text-[12.5px] leading-relaxed text-sub">{nt.mensagem}</div>
                             {nt.tipo === "leitura_reaproveitada" && (
