@@ -3423,63 +3423,72 @@ async def extrair_email(
     _IMG_SKIP_EXT = re.compile(r'logo|logotipo|assinatura|signature|bullet|icon', re.I)
 
     def _extrair_excel_bytes(data, fname):
-        """Extrai Excel priorizando linhas de item.
-        Detecta o header da tabela e extrai só metadados-chave + linhas de item.
-        Fallback para extração bruta se header não for detectável.
+        """Planilha → texto FIEL, linha a linha. Sem heurística de "o que é item".
+
+        HISTÓRICO (17/09, NEG 0043770 da Universal): a versão anterior tentava
+        ADIVINHAR o cabeçalho (precisava de "qtd" E "descri" na mesma linha) e,
+        sem cabeçalho, só guardava linhas que casassem com "cnpj|cliente|...".
+        A planilha era um pivot do Coupa com a coluna "Rótulos de Linha" — 41
+        itens, e o modelo recebeu UM (o que tinha "Referência" no endereço).
+        Nenhum aviso. Foi a segunda vez no mês.
+
+        Regra da casa (ingestao.py): "errar mandando é barato; errar descartando
+        apaga a cotação. Quem separa é o modelo, lendo." Aqui vale igual: toda
+        linha não vazia vai, em ordem, com as colunas separadas por " | ". O
+        único corte é de TAMANHO, e ele é declarado no texto.
         """
+        import io as _io
+        MAX_LINHAS_ABA = 600
+        MAX_CHARS = 90000
+
+        def _cel(c):
+            if c is None:
+                return ""
+            if isinstance(c, float) and c.is_integer():
+                c = int(c)
+            return re.sub(r"\s*\n\s*", " / ", str(c)).strip()
+
+        def _linhas_para_texto(nome_aba, linhas):
+            out, n = [], 0
+            for row in linhas:
+                vals = [_cel(c) for c in row]
+                while vals and not vals[-1]:
+                    vals.pop()
+                if not any(vals):
+                    continue
+                n += 1
+                if n > MAX_LINHAS_ABA:
+                    continue
+                out.append(" | ".join(vals))
+            corte = f"\n[... {n - MAX_LINHAS_ABA} linhas omitidas por tamanho]" if n > MAX_LINHAS_ABA else ""
+            return (f"[ABA: {nome_aba} — {min(n, MAX_LINHAS_ABA)} linhas]\n" + "\n".join(out) + corte) if out else ""
+
+        partes = []
         try:
-            import openpyxl, io as _io
+            import openpyxl
             wb = openpyxl.load_workbook(_io.BytesIO(data), read_only=True, data_only=True)
-            partes = []
-            HQTD = re.compile(r'\bqtd|\bquant', re.I)
-            HDESC = re.compile(r'descri|material|servi[çc]|equipamento', re.I)
-            HMETA = re.compile(r'cnpj|empresa|cliente|faturamento|rfq|referência|nº\s*rc|pedido', re.I)
-            for sname in wb.sheetnames:
-                ws = wb[sname]
-                rows = list(ws.iter_rows(values_only=True))
-                metadados, item_rows, header_idx = [], [], None
-                for i, row in enumerate(rows):
-                    vals = [str(c).strip() if c is not None else "" for c in row]
-                    nao_v = [v for v in vals if v and v != "None"]
-                    if not nao_v:
-                        continue
-                    linha = " | ".join(nao_v)
-                    first = nao_v[0]
-                    if header_idx is None:
-                        if len(nao_v) >= 4 and HQTD.search(linha) and HDESC.search(linha):
-                            header_idx = i
-                            item_rows.append(f"COLUNAS: {linha}")
-                            continue
-                        if HMETA.search(linha):
-                            metadados.append(linha)
-                        continue
-                    try:
-                        int(first)
-                        item_rows.append(linha)
-                    except ValueError:
-                        pass
-                if metadados:
-                    partes.append("[META]\n" + "\n".join(metadados[:12]))
-                if item_rows:
-                    partes.append(f"[ITENS - {sname}]\n" + "\n".join(item_rows))
-            resultado = "\n\n".join(partes)
-            if resultado.strip():
-                return resultado
-            # Fallback: extração bruta para planilhas simples sem header detectável
-            partes2 = []
-            wb2 = openpyxl.load_workbook(_io.BytesIO(data), read_only=True, data_only=True)
-            for sname in wb2.sheetnames:
-                ws = wb2[sname]
-                linhas = []
-                for row in ws.iter_rows(values_only=True):
-                    vals = [str(c).strip() if c is not None else "" for c in row]
-                    if any(v and v != "None" for v in vals):
-                        linhas.append(" | ".join(vals))
-                if linhas:
-                    partes2.append(f"[ABA: {sname}]\n" + "\n".join(linhas[:300]))
-            return "\n\n".join(partes2)
-        except Exception:
-            return ""
+            for ws in wb.worksheets:
+                t = _linhas_para_texto(ws.title, ws.iter_rows(values_only=True))
+                if t:
+                    partes.append(t)
+        except Exception as e_x:
+            # .xls antigo (ou arquivo que o openpyxl não abre): tenta o xlrd.
+            try:
+                import xlrd
+                book = xlrd.open_workbook(file_contents=data)
+                for sh in book.sheets():
+                    t = _linhas_para_texto(sh.name, (sh.row_values(r) for r in range(sh.nrows)))
+                    if t:
+                        partes.append(t)
+            except Exception as e_r:
+                # Silêncio era o pior desfecho: o operador via a proposta vazia e
+                # não sabia que a planilha nem tinha sido lida.
+                return (f"[PLANILHA NÃO LIDA — {fname}: {type(e_x).__name__}: {str(e_x)[:120]} / "
+                        f"{type(e_r).__name__}: {str(e_r)[:120]}]")
+        texto = "\n\n".join(partes)
+        if len(texto) > MAX_CHARS:
+            texto = texto[:MAX_CHARS] + "\n[... planilha cortada por tamanho]"
+        return texto
 
     propostas_raw: list = []   # acumulador — declarado aqui para estar disponível
     #                              durante o loop de arquivos (parser det. insere direto)
@@ -3656,8 +3665,21 @@ async def extrair_email(
     #   · 1 chamada por anexo         → e-mail com 6 PDFs virava 6 propostas
     documentos: list = []
     if _INGESTAO_OK:
+        def _planilha_conv(b):
+            """Planilha → texto; falha de leitura vira AVISO ao operador, não silêncio."""
+            t = _extrair_excel_bytes(b, "anexo")
+            if t.startswith("[PLANILHA NÃO LIDA"):
+                avisos_ingestao.append({
+                    "tipo": "busca_falhou", "etapa": "planilha",
+                    "assinatura": "ingestao:planilha_nao_lida",
+                    "mensagem": ("Não consegui ler a planilha. Nenhum item dela entrou — "
+                                 "foi falha do sistema, não do arquivo. Tente salvar como "
+                                 ".xlsx e enviar de novo; se repetir, me chame."),
+                    "detalhe": t[:400],
+                })
+            return t
         _conv = {"pdf": lambda b: _pdf_po_texto(b) if len(b) <= _PDF_MAX_BYTES else "",
-                 "planilha": lambda b: _extrair_excel_bytes(b, "anexo"),
+                 "planilha": _planilha_conv,
                  "word": lambda b: _ler_docx(b) if "_ler_docx" in globals() else ""}
         for _fn, _dd in _brutos:
             _fl = _fn.lower()
