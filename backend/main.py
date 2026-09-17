@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.63"
+VERSAO_BACKEND = "3.64"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -5413,6 +5413,46 @@ async def pesquisa_resultado_receber(ref: str, payload: dict,
         recebidos += 1
 
     return {"recebidos": recebidos, "ignorados": ignorados}
+
+
+@app.post("/markup-itens")
+async def markup_itens(payload: dict, usuario: str = Depends(verificar_token)):
+    """Markup mediano POR ITEM, do específico para o geral (v3.64).
+
+    Ordem: este item com este cliente → este item com qualquer cliente → este
+    cliente → geral. "Este item" casa pela linha do banco (`banco_id`) ou pela
+    descrição normalizada. Devolve fator, fonte e amostra — a tela multiplica
+    pelo custo e o operador continua podendo mudar o preço.
+
+    Amostra mínima: 3 para item (duas linhas costumam ser o mesmo pedido
+    repetido, como as três cores do mesmo pincel) e 8 para cliente.
+    """
+    itens = payload.get("itens") if isinstance(payload, dict) else None
+    if not isinstance(itens, list) or not itens:
+        raise HTTPException(422, "Envie 'itens': [{'k': ..., 'banco_id': ..., 'entrada': ...}]")
+    pedido = []
+    for x in itens[:300]:
+        if not isinstance(x, dict):
+            continue
+        k = _txt(x.get("k") or x.get("item_uid"), 64)
+        if not k:
+            continue
+        pedido.append({"k": k,
+                       "banco_id": str(x.get("banco_id") or "") or None,
+                       "entrada": _txt(x.get("entrada") or x.get("descricao"), 400)})
+    if not pedido:
+        raise HTTPException(422, "Nenhum item com chave 'k'.")
+    try:
+        r = get_supabase().rpc("markup_por_item", {
+            "p_cnpj": _txt(payload.get("cnpj"), 20) or None,
+            "p_itens": pedido, "p_min_item": 3, "p_min_cliente": 8}).execute()
+        linhas = r.data or []
+    except Exception as e:
+        raise HTTPException(500, f"Falha ao calcular markup: {str(e)[:150]}")
+    return {"itens": {str(l.get("chave")): {
+                "fator": float(l.get("mediana") or 0) or None,
+                "fonte": l.get("fonte"), "amostra": l.get("amostra")}
+            for l in linhas}}
 
 
 @app.get("/propostas/{ref}/fonte", response_class=PlainTextResponse)

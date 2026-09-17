@@ -1780,6 +1780,13 @@ export function decidirEscrita(it, of) {
   return { escreve: false, motivo: "nao" };
 }
 
+// Venda = custo × fator do markup mediano. Arredonda em centavos.
+export function vendaPelaMediana(custo, fator) {
+  const c = Number(custo), f = Number(fator);
+  if (!(c > 0) || !(f > 0)) return null;
+  return Math.round(c * f * 100) / 100;
+}
+
 // Aplica a oferta: custo e origem. A VENDA não é tocada — a internet é custo,
 // o preço de venda é decisão do operador.
 export function aplicarOfertaDwight(it, of) {
@@ -2366,7 +2373,7 @@ export default function App() {
   // Carrega no item o que o Dwight achou, pela regra: item em branco, ou oferta
   // mais barata que o custo que está lá. A VENDA nunca é tocada — a internet é
   // custo; a venda é decisão do operador. Guarda o valor anterior para desfazer.
-  function carregarDwight(uidsFiltro = null) {
+  function carregarDwight(uidsFiltro = null, markups = null) {
     const lista = (propostas[propostaIdx]?.itens) || [];
     const escrever = [], trocados = [], recusados = [];
     lista.forEach((it, i) => {
@@ -2386,11 +2393,31 @@ export default function App() {
     }
     const antes = escrever.map(([i]) => ({ i, item: lista[i] }));
     const mapa = new Map(escrever);
+
+    // Venda pela mediana: calculada ANTES de mexer no estado, para a conta não
+    // depender de quantas vezes o React rodar a função de atualização. Só entra
+    // em item com a venda EM BRANCO — preço que o operador digitou é dele.
+    const vendas = new Map();
+    const fontes = new Set();
+    if (markups) {
+      escrever.forEach(([i, of]) => {
+        const it = lista[i];
+        const mk = markups[String(it.item_uid || "").toLowerCase()];
+        if (!mk?.fator || Number(it.preco_un) > 0) return;
+        const v = vendaPelaMediana(custoDaOferta(of), mk.fator);
+        if (v != null) { vendas.set(i, v); if (mk.fonte) fontes.add(mk.fonte); }
+      });
+    }
+    const comVenda = vendas.size;
+
     setPropostas((prev) => prev.map((p, pi) => pi !== propostaIdx ? p : {
       ...p,
       itens: (p.itens || []).map((it, i) => {
         const of = mapa.get(i);
-        return of ? aplicarOfertaDwight(it, of) : it;
+        if (!of) return it;
+        const novo = aplicarOfertaDwight(it, of);
+        if (vendas.has(i)) novo.preco_un = vendas.get(i);
+        return novo;
       }),
     }));
     setDesfazer({ idx: propostaIdx, antes });
@@ -2399,8 +2426,40 @@ export default function App() {
     setPesqMsg(`Carregado em ${escrever.length} ${escrever.length === 1 ? "item" : "itens"}`
       + (trocados.length ? ` · ${trocados.length} ${trocados.length === 1 ? "estava" : "estavam"} mais caro${trocados.length === 1 ? "" : "s"} (economia ${brl(econ)})` : "")
       + (recusados.length ? ` · ${recusados.length} mantido${recusados.length === 1 ? "" : "s"} como ${recusados.length === 1 ? "estava" : "estavam"}` : "")
-      + ". Venda em branco.");
+      + (markups
+          ? ` · venda pela mediana em ${comVenda} ${comVenda === 1 ? "item" : "itens"}${fontes.size ? ` (${[...fontes].join(", ")})` : ""}`
+          : ". Venda em branco."));
     return escrever.length;
+  }
+
+  // "carregar com venda": custo e origem do Dwight + venda pela mediana de lucro
+  // praticada (este item com este cliente > este item > este cliente > geral).
+  async function carregarDwightComVenda() {
+    const lista = (propostas[propostaIdx]?.itens) || [];
+    const alvos = lista.filter((it) => {
+      const of = ofertaRecomendada(it);
+      return of && decidirEscrita(it, of).escreve;
+    });
+    if (!alvos.length) { setPesqMsg("Nenhuma oferta do Dwight para carregar."); return; }
+    setPesqEnviando(true);
+    try {
+      const r = await fetch(`${API}/markup-itens`, {
+        method: "POST", headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({
+          cnpj: propostas[propostaIdx]?.cnpj || "",
+          itens: alvos.map((it) => ({
+            k: String(it.item_uid || "").toLowerCase(),
+            banco_id: it.banco_id || null,
+            entrada: it.descricao_original || it.descricao_final || "",
+          })),
+        }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+      carregarDwight(null, d.itens || {});
+    } catch (e) {
+      setPesqMsg(`Carreguei nada: não consegui o markup (${e.message}).`);
+    } finally { setPesqEnviando(false); }
   }
 
   function desfazerDwight() {
@@ -3189,6 +3248,20 @@ export default function App() {
                         className="rounded-lg border border-line2 bg-surface px-3 py-1.5 font-medium text-sub hover:border-kist hover:text-kist"
                         title="Carrega custo e origem: item em branco, ou oferta mais barata que a que está lá">
                         carregar itens do Dwight ({n})
+                      </button>
+                    );
+                  })()}
+                  {(() => {
+                    const n = (prop.itens || []).filter((it) => {
+                      const of = ofertaRecomendada(it);
+                      return of && decidirEscrita(it, of).escreve;
+                    }).length;
+                    if (!n) return null;
+                    return (
+                      <button onClick={carregarDwightComVenda} disabled={pesqEnviando}
+                        className="rounded-lg border border-line2 bg-surface px-3 py-1.5 font-medium text-sub hover:border-kist hover:text-kist disabled:opacity-50"
+                        title="Carrega custo e origem e preenche a venda com a mediana de lucro praticada (este item com este cliente, depois este item, depois este cliente)">
+                        carregar com venda ({n})
                       </button>
                     );
                   })()}
