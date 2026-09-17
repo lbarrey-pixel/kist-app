@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.64"
+VERSAO_BACKEND = "3.65"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -7149,10 +7149,29 @@ def _conhecimento_agente(sb) -> str:
     return "\n".join(partes)
 
 
+# Modo SUPORTE (v3.65): o balão do canto da tela. Mesmo conhecimento do
+# Analista, outro objetivo — responder "como faço isso" em duas linhas, não
+# levantar requisito. Por isso: sem a ferramenta de ficha (o operador não quer
+# abrir chamado quando só quer saber onde clicar), resposta curta, e Haiku em
+# vez de Sonnet, porque o conhecimento vem no prompt e a tarefa é ler e apontar.
+SYSTEM_SUPORTE_EXTRA = """
+MODO SUPORTE — o operador está com uma dúvida de uso, no meio do trabalho.
+
+- Responda CURTO: 2 a 5 linhas. Diga a TELA e o CAMINHO ("Nova proposta → gaveta
+  motor de preços → carregar itens do Dwight").
+- Use só o conhecimento abaixo. Se o sistema não faz aquilo, diga que não faz.
+  Se você não tem certeza, diga que não sabe — não invente capacidade nem caminho.
+- Se for bug ou pedido de mudança, responda o que der e feche assim:
+  "Se quiser registrar, abra em Requisições — lá eu monto a ficha do chamado."
+- Não pergunte mais de uma coisa por vez. Não prometa prazo. Não abra chamado aqui.
+"""
+
+
 class AnalistaChatIn(BaseModel):
     mensagens: list
     operador_nome: Optional[str] = ""
     sessao_id: Optional[str] = ""
+    modo: Optional[str] = "chamado"      # 'chamado' (tela Requisições) | 'suporte' (balão)
 
 
 @app.post("/analista/chat")
@@ -7169,9 +7188,15 @@ async def analista_chat(payload: AnalistaChatIn, usuario: str = Depends(verifica
                 "de forma cordial e natural — sem exagerar, sem repetir a cada frase.") if apelido else ""
     # Anexos: a leitura já foi feita no upload; aqui entra só o texto (barato).
     lim = _anexo_limites(sb)
-    system = (SYSTEM_ANALISTA + saudacao + "\n\n" + _regras_anexos(sb)
-              + "\n\n" + _conhecimento_agente(sb)
-              + _anexos_contexto(sb, payload.sessao_id or "", usuario, lim))
+    suporte = str(payload.modo or "").strip().lower() == "suporte"
+    if suporte:
+        # Sem regras de anexo e sem contexto de anexo: o balão não recebe arquivo.
+        system = (SYSTEM_ANALISTA + saudacao + "\n\n" + SYSTEM_SUPORTE_EXTRA
+                  + "\n\n" + _conhecimento_agente(sb))
+    else:
+        system = (SYSTEM_ANALISTA + saudacao + "\n\n" + _regras_anexos(sb)
+                  + "\n\n" + _conhecimento_agente(sb)
+                  + _anexos_contexto(sb, payload.sessao_id or "", usuario, lim))
 
     msgs = []
     for m in (payload.mensagens or [])[-40:]:
@@ -7180,13 +7205,18 @@ async def analista_chat(payload: AnalistaChatIn, usuario: str = Depends(verifica
         if role in ("user", "assistant") and isinstance(content, str) and content.strip():
             msgs.append({"role": role, "content": content})
     if not msgs or msgs[0]["role"] != "user":
-        return {"reply": "Oi! Sou o analista do sistema. Me conta a melhoria que você quer sugerir ou o problema que encontrou.", "ficha": None}
+        return {"reply": ("Oi! Pergunte o que quiser sobre o sistema — onde fica, como faz, o que ele já faz."
+                          if suporte else
+                          "Oi! Sou o analista do sistema. Me conta a melhoria que você quer sugerir ou o problema que encontrou."),
+                "ficha": None}
 
     try:
         resp = claude.messages.create(
-            model="claude-sonnet-4-6", max_tokens=4000,
-            system=system, messages=msgs, temperature=0.2, timeout=90.0,
-            tools=[FERRAMENTA_FICHA],
+            model=("claude-haiku-4-5-20251001" if suporte else "claude-sonnet-4-6"),
+            max_tokens=(1200 if suporte else 4000),
+            system=system, messages=msgs[-12:] if suporte else msgs,
+            temperature=0.2, timeout=90.0,
+            **({} if suporte else {"tools": [FERRAMENTA_FICHA]}),
         )
         # A prosa vem em bloco(s) de texto; a ficha vem estruturada pela ferramenta.
         # Nada de json.loads em cima da fala do modelo — era daí que vinha o

@@ -5,6 +5,7 @@ import OrdensCompra from "./OrdensCompra.jsx";
 import Analista from "./Analista.jsx";
 import ChamadosAdmin from "./ChamadosAdmin.jsx";
 import Agentes from "./Agentes.jsx";
+import Suporte from "./Suporte.jsx";
 import { DatasheetBotao, DatasheetLote, DatasheetBaixarTodos } from "./Datasheet.jsx";
 import {
   CONF, brl, btnPrimary, btnGhost, Eyebrow, StateLabel, PageHeader,
@@ -3503,6 +3504,12 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {/* Balão de dúvida: vale em qualquer tela, por isso vive aqui e não dentro
+          de uma página. Usa o conhecimento do Analista para responder "onde fica"
+          e "como faço" sem obrigar o operador a abrir chamado. */}
+      <Suporte token={token} usuario={usuario}
+        onAbrirRequisicoes={() => { setPagina("requisicoes"); setShowDocs(false); }} />
     </div>
   );
 }
