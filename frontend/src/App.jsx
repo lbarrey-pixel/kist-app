@@ -13,6 +13,22 @@ import {
   IconGoogle, IconBell, IconSearch, lerContato } from "./kist-ui.jsx";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+
+// Identidade estável do item (v3.61). O save apaga e recria as linhas da proposta,
+// então o `id` muda a cada auto-save. O `item_uid` nasce aqui, viaja com o item e é
+// por ele que o resultado da pesquisa do Dwight volta para a linha certa.
+function novoUid() {
+  try { if (crypto?.randomUUID) return crypto.randomUUID(); } catch { /* segue */ }
+  const h = "0123456789abcdef";
+  let u = "";
+  for (let i = 0; i < 36; i++) {
+    if ([8, 13, 18, 23].includes(i)) u += "-";
+    else if (i === 14) u += "4";
+    else if (i === 19) u += h[(Math.random() * 4 | 0) + 8];
+    else u += h[Math.random() * 16 | 0];
+  }
+  return u;
+}
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 
 // E-mails autorizados — mesma lista/default do backend (USUARIOS_PERMITIDOS).
@@ -412,7 +428,7 @@ const MARKETPLACES = [
 ];
 
 // ── Linha de item da revisão ───────────────────────────────────────────────
-function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, cnpj, propostaId, onSalvar }) {
+function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, cnpj, propostaId, onSalvar, dwight }) {
   // ── Alerta ────────────────────────────────────────────────────────────
   // ── Termo de busca ────────────────────────────────────────────────────
   // O que os atalhos disparam. Fica VISÍVEL e editável na própria linha: se
@@ -709,6 +725,18 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
       fonte_url: ap.url || "", fonte_nome: ap.fonte || "", apresentacao: ap.apresentacao || "",
     });
     if (net?.perfil) onChange(index, "interpretacao", net.perfil);
+  }
+
+  // "usar esta" da oferta do Dwight: mesmo caminho da ficha da internet — custo e
+  // origem entram, venda fica em branco, descrição do cliente não é tocada.
+  // Custo = preço Pix quando houver (é o que o Dwight usa); senão o preço cheio.
+  // O frete estimado NÃO entra sozinho: é estimativa, o operador decide.
+  function usarOfertaDwight(of) {
+    const preco = of.preco_pix != null ? of.preco_pix : of.preco_cheio;
+    usarFichaInternet({
+      preco_brl: preco, url: of.link || "", fonte: of.loja || "",
+      sku: of.sku || "", apresentacao: of.pn || "",
+    });
   }
 
   // "usar esta" do card do BANCO: carrega TUDO que veio do banco — preço de VENDA,
@@ -1308,6 +1336,75 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
 
               {/* ── INTERNET (direita) ── */}
               <div>
+                {dwight && (
+                  <div className="mb-2 rounded-lg border border-line2 bg-surface p-3">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="eyebrow text-[9px] font-semibold uppercase text-faint">Pesquisa do Dwight</div>
+                      {dwight.telemetria?.tempo_ms != null && (
+                        <span className="font-mono text-[10px] text-faint">
+                          {Math.round(dwight.telemetria.tempo_ms / 1000)}s
+                          {dwight.telemetria.buscas != null && ` · ${dwight.telemetria.buscas} buscas`}
+                          {dwight.telemetria.paginas != null && ` · ${dwight.telemetria.paginas} páginas`}
+                        </span>
+                      )}
+                    </div>
+                    {dwight.status === "aguardando" && (
+                      <div className="mt-1.5 text-[12px] text-sub">Aguardando pesquisa…</div>
+                    )}
+                    {dwight.status === "expirado" && (
+                      <div className="mt-1.5 text-[12px] text-amber">Sem retorno há mais de 3 horas. Dispare de novo se ainda precisar.</div>
+                    )}
+                    {dwight.status === "erro_envio" && (
+                      <div className="mt-1.5 text-[12px] text-rose">Não consegui enviar para o Dwight. Tente de novo.</div>
+                    )}
+                    {dwight.status === "erro" && (
+                      <div className="mt-1.5 text-[12px] text-rose">O Dwight informou erro nesta pesquisa.{dwight.resultado?.obs ? ` ${dwight.resultado.obs}` : ""}</div>
+                    )}
+                    {dwight.status === "nao_encontrado" && (
+                      <div className="mt-1.5 text-[12px] text-amber">O Dwight não encontrou este item.{dwight.resultado?.obs ? ` ${dwight.resultado.obs}` : ""}</div>
+                    )}
+                    {dwight.status === "concluido" && (dwight.resultado?.ofertas || []).length > 0 && (
+                      <div className="mt-2 space-y-1.5">
+                        {dwight.resultado.ofertas.map((of, k) => {
+                          const recomendada = k === (dwight.resultado.escolha || 0);
+                          return (
+                            <div key={k} className="border-t border-line pt-1.5 first:border-t-0 first:pt-0">
+                              <div className="flex items-baseline justify-between gap-2">
+                                <span className="min-w-0 truncate text-[12px] text-ink">
+                                  {of.loja || "—"}
+                                  {recomendada && <span className="ml-1.5 rounded bg-signalbg px-1 py-px text-[9.5px] font-medium text-signal">recomendada</span>}
+                                </span>
+                                <div className="flex flex-shrink-0 items-center gap-2">
+                                  {of.preco_pix != null ? (
+                                    <span className="font-mono text-[13.5px] font-medium text-ink" title="preço Pix">{brl(of.preco_pix)}</span>
+                                  ) : of.preco_cheio != null ? (
+                                    <span className="font-mono text-[13.5px] font-medium text-ink">{brl(of.preco_cheio)}</span>
+                                  ) : (
+                                    <span className="text-[11px] font-medium text-amber">sem preço</span>
+                                  )}
+                                  <button onClick={() => usarOfertaDwight(of)}
+                                    title="Usar esta oferta e preencher custo e origem"
+                                    className="rounded-md border border-line2 px-2 py-0.5 text-[11px] font-medium text-sub hover:border-kist hover:text-kist">
+                                    usar esta
+                                  </button>
+                                </div>
+                              </div>
+                              <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-[10.5px] text-faint">
+                                {of.pn && <span className="font-mono text-sub">{of.fabricante ? `${of.fabricante} ` : ""}{of.pn}</span>}
+                                {of.preco_pix != null && of.preco_cheio != null && <span>cheio <span className="font-mono">{brl(of.preco_cheio)}</span></span>}
+                                {of.estoque && <span>· {of.estoque}</span>}
+                                {of.frete != null && <span>· frete est. <span className="font-mono">{brl(of.frete)}</span></span>}
+                                {of.prazo && <span>· {of.prazo}</span>}
+                                {of.link && <a href={of.link} target="_blank" rel="noreferrer" className="text-kist hover:underline">· ver anúncio</a>}
+                              </div>
+                              {of.obs && <div className="mt-0.5 text-[10.5px] text-sub">{of.obs}</div>}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
                 {netLoad && (
                   <div className="flex h-full items-center rounded-lg border border-line2 bg-surface px-3 py-2.5 text-[12px] text-sub">
                     Buscando preço na internet…
@@ -2143,6 +2240,77 @@ export default function App() {
     finally { setSalvando(false); }
   }
 
+  // ── Pesquisa pelo Dwight (v3.61) ──────────────────────────────────────────
+  // Todo item ganha `item_uid` assim que entra na tela (extração, reabertura,
+  // item novo). O resultado da pesquisa volta por ele.
+  useEffect(() => {
+    const falta = propostas.some((p) => (p?.itens || []).some((it) => it && typeof it === "object" && !it.item_uid));
+    if (!falta) return;
+    setPropostas((prev) => prev.map((p) => ({
+      ...p,
+      itens: (p?.itens || []).map((it) => (it && typeof it === "object" && !it.item_uid) ? { ...it, item_uid: novoUid() } : it),
+    })));
+  }, [propostas]);
+
+  const [pesq, setPesq] = useState({ itens: {}, aguardando: 0 });
+  const [pesqEnviando, setPesqEnviando] = useState(false);
+  const [pesqMsg, setPesqMsg] = useState("");
+  const numeroAtual = String(propostas[propostaIdx]?.proposta || numeroProposta || "").trim();
+
+  async function carregarPesquisa(numero) {
+    if (!numero || !token) return;
+    try {
+      const r = await fetch(`${API}/propostas/${encodeURIComponent(numero)}/pesquisa-resultado`, { headers: authHeaders() });
+      if (!r.ok) { setPesq({ itens: {}, aguardando: 0 }); return; }
+      const d = await r.json();
+      setPesq({ itens: d.itens || {}, aguardando: d.aguardando || 0 });
+    } catch { /* leitura silenciosa: a tela segue sem o card */ }
+  }
+
+  // Carrega ao trocar de proposta; enquanto houver item aguardando, consulta a
+  // cada 20 s (leitura barata, sem IA). Para sozinho quando nada estiver pendente.
+  useEffect(() => {
+    setPesq({ itens: {}, aguardando: 0 });
+    setPesqMsg("");
+    if (step === "resultado" && numeroAtual) carregarPesquisa(numeroAtual);
+  }, [numeroAtual, step]);
+
+  useEffect(() => {
+    if (!(pesq.aguardando > 0) || !numeroAtual) return;
+    const t = setInterval(() => carregarPesquisa(numeroAtual), 20000);
+    return () => clearInterval(t);
+  }, [pesq.aguardando, numeroAtual]);
+
+  async function pesquisarComDwight(forcar = false) {
+    if (!numeroAtual || pesqEnviando) return;
+    setPesqEnviando(true); setPesqMsg("");
+    try {
+      // Grava antes: o backend lê os itens do banco, e é lá que está o item_uid.
+      modificadoRef.current = true;
+      if (autoSaveRef.current) clearTimeout(autoSaveRef.current);
+      await salvarRascunho(true);
+      const r = await fetch(`${API}/propostas/${encodeURIComponent(numeroAtual)}/pesquisa-dwight`, {
+        method: "POST", headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify(forcar ? { forcar: true } : {}),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (r.status === 409 && !forcar) {
+        if (window.confirm(`${d.detail || "Já existe pesquisa em andamento."}\n\nEnviar de novo mesmo assim?`)) {
+          setPesqEnviando(false);
+          return pesquisarComDwight(true);
+        }
+        return;
+      }
+      if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+      setPesqMsg(d.enviados > 0
+        ? `${d.enviados} ${d.enviados === 1 ? "item enviado" : "itens enviados"} ao Dwight. O resultado aparece em cada item.`
+        : (d.motivo || "Nenhum item para pesquisar."));
+      await carregarPesquisa(numeroAtual);
+    } catch (e) {
+      setPesqMsg(`Não consegui enviar (${e.message}).`);
+    } finally { setPesqEnviando(false); }
+  }
+
   async function abrirPropostaExistente(id) {
     setLoading(true); setErro("");
     try {
@@ -2174,6 +2342,7 @@ export default function App() {
         // id da linha e datasheet vinculado: SAO persistidos, e sem trazer de
         // volta o selo morre no reload e o operador regera o mesmo documento.
         id:                   it.id || null,
+        item_uid:             it.item_uid || null,
         // Os dois documentos irmãos. São persistidos; sem trazer de volta,
         // os selos morrem no reload e o operador regera o que já aprovou.
         datasheet_id:         it.datasheet_id || null,
@@ -2854,6 +3023,18 @@ export default function App() {
 
                 <div className="mt-4"><CertaintyStrip itens={prop.itens || []} /></div>
 
+                {/* Pesquisa pelo Dwight: só itens sem match ou com match incerto */}
+                <div className="mt-3 flex flex-wrap items-center gap-2 text-[12px]">
+                  <button onClick={() => pesquisarComDwight(false)} disabled={pesqEnviando || !numeroAtual}
+                    className="rounded-lg border border-line2 bg-surface px-3 py-1.5 font-medium text-kist hover:border-kist disabled:opacity-50">
+                    {pesqEnviando ? "Enviando…" : "🔎 pesquisar com o Dwight"}
+                  </button>
+                  {pesq.aguardando > 0 && (
+                    <span className="text-sub">{pesq.aguardando} {pesq.aguardando === 1 ? "item aguardando" : "itens aguardando"} pesquisa</span>
+                  )}
+                  {pesqMsg && <span className="text-faint">{pesqMsg}</span>}
+                </div>
+
                 {/* Dados da proposta para o Tiny — preenchidos aqui, exportados no CSV */}
                 <div className="mt-4 rounded-xl border border-line bg-surface p-4">
                   <div className="eyebrow text-[10px] font-bold uppercase text-faint">Dados da proposta (Tiny)</div>
@@ -2925,7 +3106,8 @@ export default function App() {
                     </thead>
                     <tbody>
                       {(prop.itens || []).map((item, i) => (
-                        <ItemRow key={i} item={item} index={i} onChange={atualizarItem} onRemove={removerItem} token={token} apiUrl={API} fonteTexto={prop.fonte_texto} cnpj={prop.cnpj} propostaId={propostaId} onSalvar={salvarRascunho} />
+                        <ItemRow key={i} item={item} index={i} onChange={atualizarItem} onRemove={removerItem} token={token} apiUrl={API} fonteTexto={prop.fonte_texto} cnpj={prop.cnpj} propostaId={propostaId} onSalvar={salvarRascunho}
+                          dwight={item?.item_uid ? pesq.itens[String(item.item_uid).toLowerCase()] : null} />
                       ))}
                     </tbody>
                   </table>

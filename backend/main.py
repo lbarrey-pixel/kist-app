@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.60"
+VERSAO_BACKEND = "3.61"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -107,8 +107,9 @@ API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webh
   com o e-mail dele, e o custo de IA some no consumo dele.
 
 **Escopos da chave:** `leitura` (só GET) · `escrita` (GET + POST/PUT/PATCH) ·
-`admin` (tudo, inclusive DELETE e rotinas de lote). Chave sem escopo suficiente
-recebe **403** com a explicação, sem executar nada.
+`admin` (tudo, inclusive DELETE e rotinas de lote) · `pesquisa` (só devolve
+resultado de pesquisa: `POST /propostas/{numero}/pesquisa-resultado`). Chave sem
+escopo suficiente recebe **403** com a explicação, sem executar nada.
 
 Confira sua credencial em `GET /api/whoami`.
 """.strip()
@@ -317,7 +318,15 @@ async def _guarda_escopo_api(request: Request, call_next):
         _logar(403, bloqueado=True, motivo=motivo)
         return _nega_escopo(motivo)
 
-    if escopo != "admin":
+    # Escopo `pesquisa`: lista fechada de rotas, antes de qualquer outra regra.
+    if escopo == "pesquisa":
+        if not _rota_permitida_pesquisa(metodo, request.url.path):
+            motivo = ("Chave de escopo 'pesquisa' só pode chamar "
+                      "POST /propostas/{numero}/pesquisa-resultado e GET /api/whoami.")
+            _logar(403, bloqueado=True, motivo=motivo)
+            return _nega_escopo(motivo)
+
+    elif escopo != "admin":
         if rota_norm in _rotas_admin() or metodo == "DELETE":
             motivo = f"Esta rota exige escopo 'admin'. Sua chave tem '{escopo}'."
             _logar(403, bloqueado=True, motivo=motivo)
@@ -368,7 +377,18 @@ _token_cache: dict = {}
 # match_memoria; uma identidade "api@kist" criaria um operador fantasma no
 # aprendizado e quebraria a rastreabilidade que custou a v3.20 para existir.
 API_KEY_PREFIXO = "kist_sk_"
-_API_ESCOPOS = ("leitura", "escrita", "admin")
+_API_ESCOPOS = ("leitura", "escrita", "admin", "pesquisa")
+
+# Escopo `pesquisa` (v3.61): chave de um agente que SÓ devolve resultado de
+# pesquisa de preço. Não lê proposta, não salva, não exporta. Se vazar, o pior
+# que ela faz é escrever uma sugestão que o operador ainda precisa aceitar.
+_ROTAS_ESCOPO_PESQUISA = (
+    ("POST", re.compile(r"^/propostas/[^/]+/pesquisa-resultado/?$")),
+    ("GET",  re.compile(r"^/api/whoami/?$")),
+)
+
+def _rota_permitida_pesquisa(metodo: str, caminho: str) -> bool:
+    return any(metodo == m and rx.match(caminho or "") for m, rx in _ROTAS_ESCOPO_PESQUISA)
 _api_key_cache: dict = {}          # sha256 -> (email, escopo, expira_em_epoch)
 _API_KEY_TTL = 300                 # 5 min: revogação por SQL vale no próximo ciclo
 
@@ -2519,7 +2539,9 @@ def whoami(request: Request, usuario: str = Depends(verificar_token)):
         credencial = "api_key"
         metodos = {"leitura": ["GET"],
                    "escrita": ["GET", "POST", "PUT", "PATCH"],
-                   "admin":   ["GET", "POST", "PUT", "PATCH", "DELETE"]}.get(escopo, ["GET"])
+                   "admin":   ["GET", "POST", "PUT", "PATCH", "DELETE"],
+                   "pesquisa": ["POST /propostas/{numero}/pesquisa-resultado",
+                                "GET /api/whoami"]}.get(escopo, ["GET"])
     else:
         escopo, credencial = "sem_restricao", "google_oauth"
         metodos = ["GET", "POST", "PUT", "PATCH", "DELETE"]
@@ -4854,6 +4876,14 @@ def _snapshot_match(i):
     return out
 
 
+_UUID_RX = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+def _uid_item(i):
+    """{'item_uid': uid} quando o item traz um UUID válido; senão {} (o banco gera)."""
+    u = str(i.get("item_uid") or "").strip()
+    return {"item_uid": u.lower()} if _UUID_RX.match(u) else {}
+
+
 @app.post("/salvar-proposta")
 async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)):
     """Upsert de proposta e itens. status: 'rascunho' | 'confirmada'.
@@ -4940,6 +4970,11 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
             #   identico    -> match token a token x apenas semântico.
             # Foto do dia: quem lê, lê como está. Item sem match continua sem match.
             **_snapshot_match(i),
+            # Identidade estável do item (v3.61). O save apaga e recria as linhas,
+            # então o `id` muda a cada auto-save; o `item_uid` viaja com o item e é
+            # a âncora do resultado de pesquisa que volta horas depois. Sem uid no
+            # payload, o banco gera um novo (default da coluna).
+            **_uid_item(i),
         } for i in itens]
         sb.table("itens_proposta").insert(rows).execute()
 
@@ -4995,6 +5030,336 @@ async def detalhe_proposta(proposta_id: str, usuario: str = Depends(verificar_to
     prop = _resolver_proposta(sb, proposta_id)
     itens = sb.table("itens_proposta").select("*").eq("proposta_id", prop["id"]).execute()
     return {"proposta": prop, "itens": itens.data or []}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PESQUISA PELO DWIGHT (v3.61) — a Cabine terceiriza a busca de preço a um agente
+# ══════════════════════════════════════════════════════════════════════════════
+# Contrato (alinhado com o Dwight copy em 17/09):
+#   1. O operador clica "pesquisar com o Dwight". A Cabine manda, num POST ao
+#      webhook do agente, só os itens SEM match ou com match INCERTO — a mesma
+#      regra que decide a busca na internet na tela.
+#   2. O agente pesquisa e devolve em POST /propostas/{numero}/pesquisa-resultado,
+#      item a item, pelo `item_uid`. Ele NUNCA chama /salvar-proposta (que apaga e
+#      recria os itens) e NUNCA exporta para o Tiny.
+#   3. O resultado fica em `pesquisa_resultados` e aparece na gaveta da internet
+#      com "usar esta". Quem decide continua sendo o operador.
+#
+# Envio assíncrono: a requisição do operador volta na hora. Uma chamada lenta ao
+# webhook não pode segurar o worker — foi assim que o backend congelou em julho.
+
+DWIGHT_WEBHOOK_URL = os.environ.get("DWIGHT_WEBHOOK_URL", "")
+DWIGHT_WEBHOOK_KEY = os.environ.get("DWIGHT_WEBHOOK_KEY", "")
+CABINE_PUBLIC_URL  = os.environ.get("CABINE_PUBLIC_URL", "https://kist-backend.onrender.com").rstrip("/")
+
+_PESQ_STATUS_ENTRADA = {
+    "ok": "concluido", "concluido": "concluido", "encontrado": "concluido",
+    "nao_encontrado": "nao_encontrado", "não_encontrado": "nao_encontrado",
+    "sem_resultado": "nao_encontrado", "erro": "erro",
+}
+_PESQ_JANELA_DUPLICADO_S = 60 * 60      # disparo repetido dentro de 1h pede confirmação
+_PESQ_EXPIRA_S = 3 * 60 * 60            # "aguardando" há mais de 3h vira "expirado" na tela
+_PESQ_MAX_OFERTAS = 10
+
+
+def _item_elegivel_pesquisa(it: dict) -> bool:
+    """Espelho de `semMatchUtil` do App.jsx, só com campos PERSISTIDOS.
+
+    Busca só item sem preço e sem match confiável. Match confiável = confiança
+    'alta' + não marcado como apenas semântico + com lastro + veredito que não seja
+    'diferente'/'inconclusivo'.
+    """
+    if _num_br(it.get("preco_venda")) > 0:
+        return False
+    ficha = it.get("banco_ficha") if isinstance(it.get("banco_ficha"), dict) else {}
+    confiavel = ((it.get("confianca_match") or "nenhuma") == "alta"
+                 and it.get("identico") is not False
+                 and not ficha.get("sem_lastro")
+                 and ficha.get("veredito") not in ("diferente", "inconclusivo"))
+    return not confiavel
+
+
+def _txt(v, teto: int) -> str:
+    return str(v if v is not None else "").strip()[:teto]
+
+
+def _preco_opcional(v):
+    if v in (None, ""):
+        return None
+    n = _num_br(v)
+    return round(n, 2) if n > 0 else None
+
+
+def _link_seguro(v) -> str:
+    u = _txt(v, 1000)
+    return u if re.match(r"^https?://", u, re.I) else ""
+
+
+def _norm_oferta(o: dict) -> dict:
+    """Oferta como o agente mandar -> formato fixo que a tela lê."""
+    if not isinstance(o, dict):
+        return {}
+    of = {
+        "loja":        _txt(o.get("loja") or o.get("fornecedor") or o.get("fonte"), 120),
+        "link":        _link_seguro(o.get("link") or o.get("url")),
+        "preco_pix":   _preco_opcional(o.get("preco_pix") if o.get("preco_pix") is not None else o.get("pix")),
+        "preco_cheio": _preco_opcional(o.get("preco_cheio") if o.get("preco_cheio") is not None
+                                       else (o.get("cheio") if o.get("cheio") is not None else o.get("preco"))),
+        "estoque":     _txt(o.get("estoque"), 120),
+        "pn":          _txt(o.get("pn") or o.get("pn_ofertado") or o.get("modelo"), 120),
+        "fabricante":  _txt(o.get("fabricante") or o.get("marca"), 120),
+        "sku":         _txt(o.get("sku"), 120),
+        "frete":       _preco_opcional(o.get("frete") if o.get("frete") is not None else o.get("frete_estimado")),
+        "prazo":       _txt(o.get("prazo"), 120),
+        "obs":         _txt(o.get("obs"), 500),
+    }
+    # Oferta sem loja, sem link e sem preço não é oferta.
+    if not (of["loja"] or of["link"] or of["preco_pix"] or of["preco_cheio"]):
+        return {}
+    return of
+
+
+def _norm_telemetria(t) -> dict:
+    t = t if isinstance(t, dict) else {}
+    out = {}
+    for k in ("tempo_ms", "buscas", "paginas"):
+        try:
+            if t.get(k) not in (None, ""):
+                out[k] = int(float(str(t.get(k)).replace(",", ".")))
+        except (TypeError, ValueError):
+            pass
+    if t.get("modelo"):
+        out["modelo"] = _txt(t.get("modelo"), 60)
+    return out
+
+
+def _uids_da_proposta(sb, proposta_id: int) -> dict:
+    """{item_uid: linha} dos itens ATUAIS da proposta."""
+    r = (sb.table("itens_proposta")
+           .select("id,item_uid,descricao_original,descricao_final,specs_complementares,"
+                   "quantidade,unidade,preco_venda,confianca_match,identico,banco_ficha,"
+                   "codigo_cliente")
+           .eq("proposta_id", proposta_id).order("id").execute())
+    return {str(l["item_uid"]).lower(): l for l in (r.data or []) if l.get("item_uid")}
+
+
+def _despachar_webhook_dwight(payload: dict, external_key: str) -> None:
+    """Roda em thread. Registra o HTTP de volta; falha vira 'erro_envio'."""
+    status_http, erro = 0, ""
+    try:
+        resp = requests.post(
+            DWIGHT_WEBHOOK_URL, json=payload, timeout=20,
+            headers={"Authorization": f"Bearer {DWIGHT_WEBHOOK_KEY}",
+                     "Content-Type": "application/json"})
+        status_http = resp.status_code
+        if not (200 <= status_http < 300):
+            erro = (resp.text or "")[:300]
+    except Exception as e:
+        erro = f"{type(e).__name__}: {e}"[:300]
+    try:
+        # Conexão própria: o que roda em thread não divide socket com a operação.
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+        upd = {"despacho_http": status_http or None}
+        if erro:
+            upd["despacho_erro"] = erro
+            upd["status"] = "erro_envio"
+        (sb.table("pesquisa_resultados").update(upd)
+           .eq("external_key", external_key).eq("status", "aguardando").execute())
+    except Exception:
+        pass
+
+
+@app.post("/propostas/{ref}/pesquisa-dwight")
+async def pesquisa_dwight_disparar(ref: str, request: Request,
+                                   usuario: str = Depends(verificar_token)):
+    """Dispara a pesquisa de preço no Dwight para os itens sem match útil.
+
+    Só pela tela: agente não dispara agente. Corpo opcional:
+    `{"item_uids": [...]}` restringe a esses itens; `{"forcar": true}` ignora a
+    trava de disparo repetido.
+    """
+    esc, _, _ = _credencial_do_request(request.headers.get("authorization") or "")
+    if esc is not None:
+        raise HTTPException(403, "O disparo da pesquisa é feito pela tela, não por chave de API.")
+    if not (DWIGHT_WEBHOOK_URL and DWIGHT_WEBHOOK_KEY):
+        raise HTTPException(503, "Pesquisa pelo Dwight não configurada "
+                                 "(DWIGHT_WEBHOOK_URL / DWIGHT_WEBHOOK_KEY no Render).")
+    try:
+        corpo = await request.json()
+        corpo = corpo if isinstance(corpo, dict) else {}
+    except Exception:
+        corpo = {}
+
+    sb = get_supabase()
+    prop = _resolver_proposta(sb, ref)
+    numero = str(prop.get("numero_proposta") or "")
+    itens = _uids_da_proposta(sb, prop["id"])
+    filtro = {str(u).lower() for u in (corpo.get("item_uids") or []) if u}
+    alvo = [(u, it) for u, it in itens.items()
+            if (u in filtro if filtro else _item_elegivel_pesquisa(it))]
+    if not alvo:
+        return {"external_key": None, "enviados": 0, "itens": [],
+                "motivo": "Nenhum item sem match ou com match incerto nesta proposta."}
+
+    if not corpo.get("forcar"):
+        desde = (_dt_ext.utcnow() - _td_ext(seconds=_PESQ_JANELA_DUPLICADO_S)).isoformat()
+        pend = (sb.table("pesquisa_resultados").select("id")
+                  .eq("proposta_id", prop["id"]).eq("status", "aguardando")
+                  .gte("criado_em", desde).limit(1).execute())
+        if pend.data:
+            raise HTTPException(409, "Já existe pesquisa em andamento para esta proposta. "
+                                     "Aguarde o retorno ou confirme um novo envio.")
+
+    external_key = f"cabine-{numero or prop['id']}-{int(time.time())}"
+    linhas = [{
+        "proposta_id": prop["id"], "numero_proposta": numero, "item_uid": u,
+        "external_key": external_key, "origem": "dwight", "status": "aguardando",
+        "descricao": _txt(it.get("descricao_original") or it.get("descricao_final"), 500),
+        "solicitado_por": usuario,
+    } for u, it in alvo]
+    sb.table("pesquisa_resultados").insert(linhas).execute()
+
+    payload = {
+        "source": "cabine",
+        "action": "pesquisa",
+        "external_key": external_key,
+        "cotacao_id": numero,
+        "cliente": {"nome": prop.get("cliente") or "", "cnpj": prop.get("cnpj") or ""},
+        "itens": [{
+            "item_id": u,
+            "sku": _txt(it.get("codigo_cliente"), 120),
+            "descricao": it.get("descricao_original") or it.get("descricao_final") or "",
+            "marca": "",
+            "modelo": "",
+            "qty": _num_br(it.get("quantidade"), 1),
+            "unidade": it.get("unidade") or "UN",
+            "obs": _txt(it.get("specs_complementares"), 1500),
+        } for u, it in alvo],
+        "retorno": {"metodo": "POST",
+                    "url": f"{CABINE_PUBLIC_URL}/propostas/{numero or prop['id']}/pesquisa-resultado"},
+        "dry_run": False,
+    }
+    _threading.Thread(target=_despachar_webhook_dwight, args=(payload, external_key),
+                      daemon=True).start()
+    return {"external_key": external_key, "enviados": len(alvo), "itens": [u for u, _ in alvo]}
+
+
+@app.post("/propostas/{ref}/pesquisa-resultado")
+async def pesquisa_resultado_receber(ref: str, payload: dict,
+                                     usuario: str = Depends(verificar_token)):
+    """Retorno do agente, item a item. Não toca em `itens_proposta`.
+
+    Formato:
+    {"external_key": "...", "resultados": [
+       {"item_id": "<item_uid>", "status": "ok|nao_encontrado|erro",
+        "ofertas": [{"loja","link","preco_pix","preco_cheio","estoque","pn",
+                     "fabricante","sku","frete","prazo","obs"}],
+        "escolha": 0,
+        "telemetria": {"tempo_ms", "buscas", "paginas"}}]}
+    A primeira oferta (ou a indicada em `escolha`) é a recomendada.
+    Um item só, sem lista `ofertas`, também é aceito (campos no próprio item).
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(422, "Corpo precisa ser um objeto JSON.")
+    sb = get_supabase()
+    prop = _resolver_proposta(sb, ref)
+    atuais = _uids_da_proposta(sb, prop["id"])
+
+    resultados = payload.get("resultados")
+    if resultados is None:
+        resultados = payload.get("itens")
+    if resultados is None and (payload.get("item_id") or payload.get("item_uid")):
+        resultados = [payload]
+    if not isinstance(resultados, list) or not resultados:
+        raise HTTPException(422, "Envie 'resultados': lista com um objeto por item.")
+
+    recebidos, ignorados = 0, []
+    agora = _dt_ext.utcnow().isoformat()
+    for r in resultados[:200]:
+        if not isinstance(r, dict):
+            ignorados.append({"item_id": None, "motivo": "resultado não é objeto"})
+            continue
+        uid = str(r.get("item_id") or r.get("item_uid") or "").strip().lower()
+        if not _UUID_RX.match(uid) or uid not in atuais:
+            ignorados.append({"item_id": uid or None,
+                              "motivo": "item_id não pertence a esta proposta (ou foi removido)"})
+            continue
+
+        brutas = r.get("ofertas")
+        if not isinstance(brutas, list):
+            brutas = [r]
+        ofertas = [o for o in (_norm_oferta(x) for x in brutas[:_PESQ_MAX_OFERTAS]) if o]
+        try:
+            escolha = int(r.get("escolha") or 0)
+        except (TypeError, ValueError):
+            escolha = 0
+        if not (0 <= escolha < len(ofertas)):
+            escolha = 0
+
+        status = _PESQ_STATUS_ENTRADA.get(str(r.get("status") or "").strip().lower())
+        if status is None:
+            status = "concluido" if ofertas else "nao_encontrado"
+        if status == "concluido" and not ofertas:
+            status = "nao_encontrado"
+
+        ekey = _txt(r.get("external_key") or payload.get("external_key"), 120)
+        dados = {
+            "status": status,
+            "resultado": {"ofertas": ofertas, "escolha": escolha,
+                          "obs": _txt(r.get("obs"), 500)},
+            "telemetria": _norm_telemetria(r.get("telemetria") or payload.get("telemetria")),
+            "respondido_por": usuario,
+            "respondido_em": agora,
+        }
+
+        q = (sb.table("pesquisa_resultados").select("id,external_key")
+               .eq("proposta_id", prop["id"]).eq("item_uid", uid)
+               .eq("status", "aguardando").order("criado_em", desc=True).limit(20).execute())
+        pend = q.data or []
+        alvo = next((x for x in pend if ekey and x.get("external_key") == ekey), None) or \
+               (pend[0] if pend else None)
+        if alvo:
+            sb.table("pesquisa_resultados").update(dados).eq("id", alvo["id"]).execute()
+        else:
+            it = atuais[uid]
+            sb.table("pesquisa_resultados").insert({
+                **dados,
+                "proposta_id": prop["id"],
+                "numero_proposta": str(prop.get("numero_proposta") or ""),
+                "item_uid": uid, "external_key": ekey or None, "origem": "dwight",
+                "descricao": _txt(it.get("descricao_original") or it.get("descricao_final"), 500),
+            }).execute()
+        recebidos += 1
+
+    return {"recebidos": recebidos, "ignorados": ignorados}
+
+
+@app.get("/propostas/{ref}/pesquisa-resultado")
+async def pesquisa_resultado_listar(ref: str, usuario: str = Depends(verificar_token)):
+    """Último resultado por item (o mais recente vence). Leitura barata, sem IA."""
+    sb = get_supabase()
+    prop = _resolver_proposta(sb, ref)
+    r = (sb.table("pesquisa_resultados")
+           .select("item_uid,status,resultado,telemetria,external_key,criado_em,"
+                   "respondido_em,despacho_erro")
+           .eq("proposta_id", prop["id"]).order("criado_em", desc=True).limit(500).execute())
+    limite = _dt_ext.utcnow() - _td_ext(seconds=_PESQ_EXPIRA_S)
+    itens, aguardando = {}, 0
+    for l in (r.data or []):
+        u = str(l.get("item_uid") or "").lower()
+        if not u or u in itens:
+            continue
+        if l.get("status") == "aguardando":
+            try:
+                criado = _dt_ext.fromisoformat(str(l.get("criado_em")).replace("Z", "+00:00"))
+                if criado.replace(tzinfo=None) < limite:
+                    l["status"] = "expirado"
+            except Exception:
+                pass
+        if l.get("status") == "aguardando":
+            aguardando += 1
+        itens[u] = l
+    return {"itens": itens, "aguardando": aguardando}
 
 
 @app.get("/propostas")
