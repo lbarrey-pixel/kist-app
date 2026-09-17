@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.61"
+VERSAO_BACKEND = "3.62"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -3806,6 +3806,19 @@ async def extrair_email(
         # mesma chamada + parsing; cache em uma só cobriria metade dos casos.
         return await _chamar_com_content(msg_content)
 
+    def _erro_de_imagem(e) -> bool:
+        """400 da API por causa de imagem (corrompida, formato, tamanho)."""
+        m = str(e).lower()
+        return "image" in m and ("400" in m or "invalid_request" in m)
+
+    def _content_sem_imagens(content):
+        """O mesmo pedido sem as imagens e sem os rótulos delas."""
+        fora = ("[IMAGEM ", "Seguem as ")
+        return [c for c in (content or [])
+                if not (isinstance(c, dict) and (
+                    c.get("type") == "image"
+                    or (c.get("type") == "text" and str(c.get("text", "")).startswith(fora))))]
+
     async def _chamar_com_content(msg_content):
         """Rota ÚNICA da leitura pela IA — com cache de conteúdo.
 
@@ -3836,11 +3849,34 @@ async def extrair_email(
                 })
                 return _props_cache
 
-        resp = claude.messages.create(
-            model=modelo_extracao, max_tokens=16000,
-            system=SYSTEM_EXTRACAO,
-            messages=[{"role": "user", "content": msg_content}],
-        )
+        _gravar_cache = True
+        try:
+            resp = claude.messages.create(
+                model=modelo_extracao, max_tokens=16000,
+                system=SYSTEM_EXTRACAO,
+                messages=[{"role": "user", "content": msg_content}],
+            )
+        except Exception as _e_img:
+            # Rede de segurança (17/09, caso Convergint): se mesmo depois do
+            # saneamento a API recusar uma imagem, lê só o texto em vez de
+            # derrubar a cotação — e avisa, porque item em imagem pode faltar.
+            _sem_img = _content_sem_imagens(msg_content)
+            if not _erro_de_imagem(_e_img) or not _sem_img or len(_sem_img) == len(msg_content):
+                raise
+            avisos_extracao.append({
+                "tipo": "busca_falhou", "etapa": "extracao_imagem",
+                "assinatura": "extracao:imagem_recusada",
+                "mensagem": ("A IA recusou as imagens deste e-mail, então li só o texto. "
+                             "Se algum item estava em imagem (print de tabela), ele NÃO "
+                             "entrou — confira contra o e-mail."),
+                "detalhe": f"{type(_e_img).__name__}: {_e_img}"[:400],
+            })
+            _gravar_cache = False   # leitura parcial não vira cache
+            resp = claude.messages.create(
+                model=modelo_extracao, max_tokens=16000,
+                system=SYSTEM_EXTRACAO,
+                messages=[{"role": "user", "content": _sem_img}],
+            )
         if getattr(resp, "stop_reason", "") == "max_tokens":
             avisos_extracao.append({
                 "tipo": "busca_falhou", "etapa": "extracao_truncada",
@@ -3867,7 +3903,8 @@ async def extrair_email(
             _props_ok = parsed.get("propostas", [])
             # Só leitura BEM-SUCEDIDA entra no cache. Se guardássemos a falha, o
             # "tente de novo" do aviso devolveria a mesma falha por 8 horas.
-            _cache_extracao_gravar(_sb_cache, _hsh, _props_ok, modelo_extracao, usuario)
+            if _gravar_cache:
+                _cache_extracao_gravar(_sb_cache, _hsh, _props_ok, modelo_extracao, usuario)
             return _props_ok
         except Exception as e:
             avisos_extracao.append({
@@ -3891,6 +3928,22 @@ async def extrair_email(
         # e para decidir isso ele precisa ver o pedido inteiro de uma vez.
         _content, _rel_ing = _ing_montar_payload(documentos, texto_extra=(texto or ""))
         propostas_raw.extend(await _chamar_com_content(_content))
+        if _rel_ing.get("imagens_recuperadas"):
+            notas_extracao.append({
+                "tipo": "imagem_recuperada", "arquivo": "",
+                "mensagem": (f"{_rel_ing['imagens_recuperadas']} imagem(ns) veio(vieram) "
+                             f"corrompida(s) no e-mail. Li a parte que abriu; se faltar "
+                             f"item que estava em imagem, confira no e-mail."),
+                "exclusivos": [],
+            })
+        if _rel_ing.get("imagens_ilegiveis"):
+            notas_extracao.append({
+                "tipo": "imagem_ilegivel", "arquivo": "",
+                "mensagem": (f"{_rel_ing['imagens_ilegiveis']} imagem(ns) do e-mail não "
+                             f"abriu(abriram) e ficou(ficaram) de fora. Se havia item "
+                             f"nela(s), confira no e-mail."),
+                "exclusivos": [],
+            })
         if _rel_ing.get("imagens_cortadas"):
             notas_extracao.append({
                 "tipo": "imagens_cortadas", "arquivo": "",

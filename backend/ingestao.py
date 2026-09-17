@@ -57,6 +57,9 @@ IMG_MIN_ALTURA = 12
 IMG_MIN_LARGURA = 40
 IMG_MIN_AREA = 1500
 TEXTO_MAX_CHARS = 120000    # o corpo NUNCA é cortado antes disto
+IMG_MAX_LADO_API = 7900     # a API recusa imagem com lado maior que 8000 px
+IMG_MAX_BYTES_API = 3_700_000   # 5 MB por imagem depois do base64 (que infla 4/3)
+IMG_LADO_REDUZIDO = 2000    # a API já reduz tudo para ~1568 px; nada se perde
 
 
 def img_dimensao(b: bytes) -> tuple:
@@ -123,6 +126,79 @@ def img_descartavel(b: bytes) -> bool:
     if not w or not h:
         return False
     return h < IMG_MIN_ALTURA or w < IMG_MIN_LARGURA or (w * h) < IMG_MIN_AREA
+
+
+# ── Saneamento (17/09/2026) ───────────────────────────────────────────────
+# Caso Convergint (Anelise, 17/09): o Outlook entregou uma das três imagens da
+# assinatura TRUNCADA — o PNG declara 60.937 bytes de dados e o arquivo tem
+# 41.337. A API recusa a requisição INTEIRA ("Could not process image"), e uma
+# imagem de assinatura derrubava a leitura de 14 itens que estavam no texto.
+# Regra: imagem ruim nunca derruba a cotação. Recupera o que der, avisa o
+# operador; se não der, deixa de fora e avisa.
+import threading as _threading_img
+_TRUNCADA_LOCK = _threading_img.Lock()
+
+
+def img_sanear(b: bytes):
+    """(bytes, estado) com estado em 'ok' | 'recuperada' | 'convertida' | 'ilegivel'.
+
+    'ok'         → bytes originais, a API aceita como estão.
+    'recuperada' → arquivo corrompido; o trecho legível foi regravado em PNG.
+    'convertida' → formato que a API não aceita (BMP, TIFF…) ou grande demais;
+                   regravado em PNG/JPEG.
+    'ilegivel'   → nem Pillow abre; bytes = None.
+    Sem Pillow instalado, devolve como veio (comportamento anterior).
+    """
+    if not b:
+        return None, "ilegivel"
+    try:
+        from PIL import Image, ImageFile
+    except Exception:
+        return b, "ok"
+
+    estado = "ok"
+    try:
+        im = Image.open(io.BytesIO(b))
+        im.load()
+    except Exception:
+        # Carrega o que houver. A flag do Pillow é global; o lock evita que duas
+        # leituras simultâneas desliguem a flag uma da outra no meio.
+        try:
+            with _TRUNCADA_LOCK:
+                antes = ImageFile.LOAD_TRUNCATED_IMAGES
+                ImageFile.LOAD_TRUNCATED_IMAGES = True
+                try:
+                    im = Image.open(io.BytesIO(b))
+                    im.load()
+                finally:
+                    ImageFile.LOAD_TRUNCATED_IMAGES = antes
+            estado = "recuperada"
+        except Exception:
+            return None, "ilegivel"
+
+    formato = (im.format or "").upper()
+    w, h = im.size
+    grande = max(w, h) > IMG_MAX_LADO_API or len(b) > IMG_MAX_BYTES_API
+    if estado == "ok" and formato in ("PNG", "JPEG", "GIF", "WEBP") and not grande:
+        return b, "ok"
+    if estado == "ok":
+        estado = "convertida"
+
+    try:
+        if grande:
+            im.thumbnail((IMG_LADO_REDUZIDO, IMG_LADO_REDUZIDO))
+        if im.mode not in ("RGB", "RGBA", "L", "LA", "P"):
+            im = im.convert("RGB")
+        buf = io.BytesIO()
+        im.save(buf, format="PNG", optimize=True)
+        out = buf.getvalue()
+        if len(out) > IMG_MAX_BYTES_API:
+            buf = io.BytesIO()
+            im.convert("RGB").save(buf, format="JPEG", quality=85)
+            out = buf.getvalue()
+        return out, estado
+    except Exception:
+        return None, "ilegivel"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -734,6 +810,25 @@ def montar_payload(documentos, texto_extra="", max_imgs=IMG_MAX_N,
     # então "corpo antes do rodapé" é falso. O orçamento é folgado o bastante
     # para a pergunta não precisar de resposta: pior e-mail do corpus custa
     # 3.815 tokens.
+    # Saneamento ANTES de tudo: imagem que a API recusaria derruba a chamada
+    # inteira. Recuperada entra marcada; ilegível sai, e o operador é avisado.
+    recuperadas, convertidas, ilegiveis = 0, 0, 0
+    aproveitaveis = []
+    for doc, b in imagens:
+        novo, estado = img_sanear(b.dados)
+        if estado == "ilegivel":
+            ilegiveis += 1
+            continue
+        if novo is not b.dados:
+            b.dados = novo
+        if b.meta is None:
+            b.meta = {}
+        b.meta["estado"] = estado
+        recuperadas += estado == "recuperada"
+        convertidas += estado == "convertida"
+        aproveitaveis.append((doc, b))
+    imagens = aproveitaveis
+
     sel, gasto, cortadas, vistos = [], 0, 0, set()
     prioridade = sorted(imagens, key=lambda t: (t[1].citado, ))  # não-citado antes
     for doc, b in prioridade:
@@ -761,6 +856,9 @@ def montar_payload(documentos, texto_extra="", max_imgs=IMG_MAX_N,
             rot += f" — do documento: {doc.origem[:90]}"
         if b.citado:
             rot += " — está dentro de um trecho de resposta citado"
+        if (b.meta or {}).get("estado") == "recuperada":
+            rot += (" — o arquivo veio corrompido no e-mail; só parte da imagem "
+                    "pôde ser lida, e o que falta aparece em branco ou preto")
         rot += "]"
         content.append({"type": "text", "text": rot})
         content.append({"type": "image", "source": {
@@ -774,6 +872,9 @@ def montar_payload(documentos, texto_extra="", max_imgs=IMG_MAX_N,
         "imagens_cortadas": cortadas,
         "tokens_imagem": gasto,
         "duplicadas_descartadas": len(imagens) - len(vistos),
+        "imagens_recuperadas": recuperadas,
+        "imagens_convertidas": convertidas,
+        "imagens_ilegiveis": ilegiveis,
     }
     return content, relatorio
 
