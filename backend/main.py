@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.65"
+VERSAO_BACKEND = "3.66"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -3141,23 +3141,39 @@ def _fazer_matching(itens_raw: list, claude, sb, cliente: str = "",
                 _banco_por_desc[k] = c
     todos_candidatos = list(_banco_por_desc.values())
 
-    # ── [3] HAIKU ────────────────────────────────────────────────────────
+    # ── [3] HAIKU, EM LOTES (v3.66) ────────────────────────────────────────
+    # HISTÓRICO (17/09, NEG 0043770 — 41 itens): a versão anterior mandava TODOS
+    # os itens pendentes numa chamada só, com até 40 candidatos cada. Prompt de
+    # 42 mil tokens de entrada, uma resposta bateu o teto de 6000 tokens de saída
+    # (truncada — JSON quebrado) e outra chamada, sozinha, ficou 136s tentando
+    # (3 tentativas de 45s do próprio cliente) até estourar em timeout. Cada uma
+    # dessas falhas derrubava o matching de TODOS os 41 itens de uma vez — a
+    # proposta inteira saía sem preço, e o operador via "limite de tempo" sem
+    # saber que era isto.
+    # Em LOTES de poucos itens: cada chamada é pequena e rápida (medido: um lote
+    # de 5-8 itens leva de 3 a 14s). Lote que falhar vira aviso E só os itens
+    # DAQUELE lote ficam sem match — os outros lotes seguem intactos. É a mesma
+    # regra dos avisos: falha do sistema fica visível, mas não apaga o resto.
+    _LOTE_MATCHING = 8
     matches = {}
     itens_ia = [i for i in pendentes if candidatos_por_item[i]]
-    if itens_ia:
+    for _ini in range(0, len(itens_ia), _LOTE_MATCHING):
+        lote = itens_ia[_ini:_ini + _LOTE_MATCHING]
+        if not lote:
+            continue
         # As specs_complementares vão JUNTO. Elas estavam sendo descartadas — e é
         # nelas que a divergência mora (69% dos itens têm specs preenchidas). O
         # matcher casava "suporte 60cm" com "suporte 60cm" e dava alta, sem ver que
         # o cliente pedia haste 600x50x50 e o nosso é base parede/teto. Vendeu,
         # comprou, entregou, voltou em RMA.
         itens_txt = ""
-        for i in itens_ia:
+        for i in lote:
             itens_txt += f"\nItem {i}\n  DESCRIÇÃO: {descricoes[i]}"
             _sp = (itens_raw[i].get("specs_complementares") or "").strip()
             itens_txt += f"\n  SPECS: {_sp}\n" if _sp else "\n  SPECS: (o cliente não informou)\n"
 
         candidatos_txt = ""
-        for i in itens_ia:
+        for i in lote:
             candidatos_txt += f"\n\n--- Candidatos para Item {i} ({descricoes[i][:60]}) ---\n"
             for j, c in enumerate(candidatos_por_item[i][:40]):
                 candidatos_txt += f"  [{j}] {c.get('descricao','')} | R$ {c.get('preco_un',0)} | ref {c.get('proposta_tiny','')}\n"
@@ -3172,7 +3188,7 @@ diferente = null; spec divergente = não é o mesmo item, mesmo que a descriçã
 
         try:
             resp_match = claude.messages.create(
-                model="claude-haiku-4-5-20251001", max_tokens=6000,
+                model="claude-haiku-4-5-20251001", max_tokens=4000,
                 system=SYSTEM_MATCHING + _excludentes_matching(sb),
                 messages=[{"role": "user", "content": prompt_matching}],
                 temperature=0.0, timeout=45.0
@@ -3180,17 +3196,19 @@ diferente = null; spec divergente = não é o mesmo item, mesmo que a descriçã
             raw_match = resp_match.content[0].text.strip()
             raw_match = re.sub(r'^```(?:json)?\s*', '', raw_match)
             raw_match = re.sub(r'\s*```$', '', raw_match.strip())
-            matches = {m["indice"]: m for m in _jm.loads(raw_match).get("matches", [])}
+            for m in _jm.loads(raw_match).get("matches", []):
+                matches[m["indice"]] = m
         except Exception as e:
-            matches = {}
             # `_falhou` já registra o aviso COMPLETO (com assinatura e detalhe).
             # O append de texto solto que existia aqui era redundante E fatal: o
             # /extrair percorre estes avisos chamando a.get("assinatura"), e uma
             # string não tem .get — qualquer falha de matching virava 500 na tela
             # em vez do aviso "itens sem preço por falha do sistema".
+            # Só ESTE lote fica sem match — os demais já resolvidos permanecem.
             _falhou("ia_matching", e,
-                    "A IA de matching não respondeu. Os candidatos do banco foram "
-                    "encontrados, mas ninguém escolheu entre eles.")
+                    f"A IA de matching não respondeu para {len(lote)} item(ns) "
+                    f"(de {len(itens_ia)} no total). Os candidatos do banco foram "
+                    f"encontrados, mas ninguém escolheu entre eles para esses.")
 
     # A memória vence a IA: entra depois e sobrescreve.
     for i, (row, origem) in resolvido.items():
