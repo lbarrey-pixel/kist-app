@@ -1727,6 +1727,38 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
 // O que NUNCA copia: o cadastro do item — descrição, specs, quantidade, unidade.
 // O que muda entre destinos é quanto e para onde, não o que o produto é.
 // ─────────────────────────────────────────────────────────────────────────
+// Oferta recomendada de um item, dado o mapa de resultados do Dwight.
+export function ofertaDwight(it, mapa) {
+  const r = it?.item_uid ? (mapa || {})[String(it.item_uid).toLowerCase()] : null;
+  if (!r || r.status !== "concluido") return null;
+  const ofertas = r.resultado?.ofertas || [];
+  return ofertas[r.resultado?.escolha || 0] || null;
+}
+
+// Item que JÁ tem custo ou origem nunca é sobrescrito em lote: refazer o
+// trabalho do operador em 14 itens de uma vez é erro que só aparece no CSV.
+export function itemEmBranco(it) {
+  return !(Number(it?.preco_custo) > 0
+           || (it?.link_fornecedor || "").trim()
+           || (it?.fornecedor || "").trim());
+}
+
+// Aplica a oferta: custo e origem. A VENDA não é tocada — a internet é custo,
+// o preço de venda é decisão do operador.
+export function aplicarOfertaDwight(it, of) {
+  const preco = of?.preco_pix != null ? of.preco_pix : of?.preco_cheio;
+  return {
+    ...it,
+    ...(preco != null ? { preco_custo: Number(preco) || 0 } : {}),
+    ...(of?.link ? { link_fornecedor: of.link, fornecedor_canal: "link", fornecedor_contato: of.link } : {}),
+    ...(of?.loja ? { fornecedor: of.loja } : {}),
+    ...(of?.sku ? { sku_fornecedor: of.sku } : {}),
+    origem_escolha: "internet",
+    origem_internet: { fonte_url: of?.link || "", fonte_nome: of?.loja || "", apresentacao: of?.pn || "" },
+    _alterado: true, _herdado: false,
+  };
+}
+
 const CAMPOS_LASTRO = [
   "preco_un", "preco_custo", "frete_vinda",
   "fornecedor", "fornecedor_canal", "fornecedor_contato",
@@ -2280,6 +2312,48 @@ export default function App() {
     const t = setInterval(() => carregarPesquisa(numeroAtual), 20000);
     return () => clearInterval(t);
   }, [pesq.aguardando, numeroAtual]);
+
+  const ofertaRecomendada = (it) => ofertaDwight(it, pesq.itens);
+
+  // "Usar todas as recomendadas": aplica de uma vez o que o operador faria item a
+  // item. NÃO toca em item que já tem custo ou origem — sobrescrever o trabalho
+  // dele em lote é o tipo de erro que só se descobre depois do CSV. A venda
+  // também não é tocada: o preço da internet é CUSTO, a venda é decisão dele.
+  function usarTodasDwight() {
+    const lista = (propostas[propostaIdx]?.itens) || [];
+    const alvos = [], jaPreenchidos = [];
+    lista.forEach((it, i) => {
+      const of = ofertaRecomendada(it);
+      if (!of) return;
+      if (!itemEmBranco(it)) {
+        jaPreenchidos.push(i);
+        return;
+      }
+      alvos.push([i, of]);
+    });
+    if (!alvos.length) {
+      setPesqMsg(jaPreenchidos.length
+        ? "Todos os itens pesquisados já têm custo ou origem preenchidos."
+        : "Nenhuma oferta do Dwight para aplicar.");
+      return;
+    }
+    if (jaPreenchidos.length && !window.confirm(
+      `Aplicar a oferta recomendada em ${alvos.length} ${alvos.length === 1 ? "item" : "itens"}.\n` +
+      `${jaPreenchidos.length} já ${jaPreenchidos.length === 1 ? "tem" : "têm"} custo ou origem e não ${jaPreenchidos.length === 1 ? "será tocado" : "serão tocados"}.\n\nSeguir?`)) return;
+
+    const mapa = new Map(alvos);
+    setPropostas((prev) => prev.map((p, pi) => pi !== propostaIdx ? p : {
+      ...p,
+      itens: (p.itens || []).map((it, i) => {
+        const of = mapa.get(i);
+        return of ? aplicarOfertaDwight(it, of) : it;
+      }),
+    }));
+    _dispararAutoSave();
+    setPesqMsg(`Oferta aplicada em ${alvos.length} ${alvos.length === 1 ? "item" : "itens"}`
+      + (jaPreenchidos.length ? ` · ${jaPreenchidos.length} já ${jaPreenchidos.length === 1 ? "tinha" : "tinham"} custo ou origem` : "")
+      + ". A venda continua em branco.");
+  }
 
   async function pesquisarComDwight(forcar = false) {
     if (!numeroAtual || pesqEnviando) return;
@@ -3032,6 +3106,17 @@ export default function App() {
                     className="rounded-lg border border-line2 bg-surface px-3 py-1.5 font-medium text-kist hover:border-kist disabled:opacity-50">
                     {pesqEnviando ? "Enviando…" : "🔎 pesquisar com o Dwight"}
                   </button>
+                  {(() => {
+                    const n = (prop.itens || []).filter((it) => ofertaRecomendada(it)).length;
+                    if (!n) return null;
+                    return (
+                      <button onClick={usarTodasDwight}
+                        className="rounded-lg border border-line2 bg-surface px-3 py-1.5 font-medium text-sub hover:border-kist hover:text-kist"
+                        title="Aplica o custo e a origem da oferta recomendada nos itens que ainda estão em branco">
+                        usar todas as recomendadas ({n})
+                      </button>
+                    );
+                  })()}
                   {pesq.aguardando > 0 && (
                     <span className="text-sub">{pesq.aguardando} {pesq.aguardando === 1 ? "item aguardando" : "itens aguardando"} pesquisa</span>
                   )}
