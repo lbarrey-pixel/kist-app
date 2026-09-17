@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.67"
+VERSAO_BACKEND = "3.68"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -3434,6 +3434,7 @@ def _defesa_do_match(match: dict, row: dict) -> str:
 
 
 @app.post("/extrair")
+@app.post("/extrair")
 async def extrair_email(
     texto: str = Form(None),
     arquivos: list[UploadFile] = File(default=[]),   # múltiplos arquivos (email + Excels + PDFs)
@@ -3445,8 +3446,98 @@ async def extrair_email(
     request: Request = None,
     usuario: str = Depends(verificar_token)
 ):
-    """Extrai itens do e-mail/prints/planilhas e faz matching com o banco.
-    Aceita múltiplos arquivos simultaneamente; retorna uma ou mais propostas."""
+    """Dispara a leitura do e-mail/anexos + matching com o banco EM SEGUNDO PLANO
+    e devolve um `job_id` na hora (v3.68). A tela consulta o andamento em
+    `GET /extrair-status/{job_id}`.
+
+    HISTÓRICO (17/09, NEG 0043770 — 41 itens): a extração (Sonnet, resposta
+    grande) levava de 160 a 215s; some com o matching em lotes, o total passava
+    de 120s, depois de 240s — e QUALQUER teto fixo ia estourar de novo na
+    próxima cotação maior. A saída não é um número maior, é não ter número: o
+    POST volta em menos de 1s (só lê os arquivos, sem chamar IA nenhuma), o
+    trabalho pesado roda numa THREAD em segundo plano, e cada consulta de
+    andamento é uma leitura de banco — rápida, sem IA, sem risco de expirar.
+
+    Os arquivos são lidos AQUI (UploadFile só existe durante o ciclo desta
+    requisição) e passados como bytes puros para a thread — é por isso que o
+    núcleo pesado (`_extrair_nucleo`) não recebe UploadFile nenhum.
+    """
+    arquivos_dados = [(a.filename, await a.read()) for a in (arquivos or []) if a and a.filename]
+    imagens_dados = [(i.filename, await i.read()) for i in (imagens or []) if i and i.filename]
+
+    import uuid as _uuid_extrair
+    job_id = str(_uuid_extrair.uuid4())
+    try:
+        get_supabase().table("extracoes_jobs").insert({
+            "job_id": job_id, "usuario_email": usuario,
+            "numero_proposta": numero_proposta, "status": "processando",
+        }).execute()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Não consegui iniciar a extração: {e}")
+
+    _threading.Thread(
+        target=_rodar_job_extracao,
+        args=(job_id, usuario, numero_proposta, so_rastreavel, ignorar_cache,
+              texto, arquivos_dados, imagens_dados),
+        daemon=True,
+    ).start()
+    return {"job_id": job_id, "status": "processando"}
+
+
+def _rodar_job_extracao(job_id, usuario, numero_proposta, so_rastreavel, ignorar_cache,
+                        texto, arquivos_dados, imagens_dados) -> None:
+    """Corpo da thread. Conexão PRÓPRIA com o Supabase — regra da casa (mesma do
+    `_despachar_webhook_dwight`): quem roda em thread não divide socket com a
+    operação principal."""
+    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+    try:
+        resultado = _extrair_nucleo(sb, usuario, numero_proposta, so_rastreavel,
+                                    ignorar_cache, texto, arquivos_dados, imagens_dados)
+        sb.table("extracoes_jobs").update({
+            "status": "concluido", "resultado": resultado,
+            "concluido_em": _dt_ext.utcnow().isoformat(),
+        }).eq("job_id", job_id).execute()
+    except Exception as e:
+        try:
+            sb.table("extracoes_jobs").update({
+                "status": "erro", "erro": f"{type(e).__name__}: {e}"[:800],
+                "concluido_em": _dt_ext.utcnow().isoformat(),
+            }).eq("job_id", job_id).execute()
+        except Exception:
+            pass
+
+
+@app.get("/extrair-status/{job_id}")
+async def extrair_status(job_id: str, usuario: str = Depends(verificar_token)):
+    """Andamento do job — leitura barata, sem IA, sem efeito colateral. A tela
+    chama isto de poucos em poucos segundos até `status` sair de 'processando'.
+    """
+    r = (get_supabase().table("extracoes_jobs")
+           .select("status,resultado,erro").eq("job_id", job_id).limit(1).execute())
+    linhas = r.data or []
+    if not linhas:
+        raise HTTPException(status_code=404, detail="Job de extração não encontrado.")
+    row = linhas[0]
+    status = row.get("status")
+    if status == "concluido":
+        payload = row.get("resultado")
+        payload = payload if isinstance(payload, dict) else {}
+        return {"status": "concluido", **payload}
+    if status == "erro":
+        raise HTTPException(status_code=500, detail=row.get("erro") or "Falha desconhecida na extração.")
+    return {"status": "processando"}
+
+
+def _extrair_nucleo(sb, usuario, numero_proposta, so_rastreavel, ignorar_cache,
+                    texto, arquivos_dados, imagens_dados) -> dict:
+    """O TRABALHO PESADO de /extrair — leitura + matching. Roda em thread própria
+    (v3.68), chamada por `_rodar_job_extracao`. `arquivos_dados`/`imagens_dados`
+    são listas [(nome, bytes), ...] JÁ LIDAS pelo endpoint (UploadFile só existe
+    dentro do ciclo de vida da requisição HTTP — por isso os bytes são lidos ANTES
+    de entrar aqui, nunca dentro da thread).
+
+    Aceita múltiplos arquivos simultaneamente; retorna uma ou mais propostas.
+    Mesma função de sempre — só o transporte (UploadFile → bytes) mudou."""
 
     import json as _json_ext
 
@@ -3539,12 +3630,10 @@ async def extrair_email(
     # DOCUMENTO a partir deles. O laço abaixo segue existindo pelo parser
     # determinístico de Excel, que funciona e não se mexe.
     _brutos: list = []
-    for arq in (arquivos or []):
-        if not (arq and arq.filename):
+    for fname, dados in (arquivos_dados or []):
+        if not fname:
             continue
-        fname = arq.filename
         flo = fname.lower()
-        dados = await arq.read()
         _brutos.append((fname, dados))
 
         # ── PARSER DETERMINÍSTICO DE EXCEL: REMOVIDO (v3.28) ──────────────────
@@ -3738,11 +3827,10 @@ async def extrair_email(
                                  f"perdidos no e-mail — foi falha do sistema."),
                     "detalhe": f"{type(_e).__name__}: {_e}"[:400],
                 })
-        for _img in (imagens or []):
-            if _img and _img.filename:
+        for _iname, _idata in (imagens_dados or []):
+            if _iname:
                 try:
-                    documentos.append(_ing_doc_arquivo(
-                        _img.filename, await _img.read(), _conv))
+                    documentos.append(_ing_doc_arquivo(_iname, _idata, _conv))
                 except Exception:
                     pass
 
@@ -3790,7 +3878,7 @@ async def extrair_email(
     # ── Montar chamadas de extração ──────────────────────────────────────────
     # Regra: um arquivo de conteúdo (Excel/PDF) = uma proposta candidata
     # Sem arquivos de conteúdo = tudo junto em uma chamada (body + imagens)
-    imgs_validas = [img for img in (imagens or []) if img and img.filename]
+    imgs_validas = [(n, d) for n, d in (imagens_dados or []) if n]
     todas_imgs_len = len(imgs_validas) + len(imgs_msg)
     if _INGESTAO_OK and documentos:
         # 91% das cotações reais trazem imagem embutida — quem manda no modelo é
@@ -3799,7 +3887,7 @@ async def extrair_email(
     modelo_extracao = "claude-sonnet-4-6" if todas_imgs_len > 0 else "claude-haiku-4-5-20251001"
     claude = get_claude()
 
-    async def _chamar_extracao(payload_txt, imgs_inline=None, imgs_upload=None):
+    def _chamar_extracao(payload_txt, imgs_inline=None, imgs_upload=None):
         """Monta o payload e chama o Claude para extração."""
         msg_content = []
         if payload_txt.strip():
@@ -3854,8 +3942,7 @@ async def extrair_email(
                 })
         if imgs_upload:
             _gasto_up = 0
-            for img in (imgs_upload or [])[:_IMG_MAX_N]:
-                ib = await img.read()
+            for _nome_up, ib in (imgs_upload or [])[:_IMG_MAX_N]:
                 if _img_descartavel(ib):
                     continue
                 _tk = _img_tokens(ib)
@@ -3868,7 +3955,7 @@ async def extrair_email(
             return []
         # Uma rota só até a IA: monta aqui, chama lá. Antes eram DUAS cópias da
         # mesma chamada + parsing; cache em uma só cobriria metade dos casos.
-        return await _chamar_com_content(msg_content)
+        return _chamar_com_content(msg_content)
 
     def _erro_de_imagem(e) -> bool:
         """400 da API por causa de imagem (corrompida, formato, tamanho)."""
@@ -3883,7 +3970,7 @@ async def extrair_email(
                     c.get("type") == "image"
                     or (c.get("type") == "text" and str(c.get("text", "")).startswith(fora))))]
 
-    async def _chamar_com_content(msg_content):
+    def _chamar_com_content(msg_content):
         """Rota ÚNICA da leitura pela IA — com cache de conteúdo.
 
         `_chamar_extracao` monta o content e delega para cá, de modo que existe
@@ -3991,7 +4078,7 @@ async def extrair_email(
         # pela regra de DESTINO — endereço/CNPJ diferente = proposta diferente —
         # e para decidir isso ele precisa ver o pedido inteiro de uma vez.
         _content, _rel_ing = _ing_montar_payload(documentos, texto_extra=(texto or ""))
-        propostas_raw.extend(await _chamar_com_content(_content))
+        propostas_raw.extend(_chamar_com_content(_content))
         if _rel_ing.get("imagens_recuperadas"):
             notas_extracao.append({
                 "tipo": "imagem_recuperada", "arquivo": "",
@@ -4021,7 +4108,7 @@ async def extrair_email(
         for _ordem, (nome_arq, conteudo_arq, _tipo_arq) in enumerate(conteudo_files):
             ctx = f"CONTEXTO (cliente/CNPJ/referência do e-mail):\n{_recorte_contexto(contexto_email)}\n\n" \
                   f"CONTEÚDO PARA COTAÇÃO — arquivo: {nome_arq}\n{conteudo_arq[:15000]}"
-            props = await _chamar_extracao(
+            props = _chamar_extracao(
                 ctx,
                 imgs_inline=(imgs_msg if _ordem == 0 else None),
                 imgs_upload=(imgs_validas if _ordem == 0 else None),
@@ -4037,7 +4124,7 @@ async def extrair_email(
         # (endereço/CNPJ diferente = proposta diferente). A quebra é por CONTEÚDO, não
         # por número de arquivos: 2 e-mails pro mesmo destino = 1 aba; 1 e-mail com 2
         # destinos = 2 abas.
-        props = await _chamar_extracao(contexto_email, imgs_inline=imgs_msg, imgs_upload=imgs_validas)
+        props = _chamar_extracao(contexto_email, imgs_inline=imgs_msg, imgs_upload=imgs_validas)
         propostas_raw.extend(props)
 
     if not propostas_raw:

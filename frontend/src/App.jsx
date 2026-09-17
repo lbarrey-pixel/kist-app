@@ -15,6 +15,52 @@ import {
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
+// ── Extração assíncrona (v3.68) ─────────────────────────────────────────────
+// HISTÓRICO (17/09): cotação de 41 itens levava 160-215s na extração + matching,
+// e QUALQUER teto fixo de espera (120s, depois 240s) ia estourar de novo na
+// próxima cotação maior. Agora POST /extrair volta na hora com um job_id, e a
+// tela consulta GET /extrair-status/{job_id} de poucos em poucos segundos até
+// sair de "processando" — sem prazo fixo, porque cada consulta é rápida e
+// barata (leitura de banco, sem IA), não importa quanto o trabalho leve.
+async function _extrairAssincrono(form, authHeaders, onProgresso) {
+  const rIni = await fetch(`${API}/extrair`, { method: "POST", headers: authHeaders(), body: form });
+  if (!rIni.ok) {
+    const err = await rIni.json().catch(() => ({ detail: `Erro HTTP ${rIni.status}` }));
+    throw new Error(err.detail || "Erro ao iniciar a extração");
+  }
+  const { job_id } = await rIni.json();
+  if (!job_id) throw new Error("O servidor não devolveu o job da extração.");
+
+  const ESPERA_MS = 3000;
+  const TETO_MS = 15 * 60 * 1000;   // 15 min: não é prazo de sucesso, é rede de
+  // segurança contra job que travou de vez (backend caiu, thread morreu) — não
+  // trava a tela para sempre nesse caso raro.
+  const t0 = Date.now();
+  let tentativa = 0;
+  while (true) {
+    if (Date.now() - t0 > TETO_MS) {
+      throw new Error("A extração está demorando demais (mais de 15 min) — pode ter travado no servidor. Me avise.");
+    }
+    await new Promise((res) => setTimeout(res, ESPERA_MS));
+    tentativa += 1;
+    let rSt;
+    try {
+      rSt = await fetch(`${API}/extrair-status/${encodeURIComponent(job_id)}`, { headers: authHeaders() });
+    } catch {
+      continue;   // rede oscilou por um instante — tenta de novo na próxima volta
+    }
+    if (rSt.status === 404) throw new Error("O job da extração sumiu do servidor. Tente de novo.");
+    if (!rSt.ok) {
+      const err = await rSt.json().catch(() => ({ detail: `Erro HTTP ${rSt.status}` }));
+      throw new Error(err.detail || "Erro ao consultar a extração");
+    }
+    const d = await rSt.json();
+    if (d.status === "concluido") return d;
+    if (onProgresso) onProgresso(tentativa, ESPERA_MS);
+    // "processando": continua o laço
+  }
+}
+
 // Identidade estável do item (v3.61). O save apaga e recria as linhas da proposta,
 // então o `id` muda a cada auto-save. O `item_uid` nasce aqui, viaja com o item e é
 // por ele que o resultado da pesquisa do Dwight volta para a linha certa.
@@ -1943,6 +1989,7 @@ export default function App() {
   const [novaOCPayload, setNovaOCPayload] = useState(null);
   const [step, setStep] = useState("input");
   const [loading, setLoading] = useState(false);
+  const [processandoMsg, setProcessandoMsg] = useState("");   // v3.68: andamento do job de extração
   const [salvandoBanco, setSalvandoBanco] = useState(false);
   const [erro, setErro] = useState("");
   // Avisos do backend quando a BUSCA FALHOU (≠ produto ausente no banco).
@@ -2166,29 +2213,16 @@ export default function App() {
       if (texto) form.append("texto", texto);
       imagens.forEach((img) => form.append("imagens", img));
 
-      // 240s (v3.67): cotação grande (30-40+ itens) faz o backend rodar a extração
-      // e, depois, o matching em lotes contra o banco — mesmo em paralelo, isso
-      // passa dos 120s antigos e o operador via "Tempo limite" com o backend
-      // ainda trabalhando (caso NEG 0043770, 17/09, 41 itens). 240s é folga, não
-      // promessa: o valor real do matching agora escala com o LOTE mais lento,
-      // não com o total de itens.
-      const controller = new AbortController();
-      const tid = setTimeout(() => controller.abort(), 240000);
-      let res;
+      let data;
       try {
-        res = await fetch(`${API}/extrair`, { method: "POST", headers: authHeaders(), body: form, signal: controller.signal });
+        data = await _extrairAssincrono(form, authHeaders, (tentativa) => {
+          setProcessandoMsg(tentativa <= 2 ? "Lendo o material…"
+            : "Cruzando com o banco de preços… cotações grandes podem levar alguns minutos.");
+        });
       } catch (fe) {
-        clearTimeout(tid);
-        if (fe.name === "AbortError") throw new Error("Tempo limite (240s). Cotação muito grande — tente separar em partes, ou me avise se voltar a acontecer.");
+        if (String(fe.message || "").includes("Sessão expirada")) { setErro("Sessão expirada. Faça login novamente."); logout(); return; }
         throw fe;
-      }
-      clearTimeout(tid);
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: `Erro HTTP ${res.status}` }));
-        if (res.status === 401 || res.status === 403) { setErro("Sessão expirada. Faça login novamente."); logout(); return; }
-        throw new Error(err.detail || "Erro no servidor");
-      }
-      const data = await res.json();
+      } finally { setProcessandoMsg(""); }
       // Falha do sistema != produto ausente no banco. Sem isto, o operador
       // precifica 20 itens na mão achando que o banco está pobre.
       setAvisosSistema(Array.isArray(data.avisos) ? data.avisos : []);
@@ -2216,6 +2250,7 @@ export default function App() {
   const [addTexto, setAddTexto] = useState("");
   const [addArquivos, setAddArquivos] = useState([]);
   const [addLoading, setAddLoading] = useState(false);
+  const [addProgressoMsg, setAddProgressoMsg] = useState("");   // v3.68
   const [addErro, setAddErro] = useState("");
   const [addDrag, setAddDrag] = useState(false);
 
@@ -2231,29 +2266,15 @@ export default function App() {
       addArquivos.forEach((f) => form.append("arquivos", f));
       if (addTexto) form.append("texto", addTexto);
 
-      // 240s (v3.67): cotação grande (30-40+ itens) faz o backend rodar a extração
-      // e, depois, o matching em lotes contra o banco — mesmo em paralelo, isso
-      // passa dos 120s antigos e o operador via "Tempo limite" com o backend
-      // ainda trabalhando (caso NEG 0043770, 17/09, 41 itens). 240s é folga, não
-      // promessa: o valor real do matching agora escala com o LOTE mais lento,
-      // não com o total de itens.
-      const controller = new AbortController();
-      const tid = setTimeout(() => controller.abort(), 240000);
-      let res;
+      let data;
       try {
-        res = await fetch(`${API}/extrair`, { method: "POST", headers: authHeaders(), body: form, signal: controller.signal });
+        data = await _extrairAssincrono(form, authHeaders, (tentativa) => {
+          setAddProgressoMsg(tentativa <= 2 ? "Lendo o material…" : "Cruzando com o banco de preços…");
+        });
       } catch (fe) {
-        clearTimeout(tid);
-        if (fe.name === "AbortError") throw new Error("Tempo limite (240s). Cotação muito grande — tente separar em partes, ou me avise se voltar a acontecer.");
+        if (String(fe.message || "").includes("Sessão expirada")) { setAddErro("Sessão expirada. Faça login novamente."); return; }
         throw fe;
-      }
-      clearTimeout(tid);
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: `Erro HTTP ${res.status}` }));
-        if (res.status === 401 || res.status === 403) { setAddErro("Sessão expirada. Faça login novamente."); return; }
-        throw new Error(err.detail || "Erro no servidor");
-      }
-      const data = await res.json();
+      } finally { setAddProgressoMsg(""); }
       // O /extrair pode separar em mais de uma proposta (por cliente). Aqui o
       // operador escolheu ADICIONAR a ESTA proposta: junta os itens de todas.
       const novos = (data.propostas || [data]).flatMap((p) => p.itens || []);
@@ -2895,9 +2916,14 @@ export default function App() {
 
                   <button onClick={processar} disabled={loading} className={`${btnPrimary} w-full justify-center py-2.5`}>
                     {loading
-                      ? <><span className="inline-block animate-spin"><IconBolt size={15} /></span> Extraindo e cruzando com o banco…</>
+                      ? <><span className="inline-block animate-spin"><IconBolt size={15} /></span> {processandoMsg || "Extraindo e cruzando com o banco…"}</>
                       : <>Processar e-mail <IconArrow size={15} /></>}
                   </button>
+                  {loading && (
+                    <div className="text-center text-[11px] text-faint">
+                      Cotações grandes podem levar alguns minutos — pode deixar a aba aberta e esperar.
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -3451,7 +3477,7 @@ export default function App() {
 
                       <div className="mt-2 flex items-center gap-2">
                         <button onClick={adicionarItens} disabled={addLoading} className={btnPrimary}>
-                          {addLoading ? "lendo e casando com o banco…" : "adicionar à proposta"}
+                          {addLoading ? (addProgressoMsg || "lendo e casando com o banco…") : "adicionar à proposta"}
                         </button>
                         <span className="text-[11.5px] text-faint">
                           Os itens entram no fim da lista. Os que já estão preenchidos não são alterados.
