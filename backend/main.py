@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.66"
+VERSAO_BACKEND = "3.67"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -3157,10 +3157,11 @@ def _fazer_matching(itens_raw: list, claude, sb, cliente: str = "",
     _LOTE_MATCHING = 8
     matches = {}
     itens_ia = [i for i in pendentes if candidatos_por_item[i]]
-    for _ini in range(0, len(itens_ia), _LOTE_MATCHING):
-        lote = itens_ia[_ini:_ini + _LOTE_MATCHING]
-        if not lote:
-            continue
+    lotes = [itens_ia[i:i + _LOTE_MATCHING] for i in range(0, len(itens_ia), _LOTE_MATCHING)]
+
+    def _rodar_lote(lote):
+        """Uma chamada Haiku para um lote de poucos itens. Devolve dict de matches
+        (vazio em falha — quem chama já sabe registrar o aviso)."""
         # As specs_complementares vão JUNTO. Elas estavam sendo descartadas — e é
         # nelas que a divergência mora (69% dos itens têm specs preenchidas). O
         # matcher casava "suporte 60cm" com "suporte 60cm" e dava alta, sem ver que
@@ -3186,29 +3187,50 @@ Para cada item, decida se algum candidato é O MESMO ITEM — comparando a DESCR
 Preencha veredito, motivo, diferencas e falta. Lembre: fabricante diferente = null; categoria
 diferente = null; spec divergente = não é o mesmo item, mesmo que a descrição bata."""
 
-        try:
-            resp_match = claude.messages.create(
-                model="claude-haiku-4-5-20251001", max_tokens=4000,
-                system=SYSTEM_MATCHING + _excludentes_matching(sb),
-                messages=[{"role": "user", "content": prompt_matching}],
-                temperature=0.0, timeout=45.0
-            )
-            raw_match = resp_match.content[0].text.strip()
-            raw_match = re.sub(r'^```(?:json)?\s*', '', raw_match)
-            raw_match = re.sub(r'\s*```$', '', raw_match.strip())
-            for m in _jm.loads(raw_match).get("matches", []):
-                matches[m["indice"]] = m
-        except Exception as e:
-            # `_falhou` já registra o aviso COMPLETO (com assinatura e detalhe).
-            # O append de texto solto que existia aqui era redundante E fatal: o
-            # /extrair percorre estes avisos chamando a.get("assinatura"), e uma
-            # string não tem .get — qualquer falha de matching virava 500 na tela
-            # em vez do aviso "itens sem preço por falha do sistema".
-            # Só ESTE lote fica sem match — os demais já resolvidos permanecem.
-            _falhou("ia_matching", e,
-                    f"A IA de matching não respondeu para {len(lote)} item(ns) "
-                    f"(de {len(itens_ia)} no total). Os candidatos do banco foram "
-                    f"encontrados, mas ninguém escolheu entre eles para esses.")
+        resp_match = claude.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=4000,
+            system=SYSTEM_MATCHING + _excludentes_matching(sb),
+            messages=[{"role": "user", "content": prompt_matching}],
+            temperature=0.0, timeout=45.0
+        )
+        raw_match = resp_match.content[0].text.strip()
+        raw_match = re.sub(r'^```(?:json)?\s*', '', raw_match)
+        raw_match = re.sub(r'\s*```$', '', raw_match.strip())
+        return {m["indice"]: m for m in _jm.loads(raw_match).get("matches", [])}
+
+    # PARALELO entre lotes (v3.67): lotes são INDEPENDENTES (cada um só enxerga
+    # seus próprios itens e candidatos), então rodar em série era espera de graça.
+    # HISTÓRICO (17/09, mesma cotação de 41 itens): em lotes SEQUENCIAIS a extração
+    # (~58s) + 6 chamadas de matching (~10-35s cada) passava dos 120s que o
+    # FRONTEND espera antes de abortar — "Tempo limite (120s)" mesmo com o
+    # backend funcionando, um lote atrás do outro. Em paralelo (até 4 ao mesmo
+    # tempo), o tempo do matching passa a ser o do lote mais lento, não a soma.
+    # 4 é teto deliberado — não é sobre CPU (a espera é de rede), é para não
+    # disparar 6+ chamadas simultâneas na mesma conta e esbarrar em rate limit.
+    if len(lotes) <= 1:
+        for lote in lotes:
+            try:
+                matches.update(_rodar_lote(lote))
+            except Exception as e:
+                _falhou("ia_matching", e,
+                        f"A IA de matching não respondeu para {len(lote)} item(ns) "
+                        f"(de {len(itens_ia)} no total). Os candidatos do banco foram "
+                        f"encontrados, mas ninguém escolheu entre eles para esses.")
+    elif lotes:
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=min(4, len(lotes))) as _ex:
+            _fut_lote = {_ex.submit(_rodar_lote, lote): lote for lote in lotes}
+            for _fut in _cf.as_completed(_fut_lote):
+                lote = _fut_lote[_fut]
+                try:
+                    matches.update(_fut.result())
+                except Exception as e:
+                    # `_falhou` grava em `avisos` (lista comum). CPython garante
+                    # list.append atômico entre threads — sem lock, sem race.
+                    _falhou("ia_matching", e,
+                            f"A IA de matching não respondeu para {len(lote)} item(ns) "
+                            f"(de {len(itens_ia)} no total). Os candidatos do banco foram "
+                            f"encontrados, mas ninguém escolheu entre eles para esses.")
 
     # A memória vence a IA: entra depois e sobrescreve.
     for i, (row, origem) in resolvido.items():

@@ -2166,14 +2166,20 @@ export default function App() {
       if (texto) form.append("texto", texto);
       imagens.forEach((img) => form.append("imagens", img));
 
+      // 240s (v3.67): cotação grande (30-40+ itens) faz o backend rodar a extração
+      // e, depois, o matching em lotes contra o banco — mesmo em paralelo, isso
+      // passa dos 120s antigos e o operador via "Tempo limite" com o backend
+      // ainda trabalhando (caso NEG 0043770, 17/09, 41 itens). 240s é folga, não
+      // promessa: o valor real do matching agora escala com o LOTE mais lento,
+      // não com o total de itens.
       const controller = new AbortController();
-      const tid = setTimeout(() => controller.abort(), 120000);
+      const tid = setTimeout(() => controller.abort(), 240000);
       let res;
       try {
         res = await fetch(`${API}/extrair`, { method: "POST", headers: authHeaders(), body: form, signal: controller.signal });
       } catch (fe) {
         clearTimeout(tid);
-        if (fe.name === "AbortError") throw new Error("Tempo limite (120s). Tente com menos arquivos.");
+        if (fe.name === "AbortError") throw new Error("Tempo limite (240s). Cotação muito grande — tente separar em partes, ou me avise se voltar a acontecer.");
         throw fe;
       }
       clearTimeout(tid);
@@ -2225,14 +2231,20 @@ export default function App() {
       addArquivos.forEach((f) => form.append("arquivos", f));
       if (addTexto) form.append("texto", addTexto);
 
+      // 240s (v3.67): cotação grande (30-40+ itens) faz o backend rodar a extração
+      // e, depois, o matching em lotes contra o banco — mesmo em paralelo, isso
+      // passa dos 120s antigos e o operador via "Tempo limite" com o backend
+      // ainda trabalhando (caso NEG 0043770, 17/09, 41 itens). 240s é folga, não
+      // promessa: o valor real do matching agora escala com o LOTE mais lento,
+      // não com o total de itens.
       const controller = new AbortController();
-      const tid = setTimeout(() => controller.abort(), 120000);
+      const tid = setTimeout(() => controller.abort(), 240000);
       let res;
       try {
         res = await fetch(`${API}/extrair`, { method: "POST", headers: authHeaders(), body: form, signal: controller.signal });
       } catch (fe) {
         clearTimeout(tid);
-        if (fe.name === "AbortError") throw new Error("Tempo limite (120s). Tente com menos arquivos.");
+        if (fe.name === "AbortError") throw new Error("Tempo limite (240s). Cotação muito grande — tente separar em partes, ou me avise se voltar a acontecer.");
         throw fe;
       }
       clearTimeout(tid);
