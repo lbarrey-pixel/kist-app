@@ -428,7 +428,7 @@ const MARKETPLACES = [
 ];
 
 // ── Linha de item da revisão ───────────────────────────────────────────────
-function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, cnpj, propostaId, onSalvar, dwight }) {
+function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, cnpj, propostaId, onSalvar, dwight, onPesquisarItem }) {
   // ── Alerta ────────────────────────────────────────────────────────────
   // ── Termo de busca ────────────────────────────────────────────────────
   // O que os atalhos disparam. Fica VISÍVEL e editável na própria linha: se
@@ -1336,75 +1336,96 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
 
               {/* ── INTERNET (direita) ── */}
               <div>
-                {dwight && (
-                  <div className="mb-2 rounded-lg border border-line2 bg-surface p-3">
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="eyebrow text-[9px] font-semibold uppercase text-faint">Pesquisa do Dwight</div>
-                      {dwight.telemetria?.tempo_ms != null && (
-                        <span className="font-mono text-[10px] text-faint">
-                          {Math.round(dwight.telemetria.tempo_ms / 1000)}s
-                          {dwight.telemetria.buscas != null && ` · ${dwight.telemetria.buscas} buscas`}
-                          {dwight.telemetria.paginas != null && ` · ${dwight.telemetria.paginas} páginas`}
-                        </span>
-                      )}
-                    </div>
-                    {dwight.status === "aguardando" && (
-                      <div className="mt-1.5 text-[12px] text-sub">Aguardando pesquisa…</div>
-                    )}
-                    {dwight.status === "expirado" && (
-                      <div className="mt-1.5 text-[12px] text-amber">Sem retorno há mais de 3 horas. Dispare de novo se ainda precisar.</div>
-                    )}
-                    {dwight.status === "erro_envio" && (
-                      <div className="mt-1.5 text-[12px] text-rose">Não consegui enviar para o Dwight. Tente de novo.</div>
-                    )}
-                    {dwight.status === "erro" && (
-                      <div className="mt-1.5 text-[12px] text-rose">O Dwight informou erro nesta pesquisa.{dwight.resultado?.obs ? ` ${dwight.resultado.obs}` : ""}</div>
-                    )}
-                    {dwight.status === "nao_encontrado" && (
-                      <div className="mt-1.5 text-[12px] text-amber">O Dwight não encontrou este item.{dwight.resultado?.obs ? ` ${dwight.resultado.obs}` : ""}</div>
-                    )}
-                    {dwight.status === "concluido" && (dwight.resultado?.ofertas || []).length > 0 && (
-                      <div className="mt-2 space-y-1.5">
-                        {dwight.resultado.ofertas.map((of, k) => {
-                          const recomendada = k === (dwight.resultado.escolha || 0);
-                          return (
-                            <div key={k} className="border-t border-line pt-1.5 first:border-t-0 first:pt-0">
-                              <div className="flex items-baseline justify-between gap-2">
-                                <span className="min-w-0 truncate text-[12px] text-ink">
-                                  {of.loja || "—"}
-                                  {recomendada && <span className="ml-1.5 rounded bg-signalbg px-1 py-px text-[9.5px] font-medium text-signal">recomendada</span>}
-                                </span>
-                                <div className="flex flex-shrink-0 items-center gap-2">
-                                  {of.preco_pix != null ? (
-                                    <span className="font-mono text-[13.5px] font-medium text-ink" title="preço Pix">{brl(of.preco_pix)}</span>
-                                  ) : of.preco_cheio != null ? (
-                                    <span className="font-mono text-[13.5px] font-medium text-ink">{brl(of.preco_cheio)}</span>
-                                  ) : (
-                                    <span className="text-[11px] font-medium text-amber">sem preço</span>
-                                  )}
-                                  <button onClick={() => usarOfertaDwight(of)}
-                                    title="Usar esta oferta e preencher custo e origem"
-                                    className="rounded-md border border-line2 px-2 py-0.5 text-[11px] font-medium text-sub hover:border-kist hover:text-kist">
-                                    usar esta
-                                  </button>
-                                </div>
-                              </div>
-                              <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-[10.5px] text-faint">
-                                {of.pn && <span className="font-mono text-sub">{of.fabricante ? `${of.fabricante} ` : ""}{of.pn}</span>}
-                                {of.preco_pix != null && of.preco_cheio != null && <span>cheio <span className="font-mono">{brl(of.preco_cheio)}</span></span>}
-                                {of.estoque && <span>· {of.estoque}</span>}
-                                {of.frete != null && <span>· frete est. <span className="font-mono">{brl(of.frete)}</span></span>}
-                                {of.prazo && <span>· {of.prazo}</span>}
-                                {of.link && <a href={of.link} target="_blank" rel="noreferrer" className="text-kist hover:underline">· ver anúncio</a>}
-                              </div>
-                              {of.obs && <div className="mt-0.5 text-[10.5px] text-sub">{of.obs}</div>}
-                            </div>
-                          );
-                        })}
+                {(dwight || onPesquisarItem) && (
+                  <div className="mb-2 rounded-lg border border-line2 bg-surface px-3 py-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="eyebrow text-[9px] font-semibold uppercase text-faint">Dwight</div>
+                      <div className="flex items-center gap-2">
+                        {dwight?.telemetria?.tempo_ms != null && (
+                          <span className="font-mono text-[10px] text-faint">
+                            {Math.round(dwight.telemetria.tempo_ms / 1000)}s
+                            {dwight.telemetria.buscas != null && `·${dwight.telemetria.buscas}b`}
+                            {dwight.telemetria.paginas != null && `·${dwight.telemetria.paginas}p`}
+                          </span>
+                        )}
+                        {onPesquisarItem && dwight?.status !== "aguardando" && (
+                          <button onClick={onPesquisarItem}
+                            title="Pesquisar só este item no Dwight"
+                            className="rounded-md border border-line2 px-2 py-0.5 text-[10.5px] font-medium text-sub hover:border-kist hover:text-kist">
+                            {dwight ? "pesquisar de novo" : "🔎 pesquisar este item"}
+                          </button>
+                        )}
                       </div>
+                    </div>
+
+                    {dwight?.status === "aguardando" && (
+                      <div className="mt-1 text-[12px] text-sub">Pesquisando…</div>
                     )}
+                    {dwight?.status === "expirado" && (
+                      <div className="mt-1 text-[12px] text-amber">Sem retorno há mais de 3 h.</div>
+                    )}
+                    {dwight?.status === "erro_envio" && (
+                      <div className="mt-1 text-[12px] text-rose">Não consegui enviar ao Dwight.</div>
+                    )}
+                    {dwight?.status === "erro" && (
+                      <div className="mt-1 text-[12px] text-rose">Erro na pesquisa.{dwight.resultado?.obs ? ` ${dwight.resultado.obs}` : ""}</div>
+                    )}
+                    {dwight?.status === "nao_encontrado" && (
+                      <div className="mt-1 text-[12px] text-amber">Não encontrou este item.{dwight.resultado?.obs ? ` ${dwight.resultado.obs}` : ""}</div>
+                    )}
+
+                    {dwight?.status === "concluido" && (() => {
+                      const ofertas = dwight.resultado?.ofertas || [];
+                      const k0 = dwight.resultado?.escolha || 0;
+                      const rec = ofertas[k0];
+                      if (!rec) return null;
+                      const outras = ofertas.filter((_, k) => k !== k0);
+                      const linha = (of, k) => (
+                        <div key={k} className="flex items-baseline justify-between gap-2 py-0.5">
+                          <div className="min-w-0 flex-1 truncate text-[11.5px] text-sub">
+                            {of.link
+                              ? <a href={of.link} target="_blank" rel="noreferrer" className="text-kist hover:underline">{of.loja || "loja"}</a>
+                              : (of.loja || "—")}
+                            {of.pn && <span className="ml-1.5 font-mono text-[10.5px] text-faint">{of.pn}</span>}
+                          </div>
+                          <div className="flex flex-shrink-0 items-center gap-2">
+                            {custoDaOferta(of) != null
+                              ? <span className="font-mono text-[12.5px] text-ink">{brl(custoDaOferta(of))}</span>
+                              : <span className="text-[11px] text-amber">sem preço</span>}
+                            <button onClick={() => usarOfertaDwight(of)}
+                              className="rounded-md border border-line2 px-1.5 py-0.5 text-[10.5px] font-medium text-sub hover:border-kist hover:text-kist">
+                              usar
+                            </button>
+                          </div>
+                        </div>
+                      );
+                      const jaUsada = (item.link_fornecedor || "") === (rec.link || "\u0000");
+                      return (
+                        <div className="mt-1">
+                          {linha(rec, k0)}
+                          <div className="flex flex-wrap items-center gap-x-1.5 text-[10.5px] text-faint">
+                            {rec.estoque && <span>{rec.estoque}</span>}
+                            {rec.preco_cheio != null && rec.preco_pix != null && <span>· cheio {brl(rec.preco_cheio)}</span>}
+                            {rec.frete != null && <span>· frete est. {brl(rec.frete)}</span>}
+                            {rec.prazo && <span>· {rec.prazo}</span>}
+                            {jaUsada && <span className="text-signal">· carregada no item</span>}
+                          </div>
+                          {outras.length > 0 && (
+                            <details className="mt-0.5">
+                              <summary className="cursor-pointer text-[10.5px] text-faint hover:text-sub">
+                                +{outras.length} {outras.length === 1 ? "oferta" : "ofertas"}
+                              </summary>
+                              <div className="mt-0.5 border-t border-line pt-0.5">
+                                {ofertas.map((of, k) => k === k0 ? null : linha(of, k))}
+                              </div>
+                            </details>
+                          )}
+                        </div>
+                      );
+                    })()}
                   </div>
                 )}
+
                 {netLoad && (
                   <div className="flex h-full items-center rounded-lg border border-line2 bg-surface px-3 py-2.5 text-[12px] text-sub">
                     Buscando preço na internet…
@@ -1735,12 +1756,28 @@ export function ofertaDwight(it, mapa) {
   return ofertas[r.resultado?.escolha || 0] || null;
 }
 
-// Item que JÁ tem custo ou origem nunca é sobrescrito em lote: refazer o
-// trabalho do operador em 14 itens de uma vez é erro que só aparece no CSV.
-export function itemEmBranco(it) {
-  return !(Number(it?.preco_custo) > 0
-           || (it?.link_fornecedor || "").trim()
-           || (it?.fornecedor || "").trim());
+// Custo da oferta: Pix quando houver, senão o cheio.
+export function custoDaOferta(of) {
+  const v = of?.preco_pix != null ? of.preco_pix : of?.preco_cheio;
+  return v == null ? null : Number(v);
+}
+
+// QUANDO o Dwight escreve no item (regra do Leonardo, 17/09):
+//   · item sem origem  → escreve;
+//   · item com origem MAIS CARA que a dele → escreve (troca por mais barato);
+//   · item com origem e SEM custo para comparar → não escreve (aparece no card
+//     como alternativa; sem número dos dois lados não existe "mais barato").
+// Devolve 'vazio' | 'mais_barato' | 'nao' + a economia, para a tela explicar.
+export function decidirEscrita(it, of) {
+  const novo = custoDaOferta(of);
+  if (novo == null || !(novo > 0)) return { escreve: false, motivo: "nao" };
+  const temOrigem = !!((it?.link_fornecedor || "").trim() || (it?.fornecedor || "").trim())
+                    || Number(it?.preco_custo) > 0;
+  if (!temOrigem) return { escreve: true, motivo: "vazio" };
+  const atual = Number(it?.preco_custo);
+  if (!(atual > 0)) return { escreve: false, motivo: "nao" };
+  if (novo < atual) return { escreve: true, motivo: "mais_barato", economia: atual - novo };
+  return { escreve: false, motivo: "nao" };
 }
 
 // Aplica a oferta: custo e origem. A VENDA não é tocada — a internet é custo,
@@ -2287,6 +2324,17 @@ export default function App() {
   const [pesq, setPesq] = useState({ itens: {}, aguardando: 0 });
   const [pesqEnviando, setPesqEnviando] = useState(false);
   const [pesqMsg, setPesqMsg] = useState("");
+  const [desfazer, setDesfazer] = useState(null);     // foto dos itens antes do carregamento
+  // Preencher sozinho quando o resultado chega. Fica ligado por padrão e a
+  // escolha é do operador, guardada no navegador dele.
+  const [pesqAuto, setPesqAuto] = useState(() => {
+    try { return localStorage.getItem("kist_dwight_auto") !== "0"; } catch { return true; }
+  });
+  function alternarAuto(v) {
+    setPesqAuto(v);
+    try { localStorage.setItem("kist_dwight_auto", v ? "1" : "0"); } catch { /* sem storage, vale a sessão */ }
+  }
+  const autoAplicadosRef = useRef(new Set());         // uid já aplicado automaticamente
   const numeroAtual = String(propostas[propostaIdx]?.proposta || numeroProposta || "").trim();
 
   async function carregarPesquisa(numero) {
@@ -2315,33 +2363,29 @@ export default function App() {
 
   const ofertaRecomendada = (it) => ofertaDwight(it, pesq.itens);
 
-  // "Usar todas as recomendadas": aplica de uma vez o que o operador faria item a
-  // item. NÃO toca em item que já tem custo ou origem — sobrescrever o trabalho
-  // dele em lote é o tipo de erro que só se descobre depois do CSV. A venda
-  // também não é tocada: o preço da internet é CUSTO, a venda é decisão dele.
-  function usarTodasDwight() {
+  // Carrega no item o que o Dwight achou, pela regra: item em branco, ou oferta
+  // mais barata que o custo que está lá. A VENDA nunca é tocada — a internet é
+  // custo; a venda é decisão do operador. Guarda o valor anterior para desfazer.
+  function carregarDwight(uidsFiltro = null) {
     const lista = (propostas[propostaIdx]?.itens) || [];
-    const alvos = [], jaPreenchidos = [];
+    const escrever = [], trocados = [], recusados = [];
     lista.forEach((it, i) => {
+      if (uidsFiltro && !uidsFiltro.includes(String(it.item_uid || "").toLowerCase())) return;
       const of = ofertaRecomendada(it);
       if (!of) return;
-      if (!itemEmBranco(it)) {
-        jaPreenchidos.push(i);
-        return;
-      }
-      alvos.push([i, of]);
+      const d = decidirEscrita(it, of);
+      if (!d.escreve) { recusados.push(i); return; }
+      escrever.push([i, of]);
+      if (d.motivo === "mais_barato") trocados.push({ i, economia: d.economia });
     });
-    if (!alvos.length) {
-      setPesqMsg(jaPreenchidos.length
-        ? "Todos os itens pesquisados já têm custo ou origem preenchidos."
-        : "Nenhuma oferta do Dwight para aplicar.");
-      return;
+    if (!escrever.length) {
+      setPesqMsg(recusados.length
+        ? "Nada a carregar: os itens pesquisados já têm origem igual ou mais barata."
+        : "Nenhuma oferta do Dwight para carregar.");
+      return 0;
     }
-    if (jaPreenchidos.length && !window.confirm(
-      `Aplicar a oferta recomendada em ${alvos.length} ${alvos.length === 1 ? "item" : "itens"}.\n` +
-      `${jaPreenchidos.length} já ${jaPreenchidos.length === 1 ? "tem" : "têm"} custo ou origem e não ${jaPreenchidos.length === 1 ? "será tocado" : "serão tocados"}.\n\nSeguir?`)) return;
-
-    const mapa = new Map(alvos);
+    const antes = escrever.map(([i]) => ({ i, item: lista[i] }));
+    const mapa = new Map(escrever);
     setPropostas((prev) => prev.map((p, pi) => pi !== propostaIdx ? p : {
       ...p,
       itens: (p.itens || []).map((it, i) => {
@@ -2349,13 +2393,47 @@ export default function App() {
         return of ? aplicarOfertaDwight(it, of) : it;
       }),
     }));
+    setDesfazer({ idx: propostaIdx, antes });
     _dispararAutoSave();
-    setPesqMsg(`Oferta aplicada em ${alvos.length} ${alvos.length === 1 ? "item" : "itens"}`
-      + (jaPreenchidos.length ? ` · ${jaPreenchidos.length} já ${jaPreenchidos.length === 1 ? "tinha" : "tinham"} custo ou origem` : "")
-      + ". A venda continua em branco.");
+    const econ = trocados.reduce((a, t) => a + (t.economia || 0), 0);
+    setPesqMsg(`Carregado em ${escrever.length} ${escrever.length === 1 ? "item" : "itens"}`
+      + (trocados.length ? ` · ${trocados.length} ${trocados.length === 1 ? "estava" : "estavam"} mais caro${trocados.length === 1 ? "" : "s"} (economia ${brl(econ)})` : "")
+      + (recusados.length ? ` · ${recusados.length} mantido${recusados.length === 1 ? "" : "s"} como ${recusados.length === 1 ? "estava" : "estavam"}` : "")
+      + ". Venda em branco.");
+    return escrever.length;
   }
 
-  async function pesquisarComDwight(forcar = false) {
+  function desfazerDwight() {
+    if (!desfazer) return;
+    const { idx, antes } = desfazer;
+    const mapa = new Map(antes.map(({ i, item }) => [i, item]));
+    setPropostas((prev) => prev.map((p, pi) => pi !== idx ? p : {
+      ...p, itens: (p.itens || []).map((it, i) => mapa.has(i) ? mapa.get(i) : it),
+    }));
+    setDesfazer(null);
+    _dispararAutoSave();
+    setPesqMsg("Desfeito — os itens voltaram ao que estavam.");
+  }
+
+  // Chegou resultado novo e o automático está ligado? Carrega. Cada item é
+  // aplicado UMA vez: se o operador desfizer ou mexer, não volta a ser escrito.
+  useEffect(() => {
+    if (!pesqAuto) return;
+    const lista = (propostas[propostaIdx]?.itens) || [];
+    const novos = lista
+      .filter((it) => {
+        const uid = String(it.item_uid || "").toLowerCase();
+        if (!uid || autoAplicadosRef.current.has(uid)) return false;
+        const of = ofertaDwight(it, pesq.itens);
+        return !!of && decidirEscrita(it, of).escreve;
+      })
+      .map((it) => String(it.item_uid).toLowerCase());
+    if (!novos.length) return;
+    novos.forEach((u) => autoAplicadosRef.current.add(u));
+    carregarDwight(novos);
+  }, [pesq.itens, pesqAuto, propostaIdx]);
+
+  async function pesquisarComDwight(forcar = false, itemUids = null) {
     if (!numeroAtual || pesqEnviando) return;
     setPesqEnviando(true); setPesqMsg("");
     try {
@@ -2365,16 +2443,10 @@ export default function App() {
       await salvarRascunho(true);
       const r = await fetch(`${API}/propostas/${encodeURIComponent(numeroAtual)}/pesquisa-dwight`, {
         method: "POST", headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify(forcar ? { forcar: true } : {}),
+        body: JSON.stringify({ ...(forcar ? { forcar: true } : {}),
+                               ...(itemUids ? { item_uids: itemUids } : {}) }),
       });
       const d = await r.json().catch(() => ({}));
-      if (r.status === 409 && !forcar) {
-        if (window.confirm(`${d.detail || "Já existe pesquisa em andamento."}\n\nEnviar de novo mesmo assim?`)) {
-          setPesqEnviando(false);
-          return pesquisarComDwight(true);
-        }
-        return;
-      }
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
       setPesqMsg(d.enviados > 0
         ? `${d.enviados} ${d.enviados === 1 ? "item enviado" : "itens enviados"} ao Dwight. O resultado aparece em cada item.`
@@ -3107,16 +3179,26 @@ export default function App() {
                     {pesqEnviando ? "Enviando…" : "🔎 pesquisar com o Dwight"}
                   </button>
                   {(() => {
-                    const n = (prop.itens || []).filter((it) => ofertaRecomendada(it)).length;
+                    const n = (prop.itens || []).filter((it) => {
+                      const of = ofertaRecomendada(it);
+                      return of && decidirEscrita(it, of).escreve;
+                    }).length;
                     if (!n) return null;
                     return (
-                      <button onClick={usarTodasDwight}
+                      <button onClick={() => carregarDwight()}
                         className="rounded-lg border border-line2 bg-surface px-3 py-1.5 font-medium text-sub hover:border-kist hover:text-kist"
-                        title="Aplica o custo e a origem da oferta recomendada nos itens que ainda estão em branco">
-                        usar todas as recomendadas ({n})
+                        title="Carrega custo e origem: item em branco, ou oferta mais barata que a que está lá">
+                        carregar itens do Dwight ({n})
                       </button>
                     );
                   })()}
+                  <label className="flex items-center gap-1.5 text-faint" title="Carrega sozinho quando o resultado chega">
+                    <input type="checkbox" checked={pesqAuto} onChange={(e) => alternarAuto(e.target.checked)} />
+                    preencher sozinho
+                  </label>
+                  {desfazer && (
+                    <button onClick={desfazerDwight} className="text-[11.5px] text-kist hover:underline">desfazer</button>
+                  )}
                   {pesq.aguardando > 0 && (
                     <span className="text-sub">{pesq.aguardando} {pesq.aguardando === 1 ? "item aguardando" : "itens aguardando"} pesquisa</span>
                   )}
@@ -3195,7 +3277,10 @@ export default function App() {
                     <tbody>
                       {(prop.itens || []).map((item, i) => (
                         <ItemRow key={i} item={item} index={i} onChange={atualizarItem} onRemove={removerItem} token={token} apiUrl={API} fonteTexto={prop.fonte_texto} cnpj={prop.cnpj} propostaId={propostaId} onSalvar={salvarRascunho}
-                          dwight={item?.item_uid ? pesq.itens[String(item.item_uid).toLowerCase()] : null} />
+                          dwight={item?.item_uid ? pesq.itens[String(item.item_uid).toLowerCase()] : null}
+                          onPesquisarItem={item?.item_uid
+                            ? () => pesquisarComDwight(true, [String(item.item_uid).toLowerCase()])
+                            : null} />
                       ))}
                     </tbody>
                   </table>

@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.62"
+VERSAO_BACKEND = "3.63"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -384,6 +384,7 @@ _API_ESCOPOS = ("leitura", "escrita", "admin", "pesquisa")
 # que ela faz é escrever uma sugestão que o operador ainda precisa aceitar.
 _ROTAS_ESCOPO_PESQUISA = (
     ("POST", re.compile(r"^/propostas/[^/]+/pesquisa-resultado/?$")),
+    ("GET",  re.compile(r"^/propostas/[^/]+/fonte/?$")),
     ("GET",  re.compile(r"^/api/whoami/?$")),
 )
 
@@ -2541,6 +2542,7 @@ def whoami(request: Request, usuario: str = Depends(verificar_token)):
                    "escrita": ["GET", "POST", "PUT", "PATCH"],
                    "admin":   ["GET", "POST", "PUT", "PATCH", "DELETE"],
                    "pesquisa": ["POST /propostas/{numero}/pesquisa-resultado",
+                                "GET /propostas/{numero}/fonte",
                                 "GET /api/whoami"]}.get(escopo, ["GET"])
     else:
         escopo, credencial = "sem_restricao", "google_oauth"
@@ -5247,21 +5249,39 @@ async def pesquisa_dwight_disparar(ref: str, request: Request,
     prop = _resolver_proposta(sb, ref)
     numero = str(prop.get("numero_proposta") or "")
     itens = _uids_da_proposta(sb, prop["id"])
+
+    # PADRÃO (17/09, decisão do Leonardo): vão TODOS os itens, inclusive os que já
+    # têm preço e match exato no banco — o mercado pode estar mais barato que o
+    # custo gravado, e quem compara é a tela, na chegada. `item_uids` restringe
+    # (botão por item); `somente_sem_match` volta ao filtro antigo.
     filtro = {str(u).lower() for u in (corpo.get("item_uids") or []) if u}
-    alvo = [(u, it) for u, it in itens.items()
-            if (u in filtro if filtro else _item_elegivel_pesquisa(it))]
+    if filtro:
+        alvo = [(u, it) for u, it in itens.items() if u in filtro]
+    elif corpo.get("somente_sem_match"):
+        alvo = [(u, it) for u, it in itens.items() if _item_elegivel_pesquisa(it)]
+    else:
+        alvo = list(itens.items())
     if not alvo:
         return {"external_key": None, "enviados": 0, "itens": [],
-                "motivo": "Nenhum item sem match ou com match incerto nesta proposta."}
+                "motivo": "Nenhum item para pesquisar nesta proposta."}
 
+    # Item que JÁ está aguardando não é reenviado (o retorno viria duplicado e o
+    # Dwight pesquisaria duas vezes o mesmo). `forcar` reenvia mesmo assim.
+    repetidos = []
     if not corpo.get("forcar"):
         desde = (_dt_ext.utcnow() - _td_ext(seconds=_PESQ_JANELA_DUPLICADO_S)).isoformat()
-        pend = (sb.table("pesquisa_resultados").select("id")
+        pend = (sb.table("pesquisa_resultados").select("item_uid")
                   .eq("proposta_id", prop["id"]).eq("status", "aguardando")
-                  .gte("criado_em", desde).limit(1).execute())
-        if pend.data:
-            raise HTTPException(409, "Já existe pesquisa em andamento para esta proposta. "
-                                     "Aguarde o retorno ou confirme um novo envio.")
+                  .gte("criado_em", desde).limit(500).execute())
+        espera = {str(l.get("item_uid") or "").lower() for l in (pend.data or [])}
+        if espera:
+            repetidos = [u for u, _ in alvo if u in espera]
+            alvo = [(u, it) for u, it in alvo if u not in espera]
+        if not alvo:
+            return {"external_key": None, "enviados": 0, "itens": [],
+                    "repetidos": repetidos,
+                    "motivo": (f"{len(repetidos)} item(ns) já está(ão) em pesquisa. "
+                               f"Aguarde o retorno.")}
 
     external_key = f"cabine-{numero or prop['id']}-{int(time.time())}"
     linhas = [{
@@ -5290,11 +5310,19 @@ async def pesquisa_dwight_disparar(ref: str, request: Request,
         } for u, it in alvo],
         "retorno": {"metodo": "POST",
                     "url": f"{CABINE_PUBLIC_URL}/propostas/{numero or prop['id']}/pesquisa-resultado"},
+        # Ponteiro, não conteúdo: o texto do e-mail só é lido quando o Dwight tem
+        # dúvida. Mandar 3,5 mil caracteres em toda pesquisa seria token gasto em
+        # 90% dos casos que não precisam.
+        "fonte": {"metodo": "GET",
+                  "url": f"{CABINE_PUBLIC_URL}/propostas/{numero or prop['id']}/fonte",
+                  "chars": len(str(prop.get("fonte_texto") or "")),
+                  "quando": "só em caso de dúvida sobre o que o cliente pediu"},
         "dry_run": False,
     }
     _threading.Thread(target=_despachar_webhook_dwight, args=(payload, external_key),
                       daemon=True).start()
-    return {"external_key": external_key, "enviados": len(alvo), "itens": [u for u, _ in alvo]}
+    return {"external_key": external_key, "enviados": len(alvo),
+            "itens": [u for u, _ in alvo], "repetidos": repetidos}
 
 
 @app.post("/propostas/{ref}/pesquisa-resultado")
@@ -5385,6 +5413,32 @@ async def pesquisa_resultado_receber(ref: str, payload: dict,
         recebidos += 1
 
     return {"recebidos": recebidos, "ignorados": ignorados}
+
+
+@app.get("/propostas/{ref}/fonte", response_class=PlainTextResponse)
+async def pesquisa_fonte(ref: str, compacto: str = "1", usuario: str = Depends(verificar_token)):
+    """O texto que a IA leu na extração, em TEXTO PURO — a via mais barata.
+
+    Existe para o agente tirar dúvida sobre o que o cliente pediu (CNPJ,
+    endereço, prazo, condição, observação) sem que a Cabine empurre 3,5 mil
+    caracteres em toda pesquisa. Sem JSON em volta: o envelope custaria tokens
+    que o conteúdo não precisa.
+
+    `compacto=1` (padrão) colapsa espaço e linha repetida. `compacto=0` devolve
+    o texto exatamente como a IA leu.
+    """
+    sb = get_supabase()
+    prop = _resolver_proposta(sb, ref)
+    txt = str(prop.get("fonte_texto") or "")
+    if not txt.strip():
+        raise HTTPException(404, "Esta proposta não tem o texto da extração guardado "
+                                 "(é anterior ao recurso, ou foi digitada à mão).")
+    if str(compacto).strip().lower() not in ("0", "false", "nao", "não", "off"):
+        txt = re.sub(r"[ \t]+", " ", txt)
+        txt = re.sub(r"\n{3,}", "\n\n", txt)
+        txt = "\n".join(l.strip() for l in txt.splitlines())
+        txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
+    return txt
 
 
 @app.get("/propostas/{ref}/pesquisa-resultado")
