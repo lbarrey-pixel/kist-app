@@ -1834,6 +1834,56 @@ export function vendaPelaMediana(custo, fator) {
   return Math.round(c * f * 100) / 100;
 }
 
+// Monta o plano de "carregar itens do Dwight" — SEM tocar em estado do React,
+// para dar pra testar de verdade (não só compilar). Bug real corrigido aqui
+// (18/09, Convergint): item que já tinha o MESMO custo do Dwight (aplicado
+// antes por "usar esta") não entrava em `escrever`, e a venda ficava sem
+// calcular junto mesmo havendo mediana pronta. `elegiveisVenda` é uma lista
+// PRÓPRIA — venda entra sempre que estiver em branco e existir custo para
+// multiplicar, de agora (oferta nova) ou de antes (custo que já estava lá).
+export function planoCarregamentoDwight(itens, mapaPesquisa, markups, uidsFiltro) {
+  const escrever = [], trocados = [], recusados = [], elegiveisVenda = [];
+  (itens || []).forEach((it, i) => {
+    if (uidsFiltro && !uidsFiltro.includes(String(it.item_uid || "").toLowerCase())) return;
+    const of = ofertaDwight(it, mapaPesquisa);
+    let seraEscrito = false;
+    if (of) {
+      const d = decidirEscrita(it, of);
+      if (d.escreve) {
+        escrever.push([i, of]);
+        seraEscrito = true;
+        if (d.motivo === "mais_barato") trocados.push({ i, economia: d.economia });
+      } else {
+        recusados.push(i);
+      }
+    }
+    // Custo que vai valer DEPOIS desta operação: o novo, se for escrito agora;
+    // senão o que já está no item. Cobre os DOIS casos que já causaram bug:
+    // item novo (custo chega agora, pela oferta) e item que já tinha o mesmo
+    // custo de antes (não é reescrito, mas a venda ainda pode ser calculada).
+    if (markups && !(Number(it.preco_un) > 0)) {
+      const custoFinal = seraEscrito ? custoDaOferta(of) : Number(it.preco_custo);
+      if (custoFinal > 0) elegiveisVenda.push(i);
+    }
+  });
+
+  const vendas = new Map();
+  const fontes = new Set();
+  if (markups) {
+    const mapaOfertas = new Map(escrever);
+    elegiveisVenda.forEach((i) => {
+      const it = itens[i];
+      const mk = markups[String(it.item_uid || "").toLowerCase()];
+      if (!mk?.fator) return;
+      const of = mapaOfertas.get(i);
+      const custoBase = of ? custoDaOferta(of) : Number(it.preco_custo);
+      const v = vendaPelaMediana(custoBase, mk.fator);
+      if (v != null) { vendas.set(i, v); if (mk.fonte) fontes.add(mk.fonte); }
+    });
+  }
+  return { escrever, trocados, recusados, vendas, fontes };
+}
+
 // Aplica a oferta: custo e origem. A VENDA não é tocada — a internet é custo,
 // o preço de venda é decisão do operador.
 export function aplicarOfertaDwight(it, of) {
@@ -2405,65 +2455,39 @@ export default function App() {
   const ofertaRecomendada = (it) => ofertaDwight(it, pesq.itens);
 
   // Carrega no item o que o Dwight achou, pela regra: item em branco, ou oferta
-  // mais barata que o custo que está lá. A VENDA nunca é tocada — a internet é
-  // custo; a venda é decisão do operador. Guarda o valor anterior para desfazer.
+  // mais barata que o custo que está lá. Guarda o valor anterior para desfazer.
   function carregarDwight(uidsFiltro = null, markups = null) {
     const lista = (propostas[propostaIdx]?.itens) || [];
-    const escrever = [], trocados = [], recusados = [];
-    lista.forEach((it, i) => {
-      if (uidsFiltro && !uidsFiltro.includes(String(it.item_uid || "").toLowerCase())) return;
-      const of = ofertaRecomendada(it);
-      if (!of) return;
-      const d = decidirEscrita(it, of);
-      if (!d.escreve) { recusados.push(i); return; }
-      escrever.push([i, of]);
-      if (d.motivo === "mais_barato") trocados.push({ i, economia: d.economia });
-    });
-    if (!escrever.length) {
-      setPesqMsg(recusados.length
+    const plano = planoCarregamentoDwight(lista, pesq.itens, markups, uidsFiltro);
+    if (!plano.escrever.length && !plano.vendas.size) {
+      setPesqMsg(plano.recusados.length
         ? "Nada a carregar: os itens pesquisados já têm origem igual ou mais barata."
         : "Nenhuma oferta do Dwight para carregar.");
       return 0;
     }
-    const antes = escrever.map(([i]) => ({ i, item: lista[i] }));
-    const mapa = new Map(escrever);
-
-    // Venda pela mediana: calculada ANTES de mexer no estado, para a conta não
-    // depender de quantas vezes o React rodar a função de atualização. Só entra
-    // em item com a venda EM BRANCO — preço que o operador digitou é dele.
-    const vendas = new Map();
-    const fontes = new Set();
-    if (markups) {
-      escrever.forEach(([i, of]) => {
-        const it = lista[i];
-        const mk = markups[String(it.item_uid || "").toLowerCase()];
-        if (!mk?.fator || Number(it.preco_un) > 0) return;
-        const v = vendaPelaMediana(custoDaOferta(of), mk.fator);
-        if (v != null) { vendas.set(i, v); if (mk.fonte) fontes.add(mk.fonte); }
-      });
-    }
-    const comVenda = vendas.size;
-
+    const antes = plano.escrever.map(([i]) => ({ i, item: lista[i] }));
+    const mapa = new Map(plano.escrever);
     setPropostas((prev) => prev.map((p, pi) => pi !== propostaIdx ? p : {
       ...p,
       itens: (p.itens || []).map((it, i) => {
         const of = mapa.get(i);
-        if (!of) return it;
-        const novo = aplicarOfertaDwight(it, of);
-        if (vendas.has(i)) novo.preco_un = vendas.get(i);
+        if (!of && !plano.vendas.has(i)) return it;
+        const novo = of ? aplicarOfertaDwight(it, of) : { ...it };
+        if (plano.vendas.has(i)) novo.preco_un = plano.vendas.get(i);
         return novo;
       }),
     }));
     setDesfazer({ idx: propostaIdx, antes });
     _dispararAutoSave();
-    const econ = trocados.reduce((a, t) => a + (t.economia || 0), 0);
-    setPesqMsg(`Carregado em ${escrever.length} ${escrever.length === 1 ? "item" : "itens"}`
-      + (trocados.length ? ` · ${trocados.length} ${trocados.length === 1 ? "estava" : "estavam"} mais caro${trocados.length === 1 ? "" : "s"} (economia ${brl(econ)})` : "")
-      + (recusados.length ? ` · ${recusados.length} mantido${recusados.length === 1 ? "" : "s"} como ${recusados.length === 1 ? "estava" : "estavam"}` : "")
+    const econ = plano.trocados.reduce((a, t) => a + (t.economia || 0), 0);
+    const comVenda = plano.vendas.size;
+    setPesqMsg(`Carregado em ${plano.escrever.length} ${plano.escrever.length === 1 ? "item" : "itens"}`
+      + (plano.trocados.length ? ` · ${plano.trocados.length} ${plano.trocados.length === 1 ? "estava" : "estavam"} mais caro${plano.trocados.length === 1 ? "" : "s"} (economia ${brl(econ)})` : "")
+      + (plano.recusados.length ? ` · ${plano.recusados.length} mantido${plano.recusados.length === 1 ? "" : "s"} como ${plano.recusados.length === 1 ? "estava" : "estavam"}` : "")
       + (markups
-          ? ` · venda pela mediana em ${comVenda} ${comVenda === 1 ? "item" : "itens"}${fontes.size ? ` (${[...fontes].join(", ")})` : ""}`
+          ? ` · venda pela mediana em ${comVenda} ${comVenda === 1 ? "item" : "itens"}${plano.fontes.size ? ` (${[...plano.fontes].join(", ")})` : ""}`
           : ". Venda em branco."));
-    return escrever.length;
+    return plano.escrever.length + comVenda;
   }
 
   // "carregar com venda": custo e origem do Dwight + venda pela mediana de lucro
