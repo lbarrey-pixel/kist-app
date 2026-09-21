@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_ext
 
-VERSAO_BACKEND = "3.80"
+VERSAO_BACKEND = "3.81"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -2169,13 +2169,57 @@ def _normalizar_desconto(v, subtotal: float):
     return (val if val > 0 else None), ""
 
 
+# ── CAMPOS DA PROPOSTA (v3.81) — o que um bot pode gravar no /salvar-proposta ──
+# Mesma ideia das regras do Tiny: uma fonte só, servida em GET /api/guia/proposta.
+# Sem isto os bots só usariam frete de vinda / frete de ida se adivinhassem o nome.
+_CAMPOS_PROPOSTA = [
+    ("proposta", "Número da proposta", False, "R-<id> ou número do Tiny. Em branco: a Cabine abre um rascunho e devolve o número em \"numero\"."),
+    ("cliente", "Cliente", True, "Razão social completa (não apelido)."),
+    ("cnpj", "CNPJ do cliente", True, "14 dígitos, com ou sem máscara, dígito verificador válido."),
+    ("usuario_nome", "Operador", False, "Nome completo de quem responde pela proposta (ex.: Leonardo)."),
+    ("condicao_pagamento", "Condição de pagamento", False, "Ex.: 30 · 30 dias · 30/60/90 · 3x. Formatos no guia de exportação."),
+    ("prazo_entrega", "Prazo de entrega", False, "Texto livre, até 200 caracteres."),
+    ("frete", "Frete COBRADO do cliente (R$)", False, "Receita: vai para o orçamento no Tiny."),
+    ("frete_ida", "Frete de IDA (R$)", False, "CUSTO interno do envio ao cliente, UM valor por proposta. Entra no custo e no lucro; não vai ao Tiny; segue para a ordem de compra. Omitir o campo mantém o valor já lançado."),
+    ("outros_itens", "Outros itens ou serviços", False, "Texto livre; vai para o Tiny."),
+    ("itens[].descricao_original", "Descrição do cliente", True, "Como o cliente escreveu. Nunca reescrever."),
+    ("itens[].descricao_final", "Descrição comercial", False, "Texto da proposta. Em branco usa a do cliente."),
+    ("itens[].quantidade", "Quantidade", True, "Número maior que zero."),
+    ("itens[].unidade", "Unidade", False, "UN, M, PC, CX, KG, RL..."),
+    ("itens[].preco_un", "Preço unitário de VENDA (R$)", False, "O que o cliente paga por unidade."),
+    ("itens[].preco_custo", "Custo unitário (R$)", False, "Quanto a Kist paga por unidade."),
+    ("itens[].frete_vinda", "Frete de VINDA do item (R$)", False, "CUSTO de trazer o item do fornecedor, UM valor por item (NÃO multiplica pela quantidade). Entra no custo e no lucro; não vai ao Tiny; segue para a ordem de compra."),
+    ("itens[].fornecedor", "Fornecedor (quem)", False, "Loja ou distribuidor da origem do custo."),
+    ("itens[].link_fornecedor", "Link da origem", False, "URL do anúncio/produto."),
+    ("itens[].fornecedor_canal", "Canal", False, "link · whatsapp · email · telefone · loja · outro."),
+    ("itens[].fornecedor_contato", "Contato", False, "Número, e-mail ou URL do canal."),
+    ("itens[].sku_fornecedor", "SKU do fornecedor", False, "Até 30 caracteres."),
+    ("itens[].item_uid", "Identificador do item", False, "Mantenha o que a Cabine devolveu ao editar; é por ele que a pesquisa de preço volta."),
+]
+
+
+def _guia_proposta() -> str:
+    linhas = ["GUIA DE CAMPOS — PROPOSTA (POST /salvar-proposta)",
+              f"(gerado pela Cabine v{VERSAO_BACKEND})", "",
+              "Custo e lucro da proposta = venda − NF − (custo × quantidade de cada item)",
+              "                            − frete de vinda de cada item − frete de ida da proposta.",
+              "Fretes de vinda e de ida são CUSTO interno: não vão ao Tiny. Frete cobrado ('frete') é receita e vai.",
+              "Ler de volta: GET /propostas/{numero}/detalhe (traz os mesmos campos).", ""]
+    for campo, rotulo, obrig, regra in _CAMPOS_PROPOSTA:
+        linhas.append(f"[{campo}] {rotulo}{' — OBRIGATÓRIO' if obrig else ''}")
+        linhas.append(f"  {regra}")
+    return "\n".join(linhas).strip() + "\n"
+
+
 def _guia_exportacao_tiny() -> str:
     """Guia em texto puro, gerado das regras — o bot lê isto em runtime."""
     linhas = ["GUIA DE PREENCHIMENTO — EXPORTAÇÃO DE PROPOSTA PARA O TINY",
               f"(gerado pela Cabine v{VERSAO_BACKEND}; é a mesma regra que a tela e a prévia aplicam)", "",
               "Fluxo: 1) POST /propostas/exportar-tiny/previa  2) corrija o que vier em 'erros' e",
               "leia 'campos' e 'avisos'  3) só então POST /propostas/exportar-tiny.",
-              "Campo em branco vai em branco. Obrigatórios: CNPJ, e em cada item descrição e quantidade.", ""]
+              "Campo em branco vai em branco. Obrigatórios: CNPJ, e em cada item descrição e quantidade.",
+              "Não vão ao Tiny (custo interno): frete_ida da proposta e frete_vinda dos itens —",
+              "ver GET /api/guia/proposta.", ""]
     for c in _CAMPOS_TINY:
         linhas.append(f"[{c['campo']}] {c['rotulo']}{' — OBRIGATÓRIO' if c.get('obrigatorio') else ''}")
         linhas.append(f"  formato: {c['formato']}")
@@ -2515,6 +2559,17 @@ async def guia_exportacao_tiny(formato: str = "texto", usuario: str = Depends(ve
                 "campos": [{k: c[k] for k in ("campo", "rotulo", "obrigatorio", "formato", "exemplos", "no_tiny")}
                            for c in _CAMPOS_TINY]}
     return PlainTextResponse(_guia_exportacao_tiny())
+
+
+@app.get("/api/guia/proposta")
+async def guia_proposta(formato: str = "texto", usuario: str = Depends(verificar_token)):
+    """Campos que um bot pode gravar no /salvar-proposta (inclusive os fretes de
+    custo), gerados de uma fonte só. `?formato=json` devolve a lista estruturada."""
+    if str(formato).lower() == "json":
+        return {"versao": VERSAO_BACKEND,
+                "campos": [{"campo": c, "rotulo": r, "obrigatorio": o, "regra": g}
+                           for c, r, o, g in _CAMPOS_PROPOSTA]}
+    return PlainTextResponse(_guia_proposta())
 
 
 @app.post("/propostas/exportar-tiny/previa")
@@ -3049,7 +3104,8 @@ def whoami(request: Request, usuario: str = Depends(verificar_token)):
         "versao_backend": VERSAO_BACKEND,
         # Onde o bot aprende a preencher cada campo (texto puro, gerado das
         # mesmas regras que a tela e a prévia aplicam). Leia antes de exportar.
-        "guias": {"exportacao_tiny": "/api/guia/exportacao-tiny"},
+        "guias": {"proposta": "/api/guia/proposta",
+                  "exportacao_tiny": "/api/guia/exportacao-tiny"},
         "docs": "/docs",
     }
 
