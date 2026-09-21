@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.68"
+VERSAO_BACKEND = "3.70"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -326,6 +326,13 @@ async def _guarda_escopo_api(request: Request, call_next):
             _logar(403, bloqueado=True, motivo=motivo)
             return _nega_escopo(motivo)
 
+    elif escopo == "dwight_dispatch":
+        if not _rota_permitida_dwight_dispatch(metodo, request.url.path):
+            motivo = ("Chave de escopo 'dwight_dispatch' só pode chamar "
+                      "POST /propostas/{numero}/pesquisa-dwight e GET /api/whoami.")
+            _logar(403, bloqueado=True, motivo=motivo)
+            return _nega_escopo(motivo)
+
     elif escopo != "admin":
         if rota_norm in _rotas_admin() or metodo == "DELETE":
             motivo = f"Esta rota exige escopo 'admin'. Sua chave tem '{escopo}'."
@@ -377,7 +384,7 @@ _token_cache: dict = {}
 # match_memoria; uma identidade "api@kist" criaria um operador fantasma no
 # aprendizado e quebraria a rastreabilidade que custou a v3.20 para existir.
 API_KEY_PREFIXO = "kist_sk_"
-_API_ESCOPOS = ("leitura", "escrita", "admin", "pesquisa")
+_API_ESCOPOS = ("leitura", "escrita", "admin", "pesquisa", "dwight_dispatch")
 
 # Escopo `pesquisa` (v3.61): chave de um agente que SÓ devolve resultado de
 # pesquisa de preço. Não lê proposta, não salva, não exporta. Se vazar, o pior
@@ -387,6 +394,19 @@ _ROTAS_ESCOPO_PESQUISA = (
     ("GET",  re.compile(r"^/propostas/[^/]+/fonte/?$")),
     ("GET",  re.compile(r"^/api/whoami/?$")),
 )
+
+# Escopo `dwight_dispatch` (v3.70): um agente PRÓPRIO do Leonardo pode pedir a
+# busca — mas só essa rota, e o próprio disparo tem um curral por dentro (ver
+# `_validar_disparo_api` e `_LIMITE_*` mais abaixo): cotação real, e um teto de
+# quantas vezes por hora/dia. Curral, não cadeado: a chave PODE chamar, só não
+# pode chamar qualquer coisa, a qualquer hora, sem limite.
+_ROTAS_ESCOPO_DWIGHT_DISPATCH = (
+    ("POST", re.compile(r"^/propostas/[^/]+/pesquisa-dwight/?$")),
+    ("GET",  re.compile(r"^/api/whoami/?$")),
+)
+
+def _rota_permitida_dwight_dispatch(metodo: str, caminho: str) -> bool:
+    return any(metodo == m and rx.match(caminho or "") for m, rx in _ROTAS_ESCOPO_DWIGHT_DISPATCH)
 
 def _rota_permitida_pesquisa(metodo: str, caminho: str) -> bool:
     return any(metodo == m and rx.match(caminho or "") for m, rx in _ROTAS_ESCOPO_PESQUISA)
@@ -2042,11 +2062,34 @@ async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verifica
         contato = _tiny.achar_contato(cnpj)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"falha ao buscar contato: {str(e)[:200]}")
+
+    contato_criado = None
+    if (not contato or not contato.get("id")) and payload.get("criar_contato_se_ausente"):
+        # OPT-IN (v3.69): só cadastra quando o PEDIDO pede — nunca por padrão.
+        # HISTÓRICO: a rota recusava mesmo com CNPJ real e dados completos via
+        # BrasilAPI (caso Igreja Universal, filial de Porto Alegre). Mas isto
+        # grava direto no ERP financeiro, e o esquema do corpo NÃO foi
+        # confirmado contra uma conta Tiny real — por isso o padrão continua
+        # sendo recusar, e criar só quando pedido explicitamente.
+        try:
+            receita = _consulta_receita(cnpj) or {}
+            novo = _tiny.criar_contato(cnpj, receita)
+            contato = novo
+            contato_criado = {"id": novo.get("id"), "nome": novo.get("nome"),
+                              "cnpj": _cnpj_formatado(cnpj),
+                              "fonte_dados": "BrasilAPI" if receita else "so o CNPJ"}
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"cliente {_cnpj_formatado(cnpj)} nao existe no Tiny e o cadastro "
+                        f"automatico falhou: {str(e)[:200]} — cadastre manualmente."))
+
     if not contato or not contato.get("id"):
         raise HTTPException(
             status_code=404,
-            detail=(f"cliente {_cnpj_formatado(cnpj)} nao existe no Tiny. "
-                    "Cadastre-o la primeiro — esta rota nao cria contato."))
+            detail=(f"cliente {_cnpj_formatado(cnpj)} nao existe no Tiny. Cadastre-o la "
+                    "primeiro, ou mande \"criar_contato_se_ausente\": true para a Cabine "
+                    "cadastrar sozinha com os dados da Receita."))
 
     # SKU derivado do ITEM, não do cliente: assim o mesmo produto vendido a dois
     # clientes compartilha código, e um dia dá para olhar para trás e ver quantas
@@ -2189,6 +2232,8 @@ async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verifica
              "cliente_tiny": contato.get("nome") or contato.get("razaoSocial")}
     if banco:
         saida["banco"] = banco
+    if contato_criado:
+        saida["contato_criado"] = contato_criado
     return saida
 
 
@@ -2543,7 +2588,9 @@ def whoami(request: Request, usuario: str = Depends(verificar_token)):
                    "admin":   ["GET", "POST", "PUT", "PATCH", "DELETE"],
                    "pesquisa": ["POST /propostas/{numero}/pesquisa-resultado",
                                 "GET /propostas/{numero}/fonte",
-                                "GET /api/whoami"]}.get(escopo, ["GET"])
+                                "GET /api/whoami"],
+                   "dwight_dispatch": ["POST /propostas/{numero}/pesquisa-dwight",
+                                       "GET /api/whoami"]}.get(escopo, ["GET"])
     else:
         escopo, credencial = "sem_restricao", "google_oauth"
         metodos = ["GET", "POST", "PUT", "PATCH", "DELETE"]
@@ -3196,7 +3243,15 @@ diferente = null; spec divergente = não é o mesmo item, mesmo que a descriçã
         raw_match = resp_match.content[0].text.strip()
         raw_match = re.sub(r'^```(?:json)?\s*', '', raw_match)
         raw_match = re.sub(r'\s*```$', '', raw_match.strip())
-        return {m["indice"]: m for m in _jm.loads(raw_match).get("matches", [])}
+        # v3.69 — caso 25 itens (17/09): "Extra data: line 38 column 1" — o Haiku
+        # devolveu o JSON válido e, DEPOIS dele, mais texto (comentário, JSON
+        # repetido). `json.loads` exige a string INTEIRA ser um documento só e
+        # rejeitava a resposta inteira por causa do que vinha depois do que já
+        # importava. `raw_decode` lê só o primeiro objeto válido e ignora o
+        # resto — o mesmo padrão de tolerância que já usamos pra resposta da IA
+        # em outros pontos do arquivo.
+        obj, _ = _jm.JSONDecoder().raw_decode(raw_match)
+        return {m["indice"]: m for m in obj.get("matches", [])}
 
     # PARALELO entre lotes (v3.67): lotes são INDEPENDENTES (cada um só enxerga
     # seus próprios itens e candidatos), então rodar em série era espera de graça.
@@ -5373,18 +5428,86 @@ def _despachar_webhook_dwight(payload: dict, external_key: str) -> None:
         pass
 
 
+_PLACEHOLDERS_DESCRICAO = {"x", "xx", "xxx", "-", "--", "n/a", "na", "null",
+                          "undefined", "teste", "test", "item", "produto",
+                          "1", "a", "."}
+_DISPARO_API_MAX_HORA = 5        # disparos (não itens) por chave, por hora
+_DISPARO_API_MAX_ITENS_DIA = 150  # itens somados, por chave, por 24h
+
+
+def _validar_cotacao_real(prop: dict, itens: dict) -> str:
+    """Devolve o MOTIVO da recusa, ou "" se a cotação passa no curral.
+
+    v3.70 — "proibir não é o caminho, o caminho é desenhar o curral" (Leonardo,
+    18/09): a chave de um agente PODE disparar a pesquisa, mas só para uma
+    cotação que se pareça mesmo com uma cotação — CNPJ válido, cliente com
+    nome, itens de verdade. O objetivo não é adivinhar intenção, é recusar o
+    caso óbvio de teste/lixo/rascunho vazio.
+    """
+    cnpj_dig = re.sub(r"\D", "", str(prop.get("cnpj") or ""))
+    if len(cnpj_dig) != 14 or not _cnpj_valido(cnpj_dig):
+        return "a proposta não tem CNPJ válido do cliente"
+    cliente = str(prop.get("cliente") or "").strip()
+    if len(cliente) < 3:
+        return "a proposta não tem nome de cliente preenchido"
+    if not itens:
+        return "a proposta não tem itens"
+    descricoes_ok = 0
+    for it in itens.values():
+        d = str(it.get("descricao_original") or it.get("descricao_final") or "").strip()
+        if len(d) >= 4 and d.lower() not in _PLACEHOLDERS_DESCRICAO:
+            descricoes_ok += 1
+    if descricoes_ok == 0:
+        return "nenhum item tem descrição que pareça real (todos vazios ou placeholder)"
+    return ""
+
+
+def _limite_disparo_api(sb, usuario: str) -> str:
+    """Devolve o MOTIVO do bloqueio, ou "" se a chave ainda está dentro do teto.
+
+    Dois limites independentes, cada um seu próprio motivo — para o agente
+    saber exatamente qual parede bateu e quando ela libera de novo.
+    """
+    agora = _dt_ext.utcnow()
+    uma_hora = (agora - _td_ext(hours=1)).isoformat()
+    r1 = (sb.table("pesquisa_resultados").select("external_key")
+            .eq("disparado_por", "api").eq("solicitado_por", usuario)
+            .gte("criado_em", uma_hora).limit(2000).execute())
+    disparos_hora = len({l.get("external_key") for l in (r1.data or []) if l.get("external_key")})
+    if disparos_hora >= _DISPARO_API_MAX_HORA:
+        return (f"esta chave já disparou {disparos_hora} pesquisas na última hora "
+                f"(teto: {_DISPARO_API_MAX_HORA}/hora). Aguarde antes de tentar de novo.")
+
+    um_dia = (agora - _td_ext(hours=24)).isoformat()
+    r2 = (sb.table("pesquisa_resultados").select("item_uid")
+            .eq("disparado_por", "api").eq("solicitado_por", usuario)
+            .gte("criado_em", um_dia).limit(5000).execute())
+    itens_dia = len(r2.data or [])
+    if itens_dia >= _DISPARO_API_MAX_ITENS_DIA:
+        return (f"esta chave já pediu pesquisa de {itens_dia} itens nas últimas 24h "
+                f"(teto: {_DISPARO_API_MAX_ITENS_DIA}/dia).")
+    return ""
+
+
 @app.post("/propostas/{ref}/pesquisa-dwight")
 async def pesquisa_dwight_disparar(ref: str, request: Request,
                                    usuario: str = Depends(verificar_token)):
     """Dispara a pesquisa de preço no Dwight para os itens sem match útil.
 
-    Só pela tela: agente não dispara agente. Corpo opcional:
-    `{"item_uids": [...]}` restringe a esses itens; `{"forcar": true}` ignora a
-    trava de disparo repetido.
+    Pela tela (Leonardo clicando) ou por uma chave de escopo 'dwight_dispatch'
+    (v3.70) — essa chave passa por um curral antes de disparar: CNPJ válido,
+    cliente e itens de verdade preenchidos (`_validar_cotacao_real`), e um teto
+    de frequência (`_limite_disparo_api`). A tela não passa por este curral —
+    o julgamento ali é do Leonardo.
+
+    Corpo opcional: `{"item_uids": [...]}` restringe a esses itens;
+    `{"forcar": true}` ignora a trava de disparo repetido.
     """
     esc, _, _ = _credencial_do_request(request.headers.get("authorization") or "")
-    if esc is not None:
-        raise HTTPException(403, "O disparo da pesquisa é feito pela tela, não por chave de API.")
+    if esc is not None and esc != "dwight_dispatch":
+        raise HTTPException(403, "O disparo da pesquisa é feito pela tela, ou por uma "
+                                 "chave de escopo 'dwight_dispatch'.")
+    disparado_por = "api" if esc == "dwight_dispatch" else "tela"
     if not (DWIGHT_WEBHOOK_URL and DWIGHT_WEBHOOK_KEY):
         raise HTTPException(503, "Pesquisa pelo Dwight não configurada "
                                  "(DWIGHT_WEBHOOK_URL / DWIGHT_WEBHOOK_KEY no Render).")
@@ -5398,6 +5521,17 @@ async def pesquisa_dwight_disparar(ref: str, request: Request,
     prop = _resolver_proposta(sb, ref)
     numero = str(prop.get("numero_proposta") or "")
     itens = _uids_da_proposta(sb, prop["id"])
+
+    if disparado_por == "api":
+        # O CURRAL: cotação de verdade, e dentro do teto de frequência. A tela
+        # (Leonardo clicando) não passa por isto — o julgamento é dele; a chave
+        # de agente precisa de trilhos porque ninguém está olhando por trás dela.
+        motivo_cotacao = _validar_cotacao_real(prop, itens)
+        if motivo_cotacao:
+            raise HTTPException(422, f"Disparo recusado: {motivo_cotacao}.")
+        motivo_limite = _limite_disparo_api(sb, usuario)
+        if motivo_limite:
+            raise HTTPException(429, f"Disparo recusado: {motivo_limite}")
 
     # PADRÃO (17/09, decisão do Leonardo): vão TODOS os itens, inclusive os que já
     # têm preço e match exato no banco — o mercado pode estar mais barato que o
@@ -5437,7 +5571,7 @@ async def pesquisa_dwight_disparar(ref: str, request: Request,
         "proposta_id": prop["id"], "numero_proposta": numero, "item_uid": u,
         "external_key": external_key, "origem": "dwight", "status": "aguardando",
         "descricao": _txt(it.get("descricao_original") or it.get("descricao_final"), 500),
-        "solicitado_por": usuario,
+        "solicitado_por": usuario, "disparado_por": disparado_por,
     } for u, it in alvo]
     sb.table("pesquisa_resultados").insert(linhas).execute()
 
