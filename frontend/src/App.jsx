@@ -81,6 +81,28 @@ export function mensagemPreviaTiny(pv) {
   ].join("\n");
 }
 
+export function dataCurtaBR(iso) {
+  try {
+    const d = new Date(iso);
+    if (isNaN(d)) return "—";
+    return d.toLocaleString("pt-BR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit",
+                                       timeZone: "America/Sao_Paulo" });
+  } catch { return "—"; }
+}
+
+// Resumo do disparo (v3.73): cache x fila. Puro, testável.
+export function resumoDisparoDwight(d) {
+  d = d || {};
+  const cache = Number(d.cache || 0), fila = Number(d.na_fila ?? d.enviados ?? 0);
+  const rep = (d.repetidos || []).length;
+  if (!cache && !fila) return d.motivo || (rep ? `${rep} item(ns) já estão em pesquisa.` : "Nenhum item para pesquisar.");
+  const partes = [];
+  if (cache) partes.push(`${cache} ${cache === 1 ? "item veio" : "itens vieram"} do cache (pesquisa recente)`);
+  if (fila) partes.push(`${fila} ${fila === 1 ? "item foi" : "itens foram"} para a fila do Dwight`);
+  if (rep) partes.push(`${rep} já estava${rep === 1 ? "" : "m"} em pesquisa`);
+  return partes.join(" · ") + ". O resultado aparece em cada item.";
+}
+
 function novoUid() {
   try { if (crypto?.randomUUID) return crypto.randomUUID(); } catch { /* segue */ }
   const h = "0123456789abcdef";
@@ -1412,7 +1434,7 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
                             {dwight.telemetria.paginas != null && `·${dwight.telemetria.paginas}p`}
                           </span>
                         )}
-                        {onPesquisarItem && dwight?.status !== "aguardando" && (
+                        {onPesquisarItem && dwight?.status !== "aguardando" && dwight?.status !== "na_fila" && (
                           <button onClick={onPesquisarItem}
                             title="Pesquisar só este item no Dwight"
                             className="rounded-md border border-line2 px-2 py-0.5 text-[10.5px] font-medium text-sub hover:border-kist hover:text-kist">
@@ -1422,8 +1444,16 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
                       </div>
                     </div>
 
+                    {dwight?.status === "na_fila" && (
+                      <div className="mt-1 text-[12px] text-sub">Na fila do Dwight…</div>
+                    )}
                     {dwight?.status === "aguardando" && (
                       <div className="mt-1 text-[12px] text-sub">Pesquisando…</div>
+                    )}
+                    {dwight?.status === "concluido" && dwight?.origem === "cache" && (
+                      <div className="mt-0.5 text-[10.5px] text-faint">
+                        do cache · pesquisado em {dataCurtaBR(dwight.telemetria?.cache_de)}
+                      </div>
                     )}
                     {dwight?.status === "expirado" && (
                       <div className="mt-1 text-[12px] text-amber">Sem retorno há mais de 3 h.</div>
@@ -2451,7 +2481,7 @@ export default function App() {
       const r = await fetch(`${API}/propostas/${encodeURIComponent(numero)}/pesquisa-resultado`, { headers: authHeaders() });
       if (!r.ok) { setPesq({ itens: {}, aguardando: 0 }); return; }
       const d = await r.json();
-      setPesq({ itens: d.itens || {}, aguardando: d.aguardando || 0 });
+      setPesq({ itens: d.itens || {}, aguardando: d.aguardando || 0, na_fila: d.na_fila || 0 });
     } catch { /* leitura silenciosa: a tela segue sem o card */ }
   }
 
@@ -2582,9 +2612,7 @@ export default function App() {
       });
       const d = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
-      setPesqMsg(d.enviados > 0
-        ? `${d.enviados} ${d.enviados === 1 ? "item enviado" : "itens enviados"} ao Dwight. O resultado aparece em cada item.`
-        : (d.motivo || "Nenhum item para pesquisar."));
+      setPesqMsg(resumoDisparoDwight(d));
       await carregarPesquisa(numeroAtual);
     } catch (e) {
       setPesqMsg(`Não consegui enviar (${e.message}).`);
@@ -3374,7 +3402,10 @@ export default function App() {
                     <button onClick={desfazerDwight} className="text-[11.5px] text-kist hover:underline">desfazer</button>
                   )}
                   {pesq.aguardando > 0 && (
-                    <span className="text-sub">{pesq.aguardando} {pesq.aguardando === 1 ? "item aguardando" : "itens aguardando"} pesquisa</span>
+                    <span className="text-sub">
+                      {pesq.aguardando} {pesq.aguardando === 1 ? "item aguardando" : "itens aguardando"} pesquisa
+                      {pesq.na_fila > 0 && ` (${pesq.na_fila} na fila)`}
+                    </span>
                   )}
                   {pesqMsg && <span className="text-faint">{pesqMsg}</span>}
                 </div>

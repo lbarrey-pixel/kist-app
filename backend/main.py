@@ -90,9 +90,9 @@ except Exception:
 # e erra. Este número é a única coisa que impede isso.
 import hashlib as _hashlib_ext
 import unicodedata
-from datetime import datetime as _dt_ext, timedelta as _td_ext
+from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_ext
 
-VERSAO_BACKEND = "3.72"
+VERSAO_BACKEND = "3.73"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -5541,11 +5541,175 @@ def _despachar_webhook_dwight(payload: dict, external_key: str) -> None:
         pass
 
 
+# ── FILA E CACHE DA PESQUISA (v3.73) ────────────────────────────────────────
+# Decisão do Leonardo (21/09): o limite de "5 disparos por hora" contava a coisa
+# errada — uma proposta de 40 itens pesava o mesmo que uma de 1. Agora a unidade
+# é o ITEM:
+#   · item pesquisado há menos de 1 DIA ÚTIL (horário de Brasília) volta do
+#     cache, sem acionar o Dwight — sexta 10h vale até segunda 10h;
+#   · o resto entra numa FILA e sai em lotes de até 5 itens da mesma proposta,
+#     com no máximo 2 lotes aguardando ao mesmo tempo. Cada retorno do Dwight
+#     puxa o próximo lote — não há rotina agendada.
+# Só resultado ENCONTRADO vira cache ("não encontrado" pesquisa de novo), e o
+# prazo conta sempre da pesquisa REAL: cópia de cache não renova a validade.
+_FILA_LOTE_ITENS = 5
+_FILA_LOTES_SIMULTANEOS = 2
+_BRT = _tz_ext(_td_ext(hours=-3))          # Brasil sem horário de verão desde 2019
+_fila_lock = _threading.Lock()
+
+
+def _chave_cache_item(it: dict) -> str:
+    """Identidade do item para o cache: descrição do cliente + specs, normalizadas.
+    Igualdade exata depois de normalizar — na dúvida, pesquisa de novo."""
+    desc = _norm_entrada(it.get("descricao_original") or it.get("descricao_final") or "")
+    specs = _norm_entrada(it.get("specs_complementares") or "")
+    return (desc + ("||" + specs if specs else ""))[:600]
+
+
+def _valido_ate_dia_util(quando) -> "datetime":
+    """Pesquisa feita em `quando` vale até o mesmo horário do PRÓXIMO dia útil."""
+    t = quando.astimezone(_BRT) + _td_ext(days=1)
+    while t.weekday() >= 5:               # sábado=5, domingo=6
+        t += _td_ext(days=1)
+    return t
+
+
+def _dt_iso(v):
+    try:
+        d = _dt_ext.fromisoformat(str(v).replace("Z", "+00:00"))
+        return d if d.tzinfo else d.replace(tzinfo=_tz_ext.utc)
+    except Exception:
+        return None
+
+
+def _buscar_cache(sb, chaves: set) -> dict:
+    """{chave: linha} com a pesquisa REAL (origem dwight) mais recente e ainda
+    válida de cada chave. Uma consulta só, filtrada em Python pela regra de dia útil."""
+    chaves = {c for c in chaves if c}
+    if not chaves:
+        return {}
+    desde = (_dt_ext.utcnow() - _td_ext(days=4)).isoformat()
+    r = (sb.table("pesquisa_resultados")
+           .select("id,chave_cache,resultado,telemetria,respondido_em")
+           .in_("chave_cache", list(chaves)).eq("status", "concluido").eq("origem", "dwight")
+           .gte("respondido_em", desde).order("respondido_em", desc=True).limit(1000).execute())
+    agora = _dt_ext.now(_tz_ext.utc)
+    achados = {}
+    for l in (r.data or []):
+        c = l.get("chave_cache")
+        if c in achados:
+            continue
+        quando = _dt_iso(l.get("respondido_em"))
+        if not quando or _valido_ate_dia_util(quando) <= agora:
+            continue
+        if not ((l.get("resultado") or {}).get("ofertas")):
+            continue
+        achados[c] = l
+    return achados
+
+
+def _montar_payload_lote(prop: dict, itens_lote: list, external_key: str) -> dict:
+    numero = str(prop.get("numero_proposta") or "")
+    return {
+        "source": "cabine",
+        "action": "pesquisa",
+        "external_key": external_key,
+        "cotacao_id": numero,
+        "cliente": {"nome": prop.get("cliente") or "", "cnpj": prop.get("cnpj") or ""},
+        "itens": [{
+            "item_id": u,
+            "sku": _txt(it.get("codigo_cliente"), 120),
+            "descricao": it.get("descricao_original") or it.get("descricao_final") or "",
+            "marca": "",
+            "modelo": "",
+            "qty": _num_br(it.get("quantidade"), 1),
+            "unidade": it.get("unidade") or "UN",
+            "obs": _txt(it.get("specs_complementares"), 1500),
+        } for u, it in itens_lote],
+        "retorno": {"metodo": "POST",
+                    "url": f"{CABINE_PUBLIC_URL}/propostas/{numero or prop['id']}/pesquisa-resultado"},
+        # Ponteiro, não conteúdo: o texto do e-mail só é lido quando o Dwight tem
+        # dúvida sobre o que o cliente pediu.
+        "fonte": {"metodo": "GET",
+                  "url": f"{CABINE_PUBLIC_URL}/propostas/{numero or prop['id']}/fonte",
+                  "chars": len(str(prop.get("fonte_texto") or "")),
+                  "quando": "só em caso de dúvida sobre o que o cliente pediu"},
+        "dry_run": False,
+    }
+
+
+def _bombear_fila(sb=None) -> int:
+    """Envia ao Dwight os próximos lotes da fila, até o limite de lotes em voo.
+
+    Chamada depois de cada disparo, de cada retorno do Dwight e da consulta da
+    tela (que roda a cada 20 s enquanto há pendência) — por isso não precisa de
+    rotina agendada. O lock e o "claim" (update só onde ainda está na_fila)
+    impedem que duas chamadas simultâneas enviem o mesmo item duas vezes.
+    Devolve quantos itens foram enviados.
+    """
+    if not (DWIGHT_WEBHOOK_URL and DWIGHT_WEBHOOK_KEY):
+        return 0
+    if not _fila_lock.acquire(blocking=False):
+        return 0
+    try:
+        sb = sb or get_supabase()
+        desde = (_dt_ext.utcnow() - _td_ext(seconds=_PESQ_EXPIRA_S)).isoformat()
+        voo = (sb.table("pesquisa_resultados").select("external_key")
+                 .eq("status", "aguardando").gte("criado_em", desde).limit(1000).execute())
+        lotes_em_voo = len({l.get("external_key") for l in (voo.data or []) if l.get("external_key")})
+        enviados = 0
+        while lotes_em_voo < _FILA_LOTES_SIMULTANEOS:
+            primeiro = (sb.table("pesquisa_resultados").select("proposta_id")
+                          .eq("status", "na_fila").order("criado_em").limit(1).execute().data or [])
+            if not primeiro:
+                break
+            pid = primeiro[0]["proposta_id"]
+            fila = (sb.table("pesquisa_resultados").select("id,item_uid")
+                      .eq("status", "na_fila").eq("proposta_id", pid)
+                      .order("criado_em").limit(_FILA_LOTE_ITENS).execute().data or [])
+            prop = (sb.table("propostas").select("*").eq("id", pid).limit(1).execute().data or [{}])[0]
+            numero = str(prop.get("numero_proposta") or pid)
+            external_key = f"cabine-{numero}-{int(time.time() * 1000)}"
+            reivindicadas = (sb.table("pesquisa_resultados")
+                               .update({"status": "aguardando", "external_key": external_key,
+                                        "criado_em": _dt_ext.utcnow().isoformat()})
+                               .in_("id", [l["id"] for l in fila]).eq("status", "na_fila")
+                               .execute().data or [])
+            if not reivindicadas:
+                continue
+            atuais = _uids_da_proposta(sb, pid)
+            lote = [(str(l["item_uid"]).lower(), atuais.get(str(l["item_uid"]).lower()))
+                    for l in reivindicadas]
+            fora = [u for u, it in lote if it is None]      # item removido da proposta
+            if fora:
+                (sb.table("pesquisa_resultados").update({"status": "erro",
+                    "despacho_erro": "item removido da proposta antes do envio"})
+                   .in_("item_uid", fora).eq("external_key", external_key).execute())
+            lote = [(u, it) for u, it in lote if it is not None]
+            if lote:
+                _threading.Thread(target=_despachar_webhook_dwight,
+                                  args=(_montar_payload_lote(prop, lote, external_key), external_key),
+                                  daemon=True).start()
+                enviados += len(lote)
+            lotes_em_voo += 1
+        return enviados
+    except Exception:
+        return 0
+    finally:
+        _fila_lock.release()
+
+
+def _bombear_fila_em_thread():
+    _threading.Thread(target=lambda: _bombear_fila(create_client(SUPABASE_URL, SUPABASE_KEY)),
+                      daemon=True).start()
+
+
 _PLACEHOLDERS_DESCRICAO = {"x", "xx", "xxx", "-", "--", "n/a", "na", "null",
                           "undefined", "teste", "test", "item", "produto",
                           "1", "a", "."}
-_DISPARO_API_MAX_HORA = 5        # disparos (não itens) por chave, por hora
-_DISPARO_API_MAX_ITENS_DIA = 150  # itens somados, por chave, por 24h
+# v3.73: o teto por HORA saiu (a fila controla o ritmo). Fica só a trava diária
+# contra laço — e ela conta item que foi PARA A FILA; item do cache não conta.
+_DISPARO_API_MAX_ITENS_DIA = 300
 
 
 def _validar_cotacao_real(prop: dict, itens: dict) -> str:
@@ -5575,30 +5739,20 @@ def _validar_cotacao_real(prop: dict, itens: dict) -> str:
     return ""
 
 
-def _limite_disparo_api(sb, usuario: str) -> str:
-    """Devolve o MOTIVO do bloqueio, ou "" se a chave ainda está dentro do teto.
+def _limite_disparo_api(sb, usuario: str, novos: int = 0) -> str:
+    """MOTIVO do bloqueio, ou "" se a chave ainda cabe na trava diária.
 
-    Dois limites independentes, cada um seu próprio motivo — para o agente
-    saber exatamente qual parede bateu e quando ela libera de novo.
+    Conta os itens que esta chave mandou para a fila nas últimas 24h (cache não
+    conta) somados aos `novos` deste pedido.
     """
-    agora = _dt_ext.utcnow()
-    uma_hora = (agora - _td_ext(hours=1)).isoformat()
-    r1 = (sb.table("pesquisa_resultados").select("external_key")
-            .eq("disparado_por", "api").eq("solicitado_por", usuario)
-            .gte("criado_em", uma_hora).limit(2000).execute())
-    disparos_hora = len({l.get("external_key") for l in (r1.data or []) if l.get("external_key")})
-    if disparos_hora >= _DISPARO_API_MAX_HORA:
-        return (f"esta chave já disparou {disparos_hora} pesquisas na última hora "
-                f"(teto: {_DISPARO_API_MAX_HORA}/hora). Aguarde antes de tentar de novo.")
-
-    um_dia = (agora - _td_ext(hours=24)).isoformat()
-    r2 = (sb.table("pesquisa_resultados").select("item_uid")
-            .eq("disparado_por", "api").eq("solicitado_por", usuario)
-            .gte("criado_em", um_dia).limit(5000).execute())
-    itens_dia = len(r2.data or [])
-    if itens_dia >= _DISPARO_API_MAX_ITENS_DIA:
-        return (f"esta chave já pediu pesquisa de {itens_dia} itens nas últimas 24h "
-                f"(teto: {_DISPARO_API_MAX_ITENS_DIA}/dia).")
+    um_dia = (_dt_ext.utcnow() - _td_ext(hours=24)).isoformat()
+    r = (sb.table("pesquisa_resultados").select("item_uid")
+           .eq("disparado_por", "api").eq("solicitado_por", usuario).neq("origem", "cache")
+           .gte("criado_em", um_dia).limit(5000).execute())
+    itens_dia = len(r.data or [])
+    if itens_dia + novos > _DISPARO_API_MAX_ITENS_DIA:
+        return (f"esta chave já mandou {itens_dia} itens para pesquisa nas últimas 24h; com "
+                f"estes {novos} passaria do teto de {_DISPARO_API_MAX_ITENS_DIA}/dia.")
     return ""
 
 
@@ -5642,9 +5796,6 @@ async def pesquisa_dwight_disparar(ref: str, request: Request,
         motivo_cotacao = _validar_cotacao_real(prop, itens)
         if motivo_cotacao:
             raise HTTPException(422, f"Disparo recusado: {motivo_cotacao}.")
-        motivo_limite = _limite_disparo_api(sb, usuario)
-        if motivo_limite:
-            raise HTTPException(429, f"Disparo recusado: {motivo_limite}")
 
     # PADRÃO (17/09, decisão do Leonardo): vão TODOS os itens, inclusive os que já
     # têm preço e match exato no banco — o mercado pode estar mais barato que o
@@ -5661,13 +5812,13 @@ async def pesquisa_dwight_disparar(ref: str, request: Request,
         return {"external_key": None, "enviados": 0, "itens": [],
                 "motivo": "Nenhum item para pesquisar nesta proposta."}
 
-    # Item que JÁ está aguardando não é reenviado (o retorno viria duplicado e o
-    # Dwight pesquisaria duas vezes o mesmo). `forcar` reenvia mesmo assim.
+    # Item que JÁ está na fila ou aguardando não é reenviado (o retorno viria
+    # duplicado). `forcar` reenvia mesmo assim.
     repetidos = []
     if not corpo.get("forcar"):
-        desde = (_dt_ext.utcnow() - _td_ext(seconds=_PESQ_JANELA_DUPLICADO_S)).isoformat()
+        desde = (_dt_ext.utcnow() - _td_ext(seconds=_PESQ_EXPIRA_S)).isoformat()
         pend = (sb.table("pesquisa_resultados").select("item_uid")
-                  .eq("proposta_id", prop["id"]).eq("status", "aguardando")
+                  .eq("proposta_id", prop["id"]).in_("status", ["aguardando", "na_fila"])
                   .gte("criado_em", desde).limit(500).execute())
         espera = {str(l.get("item_uid") or "").lower() for l in (pend.data or [])}
         if espera:
@@ -5679,46 +5830,47 @@ async def pesquisa_dwight_disparar(ref: str, request: Request,
                     "motivo": (f"{len(repetidos)} item(ns) já está(ão) em pesquisa. "
                                f"Aguarde o retorno.")}
 
-    external_key = f"cabine-{numero or prop['id']}-{int(time.time())}"
-    linhas = [{
-        "proposta_id": prop["id"], "numero_proposta": numero, "item_uid": u,
-        "external_key": external_key, "origem": "dwight", "status": "aguardando",
-        "descricao": _txt(it.get("descricao_original") or it.get("descricao_final"), 500),
-        "solicitado_por": usuario, "disparado_por": disparado_por,
-    } for u, it in alvo]
-    sb.table("pesquisa_resultados").insert(linhas).execute()
+    # CACHE: pesquisa real deste mesmo item dentro de 1 dia útil volta pronta.
+    # "pesquisar de novo" (forcar) ignora o cache de propósito.
+    chaves = {u: _chave_cache_item(it) for u, it in alvo}
+    cache = {} if corpo.get("forcar") else _buscar_cache(sb, set(chaves.values()))
+    do_cache = [(u, it) for u, it in alvo if chaves[u] in cache]
+    para_fila = [(u, it) for u, it in alvo if chaves[u] not in cache]
 
-    payload = {
-        "source": "cabine",
-        "action": "pesquisa",
-        "external_key": external_key,
-        "cotacao_id": numero,
-        "cliente": {"nome": prop.get("cliente") or "", "cnpj": prop.get("cnpj") or ""},
-        "itens": [{
-            "item_id": u,
-            "sku": _txt(it.get("codigo_cliente"), 120),
-            "descricao": it.get("descricao_original") or it.get("descricao_final") or "",
-            "marca": "",
-            "modelo": "",
-            "qty": _num_br(it.get("quantidade"), 1),
-            "unidade": it.get("unidade") or "UN",
-            "obs": _txt(it.get("specs_complementares"), 1500),
-        } for u, it in alvo],
-        "retorno": {"metodo": "POST",
-                    "url": f"{CABINE_PUBLIC_URL}/propostas/{numero or prop['id']}/pesquisa-resultado"},
-        # Ponteiro, não conteúdo: o texto do e-mail só é lido quando o Dwight tem
-        # dúvida. Mandar 3,5 mil caracteres em toda pesquisa seria token gasto em
-        # 90% dos casos que não precisam.
-        "fonte": {"metodo": "GET",
-                  "url": f"{CABINE_PUBLIC_URL}/propostas/{numero or prop['id']}/fonte",
-                  "chars": len(str(prop.get("fonte_texto") or "")),
-                  "quando": "só em caso de dúvida sobre o que o cliente pediu"},
-        "dry_run": False,
-    }
-    _threading.Thread(target=_despachar_webhook_dwight, args=(payload, external_key),
-                      daemon=True).start()
-    return {"external_key": external_key, "enviados": len(alvo),
-            "itens": [u for u, _ in alvo], "repetidos": repetidos}
+    if disparado_por == "api" and para_fila:
+        motivo_limite = _limite_disparo_api(sb, usuario, len(para_fila))
+        if motivo_limite:
+            raise HTTPException(429, f"Disparo recusado: {motivo_limite}")
+
+    agora_iso = _dt_ext.utcnow().isoformat()
+    linhas = []
+    for u, it in do_cache:
+        c = cache[chaves[u]]
+        linhas.append({
+            "proposta_id": prop["id"], "numero_proposta": numero, "item_uid": u,
+            "origem": "cache", "status": "concluido", "chave_cache": chaves[u],
+            "descricao": _txt(it.get("descricao_original") or it.get("descricao_final"), 500),
+            "resultado": c.get("resultado"),
+            "telemetria": {**(c.get("telemetria") or {}), "cache_de": c.get("respondido_em"),
+                           "cache_linha": c.get("id")},
+            "respondido_em": agora_iso, "respondido_por": "cache",
+            "solicitado_por": usuario, "disparado_por": disparado_por,
+        })
+    for u, it in para_fila:
+        linhas.append({
+            "proposta_id": prop["id"], "numero_proposta": numero, "item_uid": u,
+            "origem": "dwight", "status": "na_fila", "chave_cache": chaves[u],
+            "descricao": _txt(it.get("descricao_original") or it.get("descricao_final"), 500),
+            "solicitado_por": usuario, "disparado_por": disparado_por,
+        })
+    if linhas:
+        sb.table("pesquisa_resultados").insert(linhas).execute()
+
+    enviados_agora = _bombear_fila(sb) if para_fila else 0
+    return {"cache": len(do_cache), "na_fila": len(para_fila), "enviados_agora": enviados_agora,
+            "enviados": len(para_fila),   # compatibilidade: itens que vão ao Dwight
+            "itens": [u for u, _ in alvo], "repetidos": repetidos,
+            "itens_cache": [u for u, _ in do_cache], "itens_fila": [u for u, _ in para_fila]}
 
 
 @app.post("/propostas/{ref}/pesquisa-resultado")
@@ -5808,6 +5960,8 @@ async def pesquisa_resultado_receber(ref: str, payload: dict,
             }).execute()
         recebidos += 1
 
+    if recebidos:
+        _bombear_fila_em_thread()          # a vaga liberada chama o próximo lote
     return {"recebidos": recebidos, "ignorados": ignorados}
 
 
@@ -5884,10 +6038,10 @@ async def pesquisa_resultado_listar(ref: str, usuario: str = Depends(verificar_t
     prop = _resolver_proposta(sb, ref)
     r = (sb.table("pesquisa_resultados")
            .select("item_uid,status,resultado,telemetria,external_key,criado_em,"
-                   "respondido_em,despacho_erro")
+                   "respondido_em,despacho_erro,origem")
            .eq("proposta_id", prop["id"]).order("criado_em", desc=True).limit(500).execute())
     limite = _dt_ext.utcnow() - _td_ext(seconds=_PESQ_EXPIRA_S)
-    itens, aguardando = {}, 0
+    itens, aguardando, na_fila = {}, 0, 0
     for l in (r.data or []):
         u = str(l.get("item_uid") or "").lower()
         if not u or u in itens:
@@ -5901,8 +6055,13 @@ async def pesquisa_resultado_listar(ref: str, usuario: str = Depends(verificar_t
                 pass
         if l.get("status") == "aguardando":
             aguardando += 1
+        elif l.get("status") == "na_fila":
+            na_fila += 1
         itens[u] = l
-    return {"itens": itens, "aguardando": aguardando}
+    if na_fila:
+        _bombear_fila_em_thread()          # rede de segurança: fila nunca fica parada
+    # `aguardando` inclui a fila: é o que mantém a tela consultando.
+    return {"itens": itens, "aguardando": aguardando + na_fila, "na_fila": na_fila}
 
 
 @app.get("/propostas")
