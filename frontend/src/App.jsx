@@ -1450,7 +1450,7 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
                 {(dwight || onPesquisarItem) && (
                   <div className="mb-2 rounded-lg border border-line2 bg-surface px-3 py-2">
                     <div className="flex items-center justify-between gap-2">
-                      <div className="eyebrow text-[9px] font-semibold uppercase text-faint">Dwight</div>
+                      <div className="eyebrow text-[9px] font-semibold uppercase text-faint">{dwight?.motor === "kistbot" ? "KistBot Dwight" : "Dwight"}</div>
                       <div className="flex items-center gap-2">
                         {dwight?.telemetria?.tempo_ms != null && (
                           <span className="font-mono text-[10px] text-faint">
@@ -2127,6 +2127,7 @@ export default function App() {
   const [propagacao, setPropagacao] = useState(null);
   const [tinyEnvio, setTinyEnvio] = useState(null);
   const [guiaTiny, setGuiaTiny] = useState(null);   // regras de campo do Tiny (v3.75)
+  const [motores, setMotores] = useState({});       // motores de pesquisa prontos (v3.79)
   // "Não importar preços sem rastreabilidade": ON pro Fábio por padrão, OFF pros demais.
   // Ele pode desmarcar. Diferente do antigo checkbox de preservar descrição (que criava
   // duas verdades no mesmo dado), este não muda o que o sistema SABE — só o que ele
@@ -2516,6 +2517,18 @@ export default function App() {
   const numeroAtual = String(propostas[propostaIdx]?.proposta || numeroProposta || "").trim();
 
   useEffect(() => {
+    if (!token) return;
+    fetch(`${API}/pesquisa/motores`, { headers: authHeaders() })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        const m = {};
+        ((d && d.motores) || []).forEach((x) => { m[x.motor] = x.configurado; });
+        setMotores(m);
+      })
+      .catch(() => {});
+  }, [token]);
+
+  useEffect(() => {
     if (!token || guiaTiny) return;
     fetch(`${API}/api/guia/exportacao-tiny?formato=json`, { headers: authHeaders() })
       .then((r) => (r.ok ? r.json() : null))
@@ -2650,7 +2663,7 @@ export default function App() {
     carregarDwight(novos);
   }, [pesq.itens, pesqAuto, propostaIdx]);
 
-  async function pesquisarComDwight(forcar = false, itemUids = null) {
+  async function pesquisarComDwight(forcar = false, itemUids = null, motor = "dwight") {
     if (!numeroAtual || pesqEnviando) return;
     setPesqEnviando(true); setPesqMsg("");
     try {
@@ -2658,7 +2671,8 @@ export default function App() {
       modificadoRef.current = true;
       if (autoSaveRef.current) clearTimeout(autoSaveRef.current);
       await salvarRascunho(true);
-      const r = await fetch(`${API}/propostas/${encodeURIComponent(numeroAtual)}/pesquisa-dwight`, {
+      const rota = motor === "kistbot" ? "pesquisa-kistbot-dwight" : "pesquisa-dwight";
+      const r = await fetch(`${API}/propostas/${encodeURIComponent(numeroAtual)}/${rota}`, {
         method: "POST", headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ ...(forcar ? { forcar: true } : {}),
                                ...(itemUids ? { item_uids: itemUids } : {}) }),
@@ -3441,6 +3455,15 @@ export default function App() {
                   <button onClick={() => pesquisarComDwight(false)} disabled={pesqEnviando || !numeroAtual}
                     className="rounded-lg border border-line2 bg-surface px-3 py-1.5 font-medium text-kist hover:border-kist disabled:opacity-50">
                     {pesqEnviando ? "Enviando…" : "🔎 pesquisar com o Dwight"}
+                  </button>
+                  {/* v3.78: segundo motor, mesmas regras (fila, cache, retorno na gaveta). */}
+                  <button onClick={() => pesquisarComDwight(false, null, "kistbot")}
+                    disabled={pesqEnviando || !numeroAtual || motores.kistbot === false}
+                    title={motores.kistbot === false
+                      ? "KistBot Dwight aguardando o túnel público (URL vazia no Render)"
+                      : "Pesquisar com o KistBot Dwight — fila própria, mesmas regras do Dwight"}
+                    className="rounded-lg border border-line2 bg-surface px-3 py-1.5 font-medium text-kist hover:border-kist disabled:opacity-50">
+                    🔎 pesquisar com o KistBot Dwight{motores.kistbot === false ? " (aguardando túnel)" : ""}
                   </button>
                   {(() => {
                     const n = (prop.itens || []).filter((it) => {

@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_ext
 
-VERSAO_BACKEND = "3.77"
+VERSAO_BACKEND = "3.79"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -403,6 +403,7 @@ _ROTAS_ESCOPO_PESQUISA = (
 # pode chamar qualquer coisa, a qualquer hora, sem limite.
 _ROTAS_ESCOPO_DWIGHT_DISPATCH = (
     ("POST", re.compile(r"^/propostas/[^/]+/pesquisa-dwight/?$")),
+    ("POST", re.compile(r"^/propostas/[^/]+/pesquisa-kistbot-dwight/?$")),
     ("GET",  re.compile(r"^/api/whoami/?$")),
     ("GET",  re.compile(r"^/api/guia/[a-z-]+/?$")),
 )
@@ -3034,6 +3035,7 @@ def whoami(request: Request, usuario: str = Depends(verificar_token)):
                                 "GET /propostas/{numero}/fonte",
                                 "GET /api/whoami"],
                    "dwight_dispatch": ["POST /propostas/{numero}/pesquisa-dwight",
+                                       "POST /propostas/{numero}/pesquisa-kistbot-dwight",
                                        "GET /api/whoami"]}.get(escopo, ["GET"])
     else:
         escopo, credencial = "sem_restricao", "google_oauth"
@@ -5834,6 +5836,20 @@ async def detalhe_proposta(proposta_id: str, usuario: str = Depends(verificar_to
 
 DWIGHT_WEBHOOK_URL = os.environ.get("DWIGHT_WEBHOOK_URL", "")
 DWIGHT_WEBHOOK_KEY = os.environ.get("DWIGHT_WEBHOOK_KEY", "")
+KISTBOTS_DWIGHT_WEBHOOK_URL = os.environ.get("KISTBOTS_DWIGHT_WEBHOOK_URL", "")
+KISTBOTS_DWIGHT_WEBHOOK_KEY = os.environ.get("KISTBOTS_DWIGHT_WEBHOOK_KEY", "")
+
+# Motores de pesquisa (v3.78). Mesmas regras para todos: fila em lotes, cache
+# compartilhado, curral do bot, retorno pela gaveta (/pesquisa-resultado).
+# Cada motor tem a SUA fila e o seu limite de lotes em voo.
+def _motores() -> dict:
+    return {
+        "dwight":  {"nome": "Dwight", "url": DWIGHT_WEBHOOK_URL, "key": DWIGHT_WEBHOOK_KEY,
+                    "env": "DWIGHT_WEBHOOK_URL / DWIGHT_WEBHOOK_KEY"},
+        "kistbot": {"nome": "KistBot Dwight", "url": KISTBOTS_DWIGHT_WEBHOOK_URL,
+                    "key": KISTBOTS_DWIGHT_WEBHOOK_KEY,
+                    "env": "KISTBOTS_DWIGHT_WEBHOOK_URL / KISTBOTS_DWIGHT_WEBHOOK_KEY"},
+    }
 CABINE_PUBLIC_URL  = os.environ.get("CABINE_PUBLIC_URL", "https://kist-backend.onrender.com").rstrip("/")
 
 _PESQ_STATUS_ENTRADA = {
@@ -5927,13 +5943,14 @@ def _uids_da_proposta(sb, proposta_id: int) -> dict:
     return {str(l["item_uid"]).lower(): l for l in (r.data or []) if l.get("item_uid")}
 
 
-def _despachar_webhook_dwight(payload: dict, external_key: str) -> None:
+def _despachar_webhook_dwight(payload: dict, external_key: str, motor: str = "dwight") -> None:
     """Roda em thread. Registra o HTTP de volta; falha vira 'erro_envio'."""
     status_http, erro = 0, ""
+    cfg = _motores().get(motor) or _motores()["dwight"]
     try:
         resp = requests.post(
-            DWIGHT_WEBHOOK_URL, json=payload, timeout=20,
-            headers={"Authorization": f"Bearer {DWIGHT_WEBHOOK_KEY}",
+            cfg["url"], json=payload, timeout=20,
+            headers={"Authorization": f"Bearer {cfg['key']}",
                      "Content-Type": "application/json"})
         status_http = resp.status_code
         if not (200 <= status_http < 300):
@@ -6003,7 +6020,7 @@ def _buscar_cache(sb, chaves: set) -> dict:
     desde = (_dt_ext.utcnow() - _td_ext(days=4)).isoformat()
     r = (sb.table("pesquisa_resultados")
            .select("id,chave_cache,resultado,telemetria,respondido_em")
-           .in_("chave_cache", list(chaves)).eq("status", "concluido").eq("origem", "dwight")
+           .in_("chave_cache", list(chaves)).eq("status", "concluido").in_("origem", ["dwight", "kistbot"])
            .gte("respondido_em", desde).order("respondido_em", desc=True).limit(1000).execute())
     agora = _dt_ext.now(_tz_ext.utc)
     achados = {}
@@ -6020,11 +6037,12 @@ def _buscar_cache(sb, chaves: set) -> dict:
     return achados
 
 
-def _montar_payload_lote(prop: dict, itens_lote: list, external_key: str) -> dict:
+def _montar_payload_lote(prop: dict, itens_lote: list, external_key: str, motor: str = "dwight") -> dict:
     numero = str(prop.get("numero_proposta") or "")
     return {
         "source": "cabine",
         "action": "pesquisa",
+        "motor": motor,
         "external_key": external_key,
         "cotacao_id": numero,
         "cliente": {"nome": prop.get("cliente") or "", "cnpj": prop.get("cnpj") or ""},
@@ -6059,29 +6077,43 @@ def _bombear_fila(sb=None) -> int:
     impedem que duas chamadas simultâneas enviem o mesmo item duas vezes.
     Devolve quantos itens foram enviados.
     """
-    if not (DWIGHT_WEBHOOK_URL and DWIGHT_WEBHOOK_KEY):
-        return 0
     if not _fila_lock.acquire(blocking=False):
         return 0
     try:
         sb = sb or get_supabase()
+        enviados = 0
+        for motor, cfg in _motores().items():
+            if cfg["url"] and cfg["key"]:
+                enviados += _bombear_fila_motor(sb, motor)
+        return enviados
+    except Exception:
+        return 0
+    finally:
+        _fila_lock.release()
+
+
+def _bombear_fila_motor(sb, motor: str) -> int:
+    """Uma rodada da fila de UM motor (chamada por `_bombear_fila`, já com o lock)."""
+    try:
         desde = (_dt_ext.utcnow() - _td_ext(seconds=_PESQ_EXPIRA_S)).isoformat()
         voo = (sb.table("pesquisa_resultados").select("external_key")
-                 .eq("status", "aguardando").gte("criado_em", desde).limit(1000).execute())
+                 .eq("status", "aguardando").eq("motor", motor)
+                 .gte("criado_em", desde).limit(1000).execute())
         lotes_em_voo = len({l.get("external_key") for l in (voo.data or []) if l.get("external_key")})
         enviados = 0
         while lotes_em_voo < _FILA_LOTES_SIMULTANEOS:
             primeiro = (sb.table("pesquisa_resultados").select("proposta_id")
-                          .eq("status", "na_fila").order("criado_em").limit(1).execute().data or [])
+                          .eq("status", "na_fila").eq("motor", motor)
+                          .order("criado_em").limit(1).execute().data or [])
             if not primeiro:
                 break
             pid = primeiro[0]["proposta_id"]
             fila = (sb.table("pesquisa_resultados").select("id,item_uid")
-                      .eq("status", "na_fila").eq("proposta_id", pid)
+                      .eq("status", "na_fila").eq("motor", motor).eq("proposta_id", pid)
                       .order("criado_em").limit(_FILA_LOTE_ITENS).execute().data or [])
             prop = (sb.table("propostas").select("*").eq("id", pid).limit(1).execute().data or [{}])[0]
             numero = str(prop.get("numero_proposta") or pid)
-            external_key = f"cabine-{numero}-{int(time.time() * 1000)}"
+            external_key = f"cabine-{numero}-{motor}-{int(time.time() * 1000)}"
             reivindicadas = (sb.table("pesquisa_resultados")
                                .update({"status": "aguardando", "external_key": external_key,
                                         "criado_em": _dt_ext.utcnow().isoformat()})
@@ -6100,15 +6132,13 @@ def _bombear_fila(sb=None) -> int:
             lote = [(u, it) for u, it in lote if it is not None]
             if lote:
                 _threading.Thread(target=_despachar_webhook_dwight,
-                                  args=(_montar_payload_lote(prop, lote, external_key), external_key),
+                                  args=(_montar_payload_lote(prop, lote, external_key, motor), external_key, motor),
                                   daemon=True).start()
                 enviados += len(lote)
             lotes_em_voo += 1
         return enviados
     except Exception:
         return 0
-    finally:
-        _fila_lock.release()
 
 
 def _bombear_fila_em_thread():
@@ -6168,9 +6198,50 @@ def _limite_disparo_api(sb, usuario: str, novos: int = 0) -> str:
     return ""
 
 
+@app.get("/pesquisa/motores")
+async def pesquisa_motores(usuario: str = Depends(verificar_token)):
+    """Quais motores de pesquisa estão prontos para uso (URL e chave no Render).
+    A tela desativa o botão do motor sem URL — ex.: KistBot antes do túnel público."""
+    return {"motores": [{"motor": m, "nome": c["nome"], "configurado": bool(c["url"] and c["key"])}
+                        for m, c in _motores().items()]}
+
+
+@app.post("/pesquisa/ping/{motor}")
+async def pesquisa_ping(motor: str, usuario: str = Depends(verificar_token)):
+    """Testa a conexão com um motor: manda {action: ping, dry_run: true} e devolve
+    o que ele respondeu. Não cria pesquisa nem mexe em proposta."""
+    cfg = _motores().get(motor)
+    if not cfg:
+        raise HTTPException(404, f"Motor '{motor}' não existe.")
+    if not (cfg["url"] and cfg["key"]):
+        return {"ok": False, "motor": motor, "motivo": f"{cfg['nome']} sem URL/chave no Render ({cfg['env']})."}
+    try:
+        r = requests.post(cfg["url"], timeout=15,
+                          json={"source": "cabine", "action": "ping", "motor": motor,
+                                "external_key": f"ping-{int(time.time())}", "dry_run": True},
+                          headers={"Authorization": f"Bearer {cfg['key']}", "Content-Type": "application/json"})
+        return {"ok": 200 <= r.status_code < 300, "motor": motor, "http": r.status_code,
+                "resposta": (r.text or "")[:300]}
+    except Exception as e:
+        return {"ok": False, "motor": motor, "motivo": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
+@app.post("/propostas/{ref}/pesquisa-kistbot-dwight")
+async def pesquisa_kistbot_disparar(ref: str, request: Request,
+                                    usuario: str = Depends(verificar_token)):
+    """Mesmo disparo, pelo KistBot Dwight (v3.78). Mesmas regras: curral do bot,
+    fila em lotes, cache, retorno pela gaveta. O KistBot devolve em
+    POST /propostas/{numero}/pesquisa-resultado e NUNCA salva proposta nem exporta."""
+    return await _disparar_pesquisa(ref, request, usuario, "kistbot")
+
+
 @app.post("/propostas/{ref}/pesquisa-dwight")
 async def pesquisa_dwight_disparar(ref: str, request: Request,
                                    usuario: str = Depends(verificar_token)):
+    return await _disparar_pesquisa(ref, request, usuario, "dwight")
+
+
+async def _disparar_pesquisa(ref: str, request: Request, usuario: str, motor: str):
     """Dispara a pesquisa de preço no Dwight para os itens sem match útil.
 
     Pela tela (Leonardo clicando) ou por uma chave de escopo 'dwight_dispatch'
@@ -6187,9 +6258,9 @@ async def pesquisa_dwight_disparar(ref: str, request: Request,
         raise HTTPException(403, "O disparo da pesquisa é feito pela tela, ou por uma "
                                  "chave de escopo 'dwight_dispatch'.")
     disparado_por = "api" if esc == "dwight_dispatch" else "tela"
-    if not (DWIGHT_WEBHOOK_URL and DWIGHT_WEBHOOK_KEY):
-        raise HTTPException(503, "Pesquisa pelo Dwight não configurada "
-                                 "(DWIGHT_WEBHOOK_URL / DWIGHT_WEBHOOK_KEY no Render).")
+    cfg = _motores()[motor]
+    if not (cfg["url"] and cfg["key"]):
+        raise HTTPException(503, f"Pesquisa pelo {cfg['nome']} não configurada ({cfg['env']} no Render).")
     try:
         corpo = await request.json()
         corpo = corpo if isinstance(corpo, dict) else {}
@@ -6271,7 +6342,7 @@ async def pesquisa_dwight_disparar(ref: str, request: Request,
     for u, it in para_fila:
         linhas.append({
             "proposta_id": prop["id"], "numero_proposta": numero, "item_uid": u,
-            "origem": "dwight", "status": "na_fila", "chave_cache": chaves[u],
+            "origem": motor, "motor": motor, "status": "na_fila", "chave_cache": chaves[u],
             "descricao": _txt(it.get("descricao_original") or it.get("descricao_final"), 500),
             "solicitado_por": usuario, "disparado_por": disparado_por,
         })
@@ -6463,7 +6534,7 @@ async def pesquisa_resultado_listar(ref: str, usuario: str = Depends(verificar_t
     prop = _resolver_proposta(sb, ref)
     r = (sb.table("pesquisa_resultados")
            .select("item_uid,status,resultado,telemetria,external_key,criado_em,"
-                   "respondido_em,despacho_erro,origem")
+                   "respondido_em,despacho_erro,origem,motor")
            .eq("proposta_id", prop["id"]).order("criado_em", desc=True).limit(500).execute())
     limite = _dt_ext.utcnow() - _td_ext(seconds=_PESQ_EXPIRA_S)
     itens, aguardando, na_fila = {}, 0, 0
