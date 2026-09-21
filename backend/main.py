@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_ext
 
-VERSAO_BACKEND = "3.76"
+VERSAO_BACKEND = "3.77"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -2035,8 +2035,8 @@ def _carregar_payload_exportacao(payload: dict):
     if numero and (not itens or len(cnpj) < 11):
         try:
             sb0 = get_supabase()
-            p0 = (sb0.table("propostas").select("*")
-                  .eq("numero_proposta", numero).limit(1).execute().data or [])
+            _p = _achar_por_numero(sb0, numero)
+            p0 = [_p] if _p else []
             if p0:
                 prop = p0[0]
                 if len(cnpj) < 11:
@@ -2475,9 +2475,8 @@ def _previa_exportacao(payload: dict) -> dict:
     ja = None
     if numero:
         try:
-            r0 = (get_supabase().table("propostas").select("tiny_id,tiny_numero")
-                  .eq("numero_proposta", numero).limit(1).execute().data or [])
-            ja = r0[0] if r0 and r0[0].get("tiny_id") else None
+            _l = _achar_por_numero(get_supabase(), numero)
+            ja = _l if _l and _l.get("tiny_id") else None
         except Exception:
             ja = None
     return {
@@ -2631,14 +2630,30 @@ async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verifica
     tiny_num = str((r or {}).get("numeroProposta") or "") or None
     _log(tentativa, True, tiny_id=tiny_id)
 
-    # Amarra as duas numerações. Sem isso ninguém liga a proposta ao orçamento.
+    # Amarra as duas numerações e UNIFICA (v3.77): a proposta passa a se chamar
+    # pelo número que o Tiny devolveu. O número anterior (R-<id>) fica guardado em
+    # `numero_rascunho`, e continua achando a proposta.
+    numero_final = numero
     if numero and tiny_id:
         try:
+            sbx = get_supabase()
+            linha = _achar_por_numero(sbx, numero)
             upd = {"tiny_id": tiny_id, "tiny_exportado_em": _dt_ext.utcnow().isoformat(),
                    "tiny_por": usuario}
             if tiny_num:
                 upd["tiny_numero"] = tiny_num
-            get_supabase().table("propostas").update(upd).eq("numero_proposta", numero).execute()
+                ocupado = (sbx.table("propostas").select("id").eq("numero_proposta", tiny_num)
+                             .limit(2).execute().data or [])
+                if linha and all(o["id"] == linha["id"] for o in ocupado):
+                    upd["numero_proposta"] = tiny_num
+                    if not linha.get("numero_rascunho"):
+                        upd["numero_rascunho"] = linha.get("numero_proposta")
+                    numero_final = tiny_num
+                elif linha:
+                    avisos_envio.append(f"O número {tiny_num} do Tiny já está em outra proposta da Cabine; "
+                                        f"esta continua como {linha.get('numero_proposta')}.")
+            if linha:
+                sbx.table("propostas").update(upd).eq("id", linha["id"]).execute()
         except Exception:
             pass   # o orçamento já existe no Tiny; perder o vínculo não o desfaz
 
@@ -2652,6 +2667,7 @@ async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verifica
             banco = {"erro": str(e)[:150]}
 
     saida = {"ok": 1, "tiny_id": tiny_id, "tiny_numero": tiny_num,
+             "numero_final": numero_final, "numero_anterior": numero,
              "acao": "atualizado" if ja else "criado",
              "itens": len(mod["linhas"]), "total": previa["total"],
              "contato_id": contato_id, "cliente_tiny": contato_nome,
@@ -3101,13 +3117,51 @@ def banco_buscar(q: str = "", preco_min: float = None, preco_max: float = None,
     return {"linhas": linhas, "total": len(linhas), "q": q}
 
 
+def _criar_rascunho(sb, usuario: str, cliente: str = "", cnpj=None, total_itens: int = 0) -> str:
+    """Cria a linha da proposta como RASCUNHO e devolve o número "R-<id>" (v3.77).
+
+    HISTÓRICO (21/09): o número era "o maior já salvo + 1", calculado na hora de
+    MOSTRAR e usado dias depois na hora de salvar. Quem pedisse no meio recebia o
+    mesmo número: o Thiago, o Leonardo e o bot pegaram todos o 1050912, e o
+    último a salvar apagou os outros. O id da linha é gerado pelo banco e nunca
+    repete — por isso o rascunho se chama pelo id. Depois de exportada, a
+    proposta passa a se chamar pelo número que o Tiny devolve.
+    """
+    import uuid as _uuid_r
+    provisorio = f"TMP-{_uuid_r.uuid4().hex}"
+    ins = sb.table("propostas").insert({
+        "numero_proposta": provisorio, "status": "rascunho", "usuario_email": usuario,
+        "cliente": cliente or "", "cnpj": cnpj or None, "total_itens": int(total_itens or 0),
+    }).execute()
+    pid = ins.data[0]["id"]
+    numero = f"R-{pid}"
+    sb.table("propostas").update({"numero_proposta": numero, "numero_rascunho": numero}).eq("id", pid).execute()
+    return numero
+
+
+def _achar_por_numero(sb, numero: str):
+    """Linha pelo número atual OU pelo número de rascunho antigo (a proposta
+    muda de nome ao ser exportada; referências antigas continuam valendo)."""
+    r = sb.table("propostas").select("*").eq("numero_proposta", numero).limit(1).execute()
+    if r.data:
+        return r.data[0]
+    r = sb.table("propostas").select("*").eq("numero_rascunho", numero).limit(1).execute()
+    return r.data[0] if r.data else None
+
+
 @app.get("/proxima-proposta")
 def proxima_proposta(usuario: str = Depends(verificar_token)):
-    """Retorna o próximo número de proposta disponível.
-    Fonte primária: propostas.numero_proposta (mais confiável).
-    Fallback: produtos.proposta_tiny (banco de preços).
+    """Abre um RASCUNHO novo e devolve o número dele ("R-<id>") — v3.77.
+
+    O número é exclusivo: ninguém mais recebe o mesmo. Use-o no /salvar-proposta.
+    Depois que a proposta for exportada ao Tiny, ela passa a se chamar pelo
+    número do Tiny (o R-<id> continua funcionando como referência).
     """
     sb = get_supabase()
+    try:
+        return {"proximo": _criar_rascunho(sb, usuario), "rascunho": True}
+    except Exception:
+        pass
     def _max_numeros(registros, campo):
         nums = []
         for r in registros:
@@ -3925,7 +3979,8 @@ async def extrair_email(
     texto: str = Form(None),
     arquivos: list[UploadFile] = File(default=[]),   # múltiplos arquivos (email + Excels + PDFs)
     imagens: list[UploadFile] = File(default=[]),
-    numero_proposta: str = Form(...),
+    numero_proposta: str = Form(""),
+    criar_rascunhos: str = Form("1"),
     so_rastreavel: str = Form("0"),
     ignorar_cache: str = Form("0"),
     token_form: str = Form(None),
@@ -3964,21 +4019,23 @@ async def extrair_email(
     _threading.Thread(
         target=_rodar_job_extracao,
         args=(job_id, usuario, numero_proposta, so_rastreavel, ignorar_cache,
-              texto, arquivos_dados, imagens_dados),
+              texto, arquivos_dados, imagens_dados,
+              str(criar_rascunhos).strip().lower() not in ("0", "false", "nao", "não")),
         daemon=True,
     ).start()
     return {"job_id": job_id, "status": "processando"}
 
 
 def _rodar_job_extracao(job_id, usuario, numero_proposta, so_rastreavel, ignorar_cache,
-                        texto, arquivos_dados, imagens_dados) -> None:
+                        texto, arquivos_dados, imagens_dados, criar_rascunhos: bool = True) -> None:
     """Corpo da thread. Conexão PRÓPRIA com o Supabase — regra da casa (mesma do
     `_despachar_webhook_dwight`): quem roda em thread não divide socket com a
     operação principal."""
     sb = create_client(SUPABASE_URL, SUPABASE_KEY)
     try:
         resultado = _extrair_nucleo(sb, usuario, numero_proposta, so_rastreavel,
-                                    ignorar_cache, texto, arquivos_dados, imagens_dados)
+                                    ignorar_cache, texto, arquivos_dados, imagens_dados,
+                                    criar_rascunhos=criar_rascunhos)
         sb.table("extracoes_jobs").update({
             "status": "concluido", "resultado": resultado,
             "concluido_em": _dt_ext.utcnow().isoformat(),
@@ -4015,7 +4072,7 @@ async def extrair_status(job_id: str, usuario: str = Depends(verificar_token)):
 
 
 def _extrair_nucleo(sb, usuario, numero_proposta, so_rastreavel, ignorar_cache,
-                    texto, arquivos_dados, imagens_dados) -> dict:
+                    texto, arquivos_dados, imagens_dados, criar_rascunhos: bool = True) -> dict:
     """O TRABALHO PESADO de /extrair — leitura + matching. Roda em thread própria
     (v3.68), chamada por `_rodar_job_extracao`. `arquivos_dados`/`imagens_dados`
     são listas [(nome, bytes), ...] JÁ LIDAS pelo endpoint (UploadFile só existe
@@ -4717,8 +4774,20 @@ def _extrair_nucleo(sb, usuario, numero_proposta, so_rastreavel, ignorar_cache,
                           "rc_neg": None, "itens": []}]
 
     for idx_p, prop_raw in enumerate(propostas_raw):
-        num_prop = str(base_num + idx_p) if base_num is not None else (
-            numero_proposta if idx_p == 0 else f"{numero_proposta}-{idx_p + 1}")
+        num_prop = None
+        if criar_rascunhos:
+            # v3.77: cada proposta gerada nasce como rascunho com número próprio
+            # (R-<id>). Todas as abas ficam registradas na hora — antes, aba que o
+            # operador não chegava a abrir nunca era salva e se perdia.
+            try:
+                num_prop = _criar_rascunho(sb, usuario, prop_raw.get("cliente") or "",
+                                           _cnpj_do_cliente(prop_raw.get("cnpj")),
+                                           len(prop_raw.get("itens") or []))
+            except Exception:
+                num_prop = None
+        if not num_prop:
+            num_prop = str(base_num + idx_p) if base_num is not None else (
+                numero_proposta if idx_p == 0 else f"{numero_proposta}-{idx_p + 1}")
         prop_raw["proposta"] = num_prop
         # A fonte que a IA leu viaja junto: é a spec ORIGINAL do cliente, e é contra
         # ela que o /conferir compara. Sem isso, comparamos contra o nosso resumo.
@@ -5605,7 +5674,10 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
     com_preco  = sum(1 for i in itens if _num_br(i.get("preco_un")) > 0)
     sem_preco  = len(itens) - com_preco
     status     = payload.get("status", "confirmada")
-    numero     = str(payload.get("proposta") or payload.get("numero_proposta") or "")
+    numero     = str(payload.get("proposta") or payload.get("numero_proposta") or "").strip()
+    if not numero:
+        # Sem número: abre um rascunho novo (v3.77) — nunca chuta "próximo número".
+        numero = _criar_rascunho(sb, usuario, payload.get("cliente", ""), payload.get("cnpj") or None)
 
     prop_data = {
         "numero_proposta":      numero,
@@ -5632,10 +5704,12 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
            if (payload.get("fonte_texto") or "").strip() else {}),
     }
 
-    # Upsert: buscar pelo numero_proposta
-    existing = sb.table("propostas").select("id").eq("numero_proposta", numero).limit(1).execute()
-    if existing.data:
-        proposta_id = existing.data[0]["id"]
+    # Upsert pelo número — o atual ou o de rascunho (a proposta muda de nome ao
+    # ser exportada, e um auto-save em andamento ainda pode vir com o R-<id>).
+    _ex = _achar_por_numero(sb, numero)
+    if _ex:
+        proposta_id = _ex["id"]
+        prop_data["numero_proposta"] = _ex["numero_proposta"]   # não desfaz o nome do Tiny
         sb.table("propostas").update(prop_data).eq("id", proposta_id).execute()
         # Substituir itens
         sb.table("itens_proposta").delete().eq("proposta_id", proposta_id).execute()
@@ -5684,7 +5758,8 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
         } for i in itens]
         sb.table("itens_proposta").insert(rows).execute()
 
-    return {"proposta_id": proposta_id, "total_itens": len(itens), "status": status}
+    return {"proposta_id": proposta_id, "numero": prop_data["numero_proposta"],
+            "total_itens": len(itens), "status": status}
 
 
 # Faixas que não se cruzam: id interno vai a ~1.300; número de proposta começa em
@@ -5714,6 +5789,9 @@ def _resolver_proposta(sb, ref) -> dict:
     r = (sb.table("propostas").select("*").eq("numero_proposta", txt)
            .order("data_geracao", desc=True).limit(5).execute())
     linhas = r.data or []
+    if not linhas:
+        r = sb.table("propostas").select("*").eq("numero_rascunho", txt).limit(2).execute()
+        linhas = r.data or []
     if len(linhas) > 1:
         raise HTTPException(status_code=409, detail=(
             f"Número {txt} aparece em mais de uma proposta (ids "

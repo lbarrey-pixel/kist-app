@@ -2164,8 +2164,6 @@ export default function App() {
     if (!token) return;
     fetch(`${API}/banco/stats`, { headers: { Authorization: `Bearer ${token}` } })
       .then((r) => r.json()).then(setStats).catch(() => {});
-    fetch(`${API}/proxima-proposta`, { headers: { Authorization: `Bearer ${token}` } })
-      .then((r) => r.json()).then((d) => { if (d.proximo) setNumeroProposta(d.proximo); }).catch(() => {});
     const ka = setInterval(() => fetch(`${API}/ping`).catch(() => {}), 9 * 60 * 1000);
     return () => clearInterval(ka);
   }, [token]);
@@ -2322,7 +2320,6 @@ export default function App() {
   // reler o MESMO conteúdo faz sentido é leitura correta porém INCOMPLETA: o
   // modelo pulou um item. Aí o operador força.
   async function processar(relerDoZero = false) {
-    if (!numeroProposta.trim()) { setErro("Informe o número da proposta."); return; }
     if (!texto.trim() && arquivos.length === 0 && imagens.length === 0) {
       setErro("Arraste arquivos, cole o texto ou adicione prints."); return;
     }
@@ -2356,6 +2353,10 @@ export default function App() {
       // Normalizar: backend sempre retorna {propostas:[...]}, mas suportar legado {itens:[...]}
       const props = data.propostas || [data];
       setPropostas(props); setPropostaIdx(0); setDownloadados(new Set());
+      if (props[0]?.proposta) setNumeroProposta(String(props[0].proposta));
+      // v3.77: grava TODAS as abas agora. Antes só a aba aberta era salva, e uma
+      // aba que o operador não abria se perdia (caso 1050917, 21/09).
+      salvarTodas(props);
       modificadoRef.current = true;   // marca como modificado para o save funcionar
       setStep("resultado");
       // Reservar o número no banco imediatamente — impede outro operador de receber o mesmo número
@@ -2385,6 +2386,7 @@ export default function App() {
     try {
       const form = new FormData();
       form.append("numero_proposta", numeroProposta || "");
+      form.append("criar_rascunhos", "0");   // os itens entram NESTA proposta
       form.append("so_rastreavel", soRastreavel ? "1" : "0");
       addArquivos.forEach((f) => form.append("arquivos", f));
       if (addTexto) form.append("texto", addTexto);
@@ -2441,10 +2443,22 @@ export default function App() {
     autoSaveRef.current = setTimeout(() => salvarRascunho(true), 1500);
   }
 
+  async function salvarTodas(lista) {
+    for (const p of (lista || [])) {
+      if (!p?.proposta) continue;
+      try {
+        await fetch(`${API}/salvar-proposta`, {
+          method: "POST", headers: { "Content-Type": "application/json", ...authHeaders() },
+          body: JSON.stringify({ ...p, status: "rascunho", usuario_nome: usuario?.nome || "" }),
+        });
+      } catch { /* o auto-save da aba aberta cobre; as outras ficam com o cabeçalho */ }
+    }
+  }
+
   async function salvarRascunho(silent = false) {
     if (!modificadoRef.current) return;
     const prop = propostas[propostaIdx];
-    if (!prop || !numeroProposta) return;
+    if (!prop || !(prop.proposta || numeroProposta)) return;
     if (!silent) setSalvando(true);
     else setSalvando(true);
     try {
@@ -2832,6 +2846,11 @@ export default function App() {
       const res = await fetch(`${API}/propostas/exportar-tiny`, { method: "POST", headers: cab, body: corpo });
       const d = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(d.detail || `erro ${res.status}`);
+      // v3.77: a proposta passa a se chamar pelo número do Tiny.
+      if (d.numero_final && d.numero_final !== prop.proposta) {
+        setPropostas((prev) => prev.map((p, pi) => pi === idx ? { ...p, proposta: d.numero_final } : p));
+        if (idx === propostaIdx) setNumeroProposta(String(d.numero_final));
+      }
       setTinyEnvio({ estado: "ok", ...d });
     } catch (e) {
       setTinyEnvio({ estado: "erro", msg: String(e.message || e) });
@@ -2866,8 +2885,6 @@ export default function App() {
     setPropostaId(null); setSalvando(false); setUltimoSalvo(null);
     modificadoRef.current = false;
     if (autoSaveRef.current) clearTimeout(autoSaveRef.current);
-    fetch(`${API}/proxima-proposta`, { headers: authHeaders() }).then((r) => r.json())
-      .then((d) => { if (d.proximo) setNumeroProposta(d.proximo); }).catch(() => {});
   }
 
   function navegar(k) {
@@ -2952,15 +2969,12 @@ export default function App() {
                   sub="Arraste o .msg do Outlook, cole prints com Ctrl+V ou cole o texto do e-mail." />
 
                 <div className="mt-7 space-y-5 rounded-2xl border border-line bg-surface p-6">
-                  <div>
-                    <label className="mb-1.5 block text-[12.5px] font-medium text-ink">
-                      Número da proposta <span className="text-rose">*</span>
-                    </label>
-                    <input
-                      className="w-full rounded-lg border border-line2 bg-paper px-3 py-2.5 font-mono text-[13.5px] text-ink cell-input"
-                      placeholder="ex: 1050370" value={numeroProposta}
-                      onChange={(e) => setNumeroProposta(e.target.value)}
-                    />
+                  {/* v3.77: não se digita mais número. Cada proposta gerada vira um
+                      rascunho com número próprio (R-xxxx) e, ao exportar, passa a
+                      usar o número que o Tiny devolver — o mesmo nos dois sistemas. */}
+                  <div className="rounded-lg border border-line bg-paper px-3 py-2 text-[12px] text-sub">
+                    O número é automático: cada proposta nasce como rascunho <span className="font-mono">R-xxxx</span> e,
+                    ao exportar para o Tiny, passa a usar o número do Tiny.
                   </div>
 
                   <div>
