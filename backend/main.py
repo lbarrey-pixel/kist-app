@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_ext
 
-VERSAO_BACKEND = "3.75"
+VERSAO_BACKEND = "3.76"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -4923,9 +4923,18 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
     aprender = []   # [(entrada_norm, produto_id)] — desfechos pra memória de matching
 
     for item in itens:
-        preco = item.get("preco_un", 0)
-        desc  = item.get("descricao_final", "").strip()
-        if not desc or not preco or float(preco) <= 0:
+        # v3.76 — o item pode vir da TELA (preco_un / descricao_final) ou do BANCO
+        # (preco_venda; descricao_final às vezes vazia). Exportar só pelo número
+        # carrega do banco, e esta rotina lia apenas `preco_un`: todo item caía
+        # como "sem preço" e o banco de preços não aprendia nada, em silêncio.
+        preco = item.get("preco_un") or item.get("preco_venda") or 0
+        desc  = str(item.get("descricao_final") or item.get("descricao_original") or "").strip()
+        desc_cliente = str(item.get("descricao_original") or "").strip()
+        try:
+            preco = float(_num_br(preco))
+        except Exception:
+            preco = 0.0
+        if not desc or not preco or preco <= 0:
             ignorados += 1
             continue
 
@@ -4998,6 +5007,13 @@ async def upsert_precos(payload: dict, usuario: str = Depends(verificar_token)):
             # o lookup e inseria linha gêmea a cada chamada — 15 a 21x por proposta.
             res = sb.table("produtos").select("id,preco_un")\
                 .ilike("descricao", _ilike_literal(desc)).limit(1).execute()
+            # v3.76 — descrição COMERCIAL reescrita (pelo operador ou por um bot)
+            # não acha a linha que foi gravada com o texto do CLIENTE e criava
+            # produto duplicado sem custo nem link (caso bolsa IW14080, 21/09).
+            # Antes de inserir, tenta também pela descrição original do cliente.
+            if not (res and res.data) and desc_cliente and desc_cliente.lower() != desc.lower():
+                res = sb.table("produtos").select("id,preco_un")\
+                    .ilike("descricao", _ilike_literal(desc_cliente)).limit(1).execute()
             if res and res.data:
                 sb.table("produtos").update({
                     "preco_un": float(preco), "data_ref": hoje,
