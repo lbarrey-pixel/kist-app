@@ -64,6 +64,12 @@ async function _extrairAssincrono(form, authHeaders, onProgresso) {
 // Identidade estável do item (v3.61). O save apaga e recria as linhas da proposta,
 // então o `id` muda a cada auto-save. O `item_uid` nasce aqui, viaja com o item e é
 // por ele que o resultado da pesquisa do Dwight volta para a linha certa.
+// A conexão OAuth com o Tiny caiu? (a renovação do token foi recusada)
+export function precisaReconectarTiny(msg) {
+  const m = String(msg || "").toLowerCase();
+  return m.includes("autoriza") && (m.includes("expirou") || m.includes("tiny/autorizar") || m.includes("reconect"));
+}
+
 // Texto da confirmação antes de exportar ao Tiny (v3.72) — puro, testável.
 export function mensagemPreviaTiny(pv) {
   const c = (pv && pv.cliente) || {};
@@ -2799,6 +2805,24 @@ export default function App() {
     }
   }
 
+  // Reconectar o Tiny (v3.73): /tiny/autorizar exige o login da Cabine, então
+  // abrir o endereço direto no navegador não funciona. A tela pede o link com o
+  // token do operador e abre o Tiny numa aba nova; aprovado lá, o Tiny volta
+  // sozinho para /tiny/callback e a conexão volta a se renovar sozinha.
+  async function reconectarTiny() {
+    const aba = window.open("", "_blank");
+    try {
+      const r = await fetch(`${API}/tiny/autorizar`, { headers: authHeaders() });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.url) throw new Error(d.detail || `erro ${r.status}`);
+      if (aba) aba.location.href = d.url; else window.location.href = d.url;
+      setTinyEnvio({ estado: "erro", msg: "Aprove a Kist na aba do Tiny que abriu (vale 15 minutos) e depois exporte de novo." });
+    } catch (e) {
+      if (aba) aba.close();
+      setTinyEnvio({ estado: "erro", msg: `Não consegui gerar o link do Tiny (${e.message}).` });
+    }
+  }
+
   function reiniciar() {
     setTinyEnvio(null);
     setAvisosSistema([]);
@@ -3098,8 +3122,13 @@ export default function App() {
                   </div>
                 )}
                 {tinyEnvio?.estado === "erro" && (
-                  <div className="mt-2 rounded-lg border border-rose/40 bg-rose/10 px-3 py-2 text-[12.5px] text-rose">
-                    {tinyEnvio.msg}
+                  <div className="mt-2 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-rose/40 bg-rose/10 px-3 py-2 text-[12.5px] text-rose">
+                    <span>{tinyEnvio.msg}</span>
+                    {precisaReconectarTiny(tinyEnvio.msg) && (
+                      <button onClick={reconectarTiny} className={`${btnGhost} flex-shrink-0 whitespace-nowrap`}>
+                        <IconLink size={14} /> Reconectar o Tiny
+                      </button>
+                    )}
                   </div>
                 )}
 
