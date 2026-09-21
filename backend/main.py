@@ -5904,11 +5904,24 @@ async def pesquisa_resultado_receber(ref: str, payload: dict,
 
     recebidos, ignorados = 0, []
     agora = _dt_ext.utcnow().isoformat()
+
+    # Envio CANCELADO (ex.: recomeço no modelo novo, 21/09): retorno atrasado do
+    # Dwight para ele é descartado — senão a pesquisa parada "ressuscita".
+    ekey_geral = _txt(payload.get("external_key"), 120)
+    cancelados = set()
+    if ekey_geral:
+        rc = (sb.table("pesquisa_resultados").select("external_key,despacho_erro")
+                .eq("external_key", ekey_geral).limit(200).execute().data or [])
+        if rc and all(str(l.get("despacho_erro") or "").startswith("cancelado") for l in rc):
+            cancelados.add(ekey_geral)
     for r in resultados[:200]:
         if not isinstance(r, dict):
             ignorados.append({"item_id": None, "motivo": "resultado não é objeto"})
             continue
         uid = str(r.get("item_id") or r.get("item_uid") or "").strip().lower()
+        if (_txt(r.get("external_key"), 120) or ekey_geral) in cancelados:
+            ignorados.append({"item_id": uid or None, "motivo": "pesquisa cancelada na Cabine"})
+            continue
         if not _UUID_RX.match(uid) or uid not in atuais:
             ignorados.append({"item_id": uid or None,
                               "motivo": "item_id não pertence a esta proposta (ou foi removido)"})
