@@ -86,6 +86,37 @@ export function precisaReconectarTiny(msg) {
   return m.includes("autoriza") && (m.includes("expirou") || m.includes("tiny/autorizar") || m.includes("reconect"));
 }
 
+// Números com vírgula ou ponto -> float (v3.80, mesma regra do painel).
+export function numBR(v) {
+  let s = String(v ?? "").trim();
+  if (s.includes(",")) s = s.replace(/\./g, "").replace(",", ".");
+  return parseFloat(s) || 0;
+}
+
+// Lucro por unidade: venda − custo − frete de vinda rateado (o frete é por item, não ×qtd).
+export function lucroUnitario(item) {
+  const q = parseFloat(item?.quantidade) || 1;
+  return (Number(item?.preco_un) || 0) - (Number(item?.preco_custo) || 0) - numBR(item?.frete_vinda) / q;
+}
+
+// Custo & lucro da proposta (v3.80) — puro, testável. Frete de vinda por item
+// (sem ×qtd) + frete de ida por proposta entram no custo; o frete COBRADO
+// (campo do Tiny) entra na receita.
+export function calcularCustoLucro(prop, aliquotaNF = 0.12) {
+  const itens = (prop && prop.itens) || [];
+  const prodVenda = itens.reduce((s, i) => s + (Number(i.preco_un) || 0) * (parseFloat(i.quantidade) || 0), 0);
+  const prodCusto = itens.reduce((s, i) => s + (Number(i.preco_custo) || 0) * (parseFloat(i.quantidade) || 0), 0);
+  const freteVinda = itens.reduce((s, i) => s + numBR(i.frete_vinda), 0);
+  const freteIda = numBR(prop && prop.frete_ida);
+  const freteCobrado = numBR(prop && prop.frete);
+  const receita = prodVenda + freteCobrado;
+  const nf = receita * aliquotaNF;
+  const custoTotal = prodCusto + freteVinda + freteIda;
+  const lucro = receita - nf - custoTotal;
+  return { prodVenda, prodCusto, freteVinda, freteIda, freteCobrado, receita, nf, custoTotal, lucro,
+           margem: receita > 0 ? (lucro / receita) * 100 : 0 };
+}
+
 // Texto da confirmação antes de exportar ao Tiny (v3.72) — puro, testável.
 export function mensagemPreviaTiny(pv) {
   const c = (pv && pv.cliente) || {};
@@ -1183,14 +1214,17 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
                   onCommit={(v) => onChange(index, "frete_vinda", v)}
                 />
               </div>
-              {item.preco_custo > 0 && (
-                <span className="text-[11px] text-faint">
-                  lucro un.{" "}
-                  <span className={`font-mono ${(item.preco_un - item.preco_custo) >= 0 ? "text-signal" : "text-rose"}`}>
-                    R$ {brl((item.preco_un || 0) - (item.preco_custo || 0))}
+              {item.preco_custo > 0 && (() => {
+                // v3.80: o frete de vinda é UM valor por item (não ×qtd), então no
+                // lucro por unidade ele entra rateado pela quantidade.
+                const lu = lucroUnitario(item);
+                return (
+                  <span className="text-[11px] text-faint" title="venda − custo − (frete de vinda ÷ quantidade)">
+                    lucro un.{" "}
+                    <span className={`font-mono ${lu >= 0 ? "text-signal" : "text-rose"}`}>R$ {brl(lu)}</span>
                   </span>
-                </span>
-              )}
+                );
+              })()}
             </div>
             <p className="mt-1.5 pl-1 text-[11px] text-faint">
               Essa referência acompanha o item quando a proposta virar ordem de compra. <span className="text-faint/80">Custo é interno — não vai pro Tiny.</span>
@@ -2740,6 +2774,7 @@ export default function App() {
         rc_neg:        prop.rc_neg || null,
         proposta:      prop.numero_proposta || "",
         frete:         prop.frete_recebimento || 0,
+        frete_ida:     Number(prop.frete_ida) || 0,
         prazo_entrega: prop.prazo_entrega || "",
         condicao_pagamento: prop.condicao_pagamento || "",
         outros_itens: prop.outros_itens || "",
@@ -3686,16 +3721,10 @@ export default function App() {
 
                 {/* Custo & lucro — uso INTERNO, não vai para o CSV do Tiny */}
                 {(() => {
-                  const num = (v) => { let s = String(v ?? "").trim(); if (s.includes(",")) s = s.replace(/\./g, "").replace(",", "."); return parseFloat(s) || 0; };
-                  const prodVenda = (prop.itens || []).reduce((s, i) => s + (i.preco_un || 0) * (parseFloat(i.quantidade) || 0), 0);
-                  const prodCusto = (prop.itens || []).reduce((s, i) => s + (i.preco_custo || 0) * (parseFloat(i.quantidade) || 0), 0);
-                  const custoFreteItens = (prop.itens || []).reduce((s, i) => s + num(i.frete_vinda), 0); // frete único por item, SEM ×qtd
-                  const freteCobr = num(prop.frete);
-                  const receitaBruta = prodVenda + freteCobr;
-                  const nf12 = receitaBruta * 0.12;
-                  const lucro = receitaBruta - nf12 - prodCusto - custoFreteItens;
-                  const margem = receitaBruta > 0 ? (lucro / receitaBruta) * 100 : 0;
-                  const temCusto = prodCusto > 0 || custoFreteItens > 0;
+                  const cl = calcularCustoLucro(prop);
+                  const prodVenda = cl.prodVenda, prodCusto = cl.prodCusto, custoFreteItens = cl.freteVinda;
+                  const freteCobr = cl.freteCobrado, nf12 = cl.nf, lucro = cl.lucro, margem = cl.margem;
+                  const temCusto = prodCusto > 0 || custoFreteItens > 0 || cl.freteIda > 0;
                   return (
                     <div className="mt-4 rounded-xl border border-line bg-surface p-4">
                       <div className="flex items-center justify-between">
@@ -3707,14 +3736,32 @@ export default function App() {
                         {freteCobr > 0 && <div className="flex justify-between text-sub"><span>+ Frete cobrado</span><span className="font-mono">R$ {brl(freteCobr)}</span></div>}
                         <div className="flex justify-between" style={{color:"#A82F2F"}}><span>− NF 12%</span><span className="font-mono">R$ {brl(nf12)}</span></div>
                         <div className="flex justify-between text-sub"><span>− Custo (produtos)</span><span className="font-mono">R$ {brl(prodCusto)}</span></div>
-                        {custoFreteItens > 0 && <div className="flex justify-between text-sub"><span>− Frete (custo)</span><span className="font-mono">R$ {brl(custoFreteItens)}</span></div>}
+                        {custoFreteItens > 0 && <div className="flex justify-between text-sub"><span>− Frete de vinda (itens)</span><span className="font-mono">R$ {brl(custoFreteItens)}</span></div>}
+                        {cl.freteIda > 0 && <div className="flex justify-between text-sub"><span>− Frete de ida</span><span className="font-mono">R$ {brl(cl.freteIda)}</span></div>}
+                        <div className="flex justify-between font-medium text-ink"><span>= Custo total</span><span className="font-mono">R$ {brl(cl.custoTotal)}</span></div>
                         <div className="mt-1.5 flex items-baseline justify-between border-t border-line pt-1.5">
                           <span className="font-medium text-ink">Lucro líquido (s/ NF)</span>
                           <span className={`font-mono text-[16px] font-semibold ${lucro >= 0 ? "text-signal" : "text-rose"}`}>R$ {brl(lucro)}</span>
                         </div>
                         <div className="text-right text-[10.5px] text-faint">{temCusto ? `${margem.toFixed(0)}% margem` : "informe os custos dos itens"} (margem líquida s/ NF)</div>
                       </div>
-                      <div className="mt-2 text-[10.5px] text-faint">O frete de custo de cada item entra no campo “Frete (item)”, junto da origem do preço.</div>
+                      {/* Frete de IDA (v3.80): envio ao cliente, custo da proposta inteira. */}
+                      <label className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-line2 bg-surface px-3 py-2">
+                        <span className="text-[12px] text-ink">
+                          Frete de ida <span className="text-faint">(envio ao cliente · custo da proposta)</span>
+                        </span>
+                        <span className="flex items-center gap-1.5">
+                          <span className="text-[11px] text-faint">R$</span>
+                          <input inputMode="decimal" value={prop.frete_ida ?? ""}
+                            onChange={(e) => { setPropostas((prev) => prev.map((p, pi) => pi === propostaIdx ? { ...p, frete_ida: e.target.value } : p)); _dispararAutoSave(); }}
+                            placeholder="0,00"
+                            className="w-28 rounded-md border border-line2 bg-paper px-2 py-1 text-right font-mono text-[12.5px] text-ink outline-none focus:bg-white focus:ring-1 focus:ring-kist" />
+                        </span>
+                      </label>
+                      <div className="mt-2 text-[10.5px] text-faint">
+                        Frete de vinda: por item, no campo “Frete (item)” junto da origem do preço. Frete de ida: aqui, uma vez por proposta.
+                        Os dois entram no custo e no lucro; nenhum vai para o Tiny. O frete cobrado do cliente é o campo “Frete (R$)” acima.
+                      </div>
                     </div>
                   );
                 })()}

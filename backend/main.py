@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_ext
 
-VERSAO_BACKEND = "3.79"
+VERSAO_BACKEND = "3.80"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -5699,6 +5699,10 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
         # persistência — a migration sozinha não faz nada.
         "condicao_pagamento":   (payload.get("condicao_pagamento") or "").strip() or None,
         "outros_itens":         (payload.get("outros_itens") or "").strip() or None,
+        # Frete de IDA (v3.80): envio ao cliente, custo interno POR PROPOSTA. Só
+        # grava quando vier no payload — um bot que não conhece o campo não zera
+        # o que o operador lançou.
+        **({"frete_ida": _num_br(payload.get("frete_ida") or 0)} if "frete_ida" in payload else {}),
         "status":               status,
         # Texto que a IA leu na extração. Só grava quando vier — reabrir uma proposta
         # e salvar de novo não pode apagar a fonte com string vazia.
@@ -7436,6 +7440,23 @@ async def criar_oc(payload: dict, usuario: str = Depends(verificar_token)):
         "uf":            uf_oc,
     }).execute()
     oc_id = res.data[0]["id"]
+
+    # Frete de IDA (v3.80): vem do payload; senão, da proposta de onde os itens
+    # saíram — o custo de envio lançado na cotação acompanha a compra.
+    try:
+        _fi = _num_br(payload.get("frete_ida") or 0)
+        if not _fi:
+            _ids = [i.get("item_proposta_id") for i in (payload.get("itens") or []) if i.get("item_proposta_id")]
+            if _ids:
+                _ps = (sb.table("itens_proposta").select("proposta_id").in_("id", _ids).execute().data or [])
+                _pids = list({x["proposta_id"] for x in _ps if x.get("proposta_id")})
+                if len(_pids) == 1:
+                    _pp = (sb.table("propostas").select("frete_ida").eq("id", _pids[0]).limit(1).execute().data or [])
+                    _fi = _num_br((_pp[0] if _pp else {}).get("frete_ida") or 0)
+        if _fi:
+            sb.table("ordens_compra").update({"frete_ida": _fi}).eq("id", oc_id).execute()
+    except Exception:
+        pass
 
     # Adicionar itens se fornecidos
     itens = payload.get("itens", [])
