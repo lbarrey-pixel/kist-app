@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_ext
 
-VERSAO_BACKEND = "3.73"
+VERSAO_BACKEND = "3.75"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -393,6 +393,7 @@ _ROTAS_ESCOPO_PESQUISA = (
     ("POST", re.compile(r"^/propostas/[^/]+/pesquisa-resultado/?$")),
     ("GET",  re.compile(r"^/propostas/[^/]+/fonte/?$")),
     ("GET",  re.compile(r"^/api/whoami/?$")),
+    ("GET",  re.compile(r"^/api/guia/[a-z-]+/?$")),
 )
 
 # Escopo `dwight_dispatch` (v3.70): um agente PRÓPRIO do Leonardo pode pedir a
@@ -403,6 +404,7 @@ _ROTAS_ESCOPO_PESQUISA = (
 _ROTAS_ESCOPO_DWIGHT_DISPATCH = (
     ("POST", re.compile(r"^/propostas/[^/]+/pesquisa-dwight/?$")),
     ("GET",  re.compile(r"^/api/whoami/?$")),
+    ("GET",  re.compile(r"^/api/guia/[a-z-]+/?$")),
 )
 
 def _rota_permitida_dwight_dispatch(metodo: str, caminho: str) -> bool:
@@ -2057,6 +2059,220 @@ def _norm_desc_tiny(s: str) -> str:
     return re.sub(r"\s+", " ", str(s or "").strip().upper())
 
 
+_CONDICAO_FORMATOS = "30 · 30 dias · 30d · 30/60/90 · 30 60 90 · 3x · 30+2x · à vista"
+
+# ── REGRAS DE CAMPO DA EXPORTAÇÃO AO TINY (v3.75) ───────────────────────────
+# Fonte ÚNICA. Daqui saem: a dica embaixo de cada campo na tela, a validação da
+# prévia, o guia que os bots leem (GET /api/guia/exportacao-tiny) e a tradução
+# do erro que o Tiny devolve. Mudou a regra? Muda aqui e vale para os quatro.
+# Decisão do Leonardo (21/09): o importante é quem preenche SABER o formato que
+# a API espera; campo deixado em branco vai em branco (sem padrão escondido).
+_CAMPOS_TINY = [
+    {"campo": "cnpj", "rotulo": "CNPJ do cliente", "destino": "contato", "obrigatorio": True,
+     "formato": "14 dígitos com dígito verificador válido; com ou sem máscara.",
+     "exemplos": ["07.616.290/0006-56", "07616290000656"],
+     "no_tiny": "Localiza o cliente; se não existir, ele é cadastrado com os dados da Receita.",
+     "prefixos_tiny": ["contato"]},
+    {"campo": "condicao_pagamento", "rotulo": "Condição de pagamento", "destino": "condicoesComerciais",
+     "obrigatorio": False,
+     "formato": "Prazo(s) em dias em ordem crescente, número de parcelas, ou entrada + parcelas. "
+                "Outro texto vai como texto livre (registra, mas não gera parcelas).",
+     "exemplos": ["30", "30 dias", "30d", "30/60/90", "3x", "30+2x"],
+     "no_tiny": "Parcelas do orçamento (tipo Parcelas) ou texto livre.",
+     "prefixos_tiny": ["condicoesComerciais"]},
+    {"campo": "prazo_entrega", "rotulo": "Prazo de entrega", "destino": "condicoesGerais.descricaoPrazoEntrega",
+     "obrigatorio": False, "limite": 200,
+     "formato": "Texto livre, até 200 caracteres.", "exemplos": ["15 dias úteis", "Imediato"],
+     "no_tiny": "Descrição do prazo de entrega no orçamento.",
+     "prefixos_tiny": ["condicoesGerais.descricaoPrazoEntrega", "condicoesGerais.dataPrevistaEntrega"]},
+    {"campo": "validade", "rotulo": "Validade da proposta", "destino": "condicoesGerais.validade",
+     "obrigatorio": False,
+     "formato": "Número inteiro de dias (1 a 365). Texto como \"15 dias\" é aceito e vira 15.",
+     "exemplos": ["7", "15", "30 dias"],
+     "no_tiny": "Validade em dias; em branco, vale o padrão do próprio Tiny.",
+     "prefixos_tiny": ["condicoesGerais.validade", "condicoesGerais"]},
+    {"campo": "frete", "rotulo": "Frete (R$)", "destino": "extras.frete", "obrigatorio": False,
+     "formato": "Valor em reais, número. Aceita 1.234,56 ou 1234.56 ou R$ 50.",
+     "exemplos": ["150", "1.234,56", "R$ 80,00"],
+     "no_tiny": "Frete cobrado do cliente, somado ao total do orçamento.",
+     "prefixos_tiny": ["extras.frete"]},
+    {"campo": "desconto", "rotulo": "Desconto", "destino": "extras.desconto", "obrigatorio": False,
+     "formato": "Valor em reais sobre o total dos itens. \"10%\" é aceito e convertido em reais.",
+     "exemplos": ["50", "R$ 120,00", "5%"],
+     "no_tiny": "Desconto absoluto (em reais) — o Tiny não recebe percentual.",
+     "prefixos_tiny": ["extras.desconto"]},
+    {"campo": "outros_itens", "rotulo": "Outros itens ou serviços", "destino": "extras.descricao",
+     "obrigatorio": False, "limite": 4000,
+     "formato": "Texto livre; cada linha vira um parágrafo.", "exemplos": ["Frete CIF", "Garantia 12 meses"],
+     "no_tiny": "Quadro \"Outros itens ou serviços\" do orçamento (sem valor).",
+     "prefixos_tiny": ["extras.descricao", "extras.total"]},
+    {"campo": "introducao", "rotulo": "Introdução", "destino": "introducao", "obrigatorio": False,
+     "limite": 2000, "formato": "Texto livre, até 2.000 caracteres.", "exemplos": ["Prezados, segue nossa proposta."],
+     "no_tiny": "Texto de abertura do orçamento.", "prefixos_tiny": ["introducao"]},
+    {"campo": "observacao", "rotulo": "Observação", "destino": "observacao", "obrigatorio": False,
+     "limite": 2000, "formato": "Texto livre, até 2.000 caracteres.", "exemplos": ["Proposta válida mediante estoque."],
+     "no_tiny": "Observação do orçamento.", "prefixos_tiny": ["observacao"]},
+    {"campo": "itens[].descricao", "rotulo": "Descrição do item", "destino": "produto.descricao",
+     "obrigatorio": True, "limite": 120,
+     "formato": "Obrigatória. O cadastro do produto no Tiny guarda até 120 caracteres; "
+                "a descrição inteira segue no complemento da linha.",
+     "exemplos": ["Cabo UTP Cat6 azul"], "no_tiny": "Produto do orçamento.",
+     "prefixos_tiny": ["itens.produto", "produto"]},
+    {"campo": "itens[].quantidade", "rotulo": "Quantidade do item", "destino": "itens.quantidade",
+     "obrigatorio": True, "formato": "Número maior que zero; aceita decimal (305 ou 2,5).",
+     "exemplos": ["305", "2,5"], "no_tiny": "Quantidade da linha.", "prefixos_tiny": ["itens.quantidade"]},
+    {"campo": "itens[].preco_un", "rotulo": "Preço unitário de venda", "destino": "itens.valorUnitario",
+     "obrigatorio": False, "formato": "Valor em reais. Zero é aceito (sai R$ 0,00, com aviso).",
+     "exemplos": ["2,50", "1.852,70"], "no_tiny": "Valor unitário da linha.",
+     "prefixos_tiny": ["itens.valorUnitario"]},
+    {"campo": "itens[].unidade", "rotulo": "Unidade do item", "destino": "produto.unidade",
+     "obrigatorio": False, "limite": 6, "formato": "Sigla de até 6 letras. Em branco vira UN.",
+     "exemplos": ["UN", "M", "PC", "CX", "KG", "RL"], "no_tiny": "Unidade do produto.",
+     "prefixos_tiny": ["itens.unidade", "unidade"]},
+    {"campo": "itens[].sku_fornecedor", "rotulo": "Código (SKU) do item", "destino": "produto.sku",
+     "obrigatorio": False, "limite": 30,
+     "formato": "Até 30 caracteres. Em branco, a Cabine gera a partir da descrição. "
+                "Código repetido em itens diferentes ganha sufixo -2, -3.",
+     "exemplos": ["CAT6AZ", "A2883FS4PRO"], "no_tiny": "Código do produto no catálogo do Tiny.",
+     "prefixos_tiny": ["sku", "codigo"]},
+]
+_CAMPOS_TINY_POR_NOME = {c["campo"]: c for c in _CAMPOS_TINY}
+
+
+def _normalizar_validade(v):
+    """(dias | None, aviso)."""
+    t = str(v if v is not None else "").strip()
+    if not t:
+        return None, ""
+    m = re.search(r"\d+", t)
+    if not m:
+        return None, f"Validade \"{t}\" sem número de dias — foi em branco (vale o padrão do Tiny)."
+    d = int(m.group())
+    if not 1 <= d <= 365:
+        return None, f"Validade {d} dias fora de 1 a 365 — foi em branco."
+    return d, ""
+
+
+def _normalizar_desconto(v, subtotal: float):
+    """(reais | None, aviso). Percentual vira reais sobre o total dos itens."""
+    t = str(v if v is not None else "").strip()
+    if not t:
+        return None, ""
+    if "%" in t:
+        pct = _num_br(t.replace("%", ""))
+        if pct <= 0 or pct >= 100:
+            return None, f"Desconto \"{t}\" inválido — foi em branco."
+        reais = round(subtotal * pct / 100, 2)
+        return reais, f"Desconto {t} convertido em R$ {reais:,.2f} (o Tiny só recebe valor em reais).".replace(",", "X").replace(".", ",").replace("X", ".")
+    val = round(_num_br(t), 2)
+    return (val if val > 0 else None), ""
+
+
+def _guia_exportacao_tiny() -> str:
+    """Guia em texto puro, gerado das regras — o bot lê isto em runtime."""
+    linhas = ["GUIA DE PREENCHIMENTO — EXPORTAÇÃO DE PROPOSTA PARA O TINY",
+              f"(gerado pela Cabine v{VERSAO_BACKEND}; é a mesma regra que a tela e a prévia aplicam)", "",
+              "Fluxo: 1) POST /propostas/exportar-tiny/previa  2) corrija o que vier em 'erros' e",
+              "leia 'campos' e 'avisos'  3) só então POST /propostas/exportar-tiny.",
+              "Campo em branco vai em branco. Obrigatórios: CNPJ, e em cada item descrição e quantidade.", ""]
+    for c in _CAMPOS_TINY:
+        linhas.append(f"[{c['campo']}] {c['rotulo']}{' — OBRIGATÓRIO' if c.get('obrigatorio') else ''}")
+        linhas.append(f"  formato: {c['formato']}")
+        linhas.append(f"  exemplos: {' | '.join(c['exemplos'])}")
+        linhas.append(f"  no Tiny: {c['no_tiny']}")
+        linhas.append("")
+    return "\n".join(linhas).strip() + "\n"
+
+
+def _traduzir_erro_tiny(msg: str) -> str:
+    """Recusa do Tiny -> mensagem por campo, com a regra de como preencher.
+
+    A API devolve {mensagem, detalhes: [{campo, mensagem}]}. Casa o `campo` do
+    Tiny com o nosso pelo prefixo; sem casamento, devolve o texto do Tiny.
+    """
+    bruto = str(msg or "")
+    detalhes = []
+    try:
+        i = bruto.index("{")
+        import json as _jt
+        j = _jt.loads(bruto[i:])
+        detalhes = [d for d in (j.get("detalhes") or []) if isinstance(d, dict)]
+    except Exception:
+        detalhes = []
+    partes = []
+    for d in detalhes:
+        campo_tiny = re.sub(r"\[\d+\]", "", str(d.get("campo") or ""))
+        regra = None
+        for c in _CAMPOS_TINY:
+            if any(campo_tiny.startswith(p) or campo_tiny.endswith(p) for p in c["prefixos_tiny"]):
+                regra = c
+                break
+        if regra:
+            partes.append(f"{regra['rotulo']}: o Tiny recusou ({d.get('mensagem') or 'valor inválido'}). "
+                          f"Como preencher: {regra['formato']} Ex.: {', '.join(regra['exemplos'][:3])}.")
+        else:
+            partes.append(f"{d.get('campo') or 'campo'}: {d.get('mensagem') or 'valor inválido'}.")
+    return " | ".join(partes) if partes else bruto[:400]
+
+
+def _normalizar_condicao(texto: str) -> dict:
+    """Condição de pagamento como o operador escreve -> como o Tiny aceita (v3.74).
+
+    HISTÓRICO (21/09, Thiago, proposta 1050910): "30", "30 dias" e "30d" foram
+    todos recusados pelo Tiny, sem orientação nenhuma, e a solução foi deixar em
+    branco e preencher à mão dentro do Tiny. "30 dias" e "30d" nem eram
+    reconhecidos como prazo — iam como texto cru no campo de parcelas.
+
+    A documentação da API aceita em `parcelas.condicao`: "30 60 90", "3x",
+    "30,60,90", "30+2x". Aqui:
+      "30", "30 dias", "30d", "30 ddl"          -> parcelas "30"
+      "30/60/90", "30-60-90", "30 e 60 dias"     -> parcelas "30 60 90"
+      "3x", "3 vezes"                            -> parcelas "3x"
+      "30+2x"                                    -> parcelas "30+2x"
+      qualquer outra coisa ("à vista", "boleto 28 dias após NF") -> TEXTO LIVRE
+    Texto livre SEMPRE é aceito pelo Tiny: a condição fica registrada no
+    orçamento, só não gera parcelas automáticas. Nunca trava a exportação.
+    Devolve {tipo: "parcelas"|"texto"|"vazio", condicao, original, explicacao}.
+    """
+    original = re.sub(r"\s+", " ", str(texto or "")).strip()
+    if not original:
+        return {"tipo": "vazio", "condicao": "", "original": "", "explicacao": ""}
+    t = original.lower()
+    t = re.sub(r"\b(dias?|dd|ddl|d)\b", " ", t)          # "30 dias", "30 ddl"
+    t = re.sub(r"(?<=\d)(dias?|ddl|dd|d)\b", " ", t)       # "30d", "30dias"
+    t = re.sub(r"\bvezes\b", "x", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    m = re.fullmatch(r"(\d{1,2})\s*x", t)
+    if m and 1 <= int(m.group(1)) <= 24:
+        return {"tipo": "parcelas", "condicao": f"{int(m.group(1))}x", "original": original,
+                "explicacao": f"{int(m.group(1))} parcelas"}
+    m = re.fullmatch(r"(\d{1,3})\s*\+\s*(\d{1,2})\s*x", t)
+    if m:
+        return {"tipo": "parcelas", "condicao": f"{int(m.group(1))}+{int(m.group(2))}x",
+                "original": original,
+                "explicacao": f"entrada em {int(m.group(1))} dias + {int(m.group(2))} parcelas"}
+    partes = [p for p in re.split(r"[\s,;/\-]+|\be\b", t) if p]
+    if partes and all(p.isdigit() for p in partes):
+        dias = [int(p) for p in partes]
+        if all(0 <= d <= 365 for d in dias) and dias == sorted(dias) and len(dias) <= 12:
+            cond = " ".join(str(d) for d in dias)
+            expl = (f"1 parcela em {dias[0]} dias" if len(dias) == 1
+                    else f"{len(dias)} parcelas em {', '.join(str(d) for d in dias)} dias")
+            return {"tipo": "parcelas", "condicao": cond, "original": original, "explicacao": expl}
+    return {"tipo": "texto", "condicao": original[:250], "original": original,
+            "explicacao": "vai como texto livre (o Tiny registra, mas não gera parcelas)"}
+
+
+def _condicoes_comerciais_tiny(norm: dict, forma: str = "parcelas") -> Optional[dict]:
+    """Bloco `condicoesComerciais` do orçamento. `forma` permite o recuo para
+    texto livre quando o Tiny recusar as parcelas."""
+    if norm["tipo"] == "vazio":
+        return None
+    if norm["tipo"] == "parcelas" and forma == "parcelas":
+        return {"tipo": "Parcelas", "parcelas": {"condicao": norm["condicao"]}}
+    return {"tipo": "Texto livre", "textoLivre": (norm.get("original") or norm["condicao"])[:250]}
+
+
 def _modelar_orcamento_tiny(payload: dict, itens: list) -> dict:
     """Monta o orçamento como vai sair — FUNÇÃO PURA, sem rede (testável).
 
@@ -2131,38 +2347,69 @@ def _modelar_orcamento_tiny(payload: dict, itens: list) -> dict:
             # Quem gerou na Cabine assina no Tiny. Proposta tem dono.
             "responsavel": (payload.get("usuario_nome") or "").strip() or "Departamento de vendas",
         },
-        "condicoesGerais": {
-            "validade": int(_num_br(payload.get("validade"), 7) or 7),
-            "descricaoPrazoEntrega": (payload.get("prazo_entrega") or "")[:200] or None,
-        },
         "itens": linhas,
-        "extras": {
-            "frete": round(_num_br(payload.get("frete")), 2),
-            "desconto": round(_num_br(payload.get("desconto")), 2),
-        },
+        "extras": {},
     }
+    # Campo em branco vai em branco (decisão do Leonardo, 21/09): sem validade
+    # de 7 dias nem frete zero inventados.
+    validade, av = _normalizar_validade(payload.get("validade"))
+    if av:
+        avisos.append(av)
+    prazo = str(payload.get("prazo_entrega") or "").strip()
+    if len(prazo) > 200:
+        avisos.append("Prazo de entrega com mais de 200 caracteres — foi cortado.")
+    cg = {k: v for k, v in (("validade", validade), ("descricaoPrazoEntrega", prazo[:200] or None)) if v is not None}
+    if cg:
+        corpo["condicoesGerais"] = cg
+    frete_txt = str(payload.get("frete") if payload.get("frete") is not None else "").strip()
+    if frete_txt:
+        corpo["extras"]["frete"] = round(_num_br(frete_txt), 2)
+    desconto, av = _normalizar_desconto(payload.get("desconto"), total)
+    if av:
+        avisos.append(av)
+    if desconto:
+        corpo["extras"]["desconto"] = desconto
     # "Outros itens ou serviços": `extras.descricao`, guardado como HTML.
     outros = (payload.get("outros_itens") or "").strip()
     if outros:
         if "<" not in outros:
             outros = "".join(f"<p>{l.strip()}</p>" for l in outros.splitlines() if l.strip())
         corpo["extras"]["descricao"] = outros[:4000]
-    # Condição de pagamento. Documentação: `tipo` ∈ {"Nenhuma", "Parcelas",
-    # "Texto livre"}; `parcelas.condicao` aceita "30 60 90", "3x", "30,60,90",
-    # "30+2x". A v3.71 mandava tipo "P" — o valor que o Tiny DEVOLVE na leitura,
-    # não o que ele ACEITA na escrita.
-    cond = (payload.get("condicao_pagamento") or "").strip()
-    if cond:
-        cc = {"tipo": "Parcelas", "parcelas": {"condicao": cond[:60]}}
-        numeros = re.findall(r"\d+", cond)
-        if numeros and re.fullmatch(r"[\d\s/,;-]+", cond):
-            cc["parcelas"]["dias"] = numeros
-            cc["parcelas"]["obs"] = [""] * len(numeros)
+    # Condição de pagamento: normalizada para o formato que o Tiny aceita (ou
+    # texto livre, que ele sempre aceita). Ver `_normalizar_condicao`.
+    cond_norm = _normalizar_condicao(payload.get("condicao_pagamento"))
+    cc = _condicoes_comerciais_tiny(cond_norm)
+    if cc:
         corpo["condicoesComerciais"] = cc
+    if cond_norm["tipo"] == "texto":
+        avisos.append(f"Condição de pagamento \"{cond_norm['original']}\" não está num formato de "
+                      f"parcelas ({_CONDICAO_FORMATOS}) — vai como texto livre no Tiny.")
+    if not corpo["extras"]:
+        corpo.pop("extras")
     corpo = {k: v for k, v in corpo.items() if v is not None}
-    frete = corpo["extras"]["frete"]
-    desconto = corpo["extras"]["desconto"]
+    frete = (corpo.get("extras") or {}).get("frete", 0.0)
+    desconto = (corpo.get("extras") or {}).get("desconto", 0.0)
+
+    # Campo a campo, como vai sair — para a tela e o bot SABEREM o que o Tiny recebe.
+    def _campo(nome, valor, vai):
+        r = _CAMPOS_TINY_POR_NOME[nome]
+        return {"campo": nome, "rotulo": r["rotulo"], "valor": valor, "vai_como": vai,
+                "formato": r["formato"], "exemplos": r["exemplos"]}
+    cn = cond_norm
+    campos = [
+        _campo("condicao_pagamento", cn.get("original") or "",
+               (cn["explicacao"] if cn["tipo"] != "vazio" else "em branco")),
+        _campo("prazo_entrega", prazo, prazo[:200] or "em branco"),
+        _campo("validade", str(payload.get("validade") or ""),
+               f"{validade} dias" if validade else "em branco (padrão do Tiny)"),
+        _campo("frete", frete_txt, f"R$ {frete:.2f}".replace(".", ",") if frete_txt else "em branco"),
+        _campo("desconto", str(payload.get("desconto") or ""),
+               f"R$ {desconto:.2f}".replace(".", ",") if desconto else "em branco"),
+        _campo("outros_itens", (payload.get("outros_itens") or "").strip(),
+               "preenchido" if (payload.get("outros_itens") or "").strip() else "em branco"),
+    ]
     return {"linhas": linhas, "itens_modelados": modelados, "corpo_sem_contato": corpo,
+            "condicao": cond_norm, "campos": campos,
             "avisos": avisos, "erros": erros,
             "total_itens": round(total, 2),
             "total": round(total + frete - desconto, 2)}
@@ -2242,6 +2489,10 @@ def _previa_exportacao(payload: dict) -> dict:
                      if ja else "criar um orçamento novo"),
         "_tiny_id_existente": (ja or {}).get("tiny_id"),
         "itens": mod["itens_modelados"],
+        "condicao_pagamento": {k: mod["condicao"][k] for k in ("tipo", "original", "condicao", "explicacao")},
+        "condicao_formatos": _CONDICAO_FORMATOS,
+        "campos": mod["campos"],
+        "guia": "/api/guia/exportacao-tiny",
         "total_itens": mod["total_itens"],
         "total": mod["total"],
         "avisos": cliente.get("avisos", []) + mod["avisos"],
@@ -2252,6 +2503,18 @@ def _previa_exportacao(payload: dict) -> dict:
 
 def _publico(previa: dict) -> dict:
     return {k: v for k, v in previa.items() if not k.startswith("_")}
+
+
+@app.get("/api/guia/exportacao-tiny")
+async def guia_exportacao_tiny(formato: str = "texto", usuario: str = Depends(verificar_token)):
+    """Como preencher cada campo para o Tiny aceitar — gerado das MESMAS regras
+    que a tela e a prévia aplicam. Texto puro por padrão (barato para bot);
+    `?formato=json` devolve a lista estruturada (a tela usa para as dicas)."""
+    if str(formato).lower() == "json":
+        return {"versao": VERSAO_BACKEND,
+                "campos": [{k: c[k] for k in ("campo", "rotulo", "obrigatorio", "formato", "exemplos", "no_tiny")}
+                           for c in _CAMPOS_TINY]}
+    return PlainTextResponse(_guia_exportacao_tiny())
 
 
 @app.post("/propostas/exportar-tiny/previa")
@@ -2306,16 +2569,67 @@ async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verifica
 
     corpo = {"contato": {"id": contato_id}, **mod["corpo_sem_contato"]}
     ja = previa.get("_tiny_id_existente")
+    cond_norm = mod["condicao"]
+    avisos_envio = []
+
+    def _log(tentativa, ok, erro="", tiny_id=None):
+        """Toda tentativa fica registrada — sem isto, a recusa do Tiny sumia e
+        ninguém conseguia dizer depois POR QUE a exportação falhou."""
+        try:
+            get_supabase().table("tiny_exportacoes_log").insert({
+                "numero_proposta": numero, "usuario_email": usuario, "tentativa": tentativa,
+                "ok": ok, "etapa": "atualizar" if ja else "criar",
+                "condicao_original": cond_norm.get("original") or None,
+                "condicao_enviada": corpo.get("condicoesComerciais"),
+                "erro": (erro or "")[:1500] or None, "tiny_id": tiny_id,
+            }).execute()
+        except Exception:
+            pass
+
+    def _enviar():
+        return _tiny.atualizar_orcamento(int(ja), corpo) if ja else _tiny.criar_orcamento(corpo)
+
+    def _erro_de_condicao(msg: str) -> bool:
+        m = msg.lower()
+        return any(x in m for x in ("condic", "parcela", "pagamento"))
+
+    r, tentativa = None, 1
     try:
-        if ja:
-            r = _tiny.atualizar_orcamento(int(ja), corpo)
-        else:
-            r = _tiny.criar_orcamento(corpo)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e)[:400])
+        r = _enviar()
+    except Exception as e1:
+        _log(tentativa, False, str(e1))
+        # RECUO: se o Tiny recusou por causa da condição, tenta de novo com ela
+        # em texto livre (que ele sempre aceita), e depois sem ela — mas a
+        # exportação não trava por isso, e o operador fica sabendo o que houve.
+        cc = corpo.get("condicoesComerciais")
+        if not (cc and _erro_de_condicao(str(e1))):
+            raise HTTPException(status_code=400, detail=_traduzir_erro_tiny(str(e1)))
+        if cc.get("tipo") == "Parcelas":
+            tentativa += 1
+            corpo["condicoesComerciais"] = _condicoes_comerciais_tiny(cond_norm, forma="texto")
+            try:
+                r = _enviar()
+                avisos_envio.append(f"O Tiny recusou a condição \"{cond_norm['original']}\" como "
+                                    "parcelas; foi registrada como texto livre no orçamento.")
+            except Exception as e2:
+                _log(tentativa, False, str(e2))
+                if not _erro_de_condicao(str(e2)):
+                    raise HTTPException(status_code=400, detail=_traduzir_erro_tiny(str(e2)))
+        if r is None:
+            tentativa += 1
+            corpo.pop("condicoesComerciais", None)
+            try:
+                r = _enviar()
+                avisos_envio.append(f"O Tiny recusou a condição \"{cond_norm['original']}\" em todos os "
+                                    "formatos; o orçamento foi criado SEM condição — ajuste no Tiny "
+                                    "e me avise, que o registro desta recusa ficou salvo para correção.")
+            except Exception as e3:
+                _log(tentativa, False, str(e3))
+                raise HTTPException(status_code=400, detail=_traduzir_erro_tiny(str(e3)))
 
     tiny_id = (r or {}).get("id")
     tiny_num = str((r or {}).get("numeroProposta") or "") or None
+    _log(tentativa, True, tiny_id=tiny_id)
 
     # Amarra as duas numerações. Sem isso ninguém liga a proposta ao orçamento.
     if numero and tiny_id:
@@ -2342,7 +2656,8 @@ async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verifica
              "itens": len(mod["linhas"]), "total": previa["total"],
              "contato_id": contato_id, "cliente_tiny": contato_nome,
              "produtos": (r or {}).get("produtos") or [],
-             "avisos": previa["avisos"]}
+             "condicao_pagamento": previa.get("condicao_pagamento"),
+             "avisos": previa["avisos"] + avisos_envio}
     if banco:
         saida["banco"] = banco
     if contato_criado:
@@ -2714,6 +3029,9 @@ def whoami(request: Request, usuario: str = Depends(verificar_token)):
         "metodos_permitidos": metodos,
         "rotas_somente_admin": _rotas_admin() if credencial == "api_key" else [],
         "versao_backend": VERSAO_BACKEND,
+        # Onde o bot aprende a preencher cada campo (texto puro, gerado das
+        # mesmas regras que a tela e a prévia aplicam). Leia antes de exportar.
+        "guias": {"exportacao_tiny": "/api/guia/exportacao-tiny"},
         "docs": "/docs",
     }
 

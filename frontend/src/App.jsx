@@ -64,6 +64,22 @@ async function _extrairAssincrono(form, authHeaders, onProgresso) {
 // Identidade estável do item (v3.61). O save apaga e recria as linhas da proposta,
 // então o `id` muda a cada auto-save. O `item_uid` nasce aqui, viaja com o item e é
 // por ele que o resultado da pesquisa do Dwight volta para a linha certa.
+// Dica de preenchimento de um campo do Tiny (v3.75). As regras vêm do backend
+// (GET /api/guia/exportacao-tiny?formato=json) — a MESMA fonte que a prévia e o
+// guia dos bots usam. Sem guia carregado, não mostra nada (nunca texto velho).
+export function textoDicaTiny(guia, campo) {
+  const r = guia && guia[campo];
+  if (!r) return "";
+  const ex = (r.exemplos || []).slice(0, 4).join(" · ");
+  return ex ? `${r.formato} Ex.: ${ex}` : r.formato;
+}
+
+function DicaTiny({ guia, campo }) {
+  const t = textoDicaTiny(guia, campo);
+  if (!t) return null;
+  return <div className="mt-1 text-[10.5px] leading-snug text-faint">{t}</div>;
+}
+
 // A conexão OAuth com o Tiny caiu? (a renovação do token foi recusada)
 export function precisaReconectarTiny(msg) {
   const m = String(msg || "").toLowerCase();
@@ -82,6 +98,9 @@ export function mensagemPreviaTiny(pv) {
     "",
     linhaCliente,
     `Operação: ${pv && pv.operacao}.`,
+    ...(pv && pv.condicao_pagamento && pv.condicao_pagamento.tipo !== "vazio"
+      ? [`Condição de pagamento: "${pv.condicao_pagamento.original}" → ${pv.condicao_pagamento.explicacao}.`]
+      : []),
     `${((pv && pv.itens) || []).length} itens · total ${brl((pv && pv.total) || 0)}.`,
     ...(avisos.length ? ["", "Avisos:", ...avisos.map((a) => "• " + a)] : []),
   ].join("\n");
@@ -2107,6 +2126,7 @@ export default function App() {
   // herdaram). Some ao reiniciar.
   const [propagacao, setPropagacao] = useState(null);
   const [tinyEnvio, setTinyEnvio] = useState(null);
+  const [guiaTiny, setGuiaTiny] = useState(null);   // regras de campo do Tiny (v3.75)
   // "Não importar preços sem rastreabilidade": ON pro Fábio por padrão, OFF pros demais.
   // Ele pode desmarcar. Diferente do antigo checkbox de preservar descrição (que criava
   // duas verdades no mesmo dado), este não muda o que o sistema SABE — só o que ele
@@ -2480,6 +2500,19 @@ export default function App() {
   }
   const autoAplicadosRef = useRef(new Set());         // uid já aplicado automaticamente
   const numeroAtual = String(propostas[propostaIdx]?.proposta || numeroProposta || "").trim();
+
+  useEffect(() => {
+    if (!token || guiaTiny) return;
+    fetch(`${API}/api/guia/exportacao-tiny?formato=json`, { headers: authHeaders() })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (!d || !Array.isArray(d.campos)) return;
+        const mapa = {};
+        d.campos.forEach((c) => { mapa[c.campo] = c; });
+        setGuiaTiny(mapa);
+      })
+      .catch(() => {});
+  }, [token]);
 
   async function carregarPesquisa(numero) {
     if (!numero || !token) return;
@@ -3455,6 +3488,7 @@ export default function App() {
                         placeholder="00.000.000/0000-00"
                         className={`mt-1 w-full rounded-lg border bg-paper px-2.5 py-1.5 font-mono text-[13px] text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist
                           ${!(prop.cnpj || "").trim() ? "border-amber/50" : "border-line2"}`} />
+                      <DicaTiny guia={guiaTiny} campo="cnpj" />
                     </label>
                     <label className="block">
                       <div className="text-[11.5px] text-sub">Prazo de entrega</div>
@@ -3462,6 +3496,7 @@ export default function App() {
                         onChange={(e) => { setPropostas((prev) => prev.map((p, pi) => pi === propostaIdx ? { ...p, prazo_entrega: e.target.value } : p)); _dispararAutoSave(); }}
                         placeholder="ex: 15 dias úteis"
                         className="mt-1 w-full rounded-lg border border-line2 bg-paper px-2.5 py-1.5 text-[13px] text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
+                      <DicaTiny guia={guiaTiny} campo="prazo_entrega" />
                     </label>
                     <label className="block sm:col-span-2">
                       {/* "Outros itens ou serviços" do orçamento: vai em
@@ -3473,6 +3508,7 @@ export default function App() {
                         onChange={(e) => { setPropostas((prev) => prev.map((p, pi) => pi === propostaIdx ? { ...p, outros_itens: e.target.value } : p)); _dispararAutoSave(); }}
                         placeholder="ex: Frete CIF · Instalação não inclusa · Garantia 12 meses"
                         className="mt-1 w-full resize-y rounded-lg border border-line2 bg-paper px-2.5 py-1.5 text-[13px] text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
+                      <DicaTiny guia={guiaTiny} campo="outros_itens" />
                     </label>
                     <label className="block">
                       {/* Condição de pagamento: vai para o campo `condicoesComerciais`
@@ -3480,9 +3516,10 @@ export default function App() {
                       <div className="text-[11.5px] text-sub">Condição de pagamento</div>
                       <input value={prop.condicao_pagamento || ""}
                         onChange={(e) => { setPropostas((prev) => prev.map((p, pi) => pi === propostaIdx ? { ...p, condicao_pagamento: e.target.value } : p)); _dispararAutoSave(); }}
-                        placeholder="ex: 30  ·  30 60 90  ·  6x"
-                        title="30 = 30 dias direto | 30 60 90 = vencimentos em 30, 60 e 90 dias | 6x = 6 parcelas a cada 30 dias"
+                        placeholder="ex: 30  ·  30 dias  ·  30/60/90  ·  3x"
+                        title="30 ou 30 dias = 1 parcela em 30 dias | 30/60/90 = 3 vencimentos | 3x = 3 parcelas | 30+2x = entrada em 30 dias + 2 parcelas | qualquer outro texto vai como texto livre"
                         className="mt-1 w-full rounded-lg border border-line2 bg-paper px-2.5 py-1.5 text-[13px] text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
+                      <DicaTiny guia={guiaTiny} campo="condicao_pagamento" />
                     </label>
                     <label className="block">
                       <div className="text-[11.5px] text-sub">Frete (R$)</div>
@@ -3490,6 +3527,7 @@ export default function App() {
                         onChange={(e) => { setPropostas((prev) => prev.map((p, pi) => pi === propostaIdx ? { ...p, frete: e.target.value } : p)); _dispararAutoSave(); }}
                         placeholder="0,00"
                         className="mt-1 w-full rounded-lg border border-line2 bg-paper px-2.5 py-1.5 font-mono text-[13px] text-ink outline-none placeholder:text-faint focus:bg-white focus:ring-1 focus:ring-kist" />
+                      <DicaTiny guia={guiaTiny} campo="frete" />
                     </label>
                   </div>
                 </div>
