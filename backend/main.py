@@ -92,7 +92,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext
 
-VERSAO_BACKEND = "3.70"
+VERSAO_BACKEND = "3.72"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -1999,35 +1999,37 @@ def tiny_teste(caminho: str = "/contatos", cru: int = 0, limite: int = 1,
             "obs": "use cru=1 para ver a resposta inteira"}
 
 
-@app.post("/propostas/exportar-tiny")
-async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verificar_token)):
-    """Lança a proposta como ORÇAMENTO (proposta comercial) no Tiny.
+# ══════════════════════════════════════════════════════════════════════════════
+# EXPORTAÇÃO PARA O TINY (v3.72) — modelada pelo contrato OFICIAL da API v3
+# ══════════════════════════════════════════════════════════════════════════════
+# Fonte: documentação Olist ERP API v3 (api-docs.erp.olist.com), rotas
+# GET/POST /contatos, GET /contatos/tipos, GET/POST /produtos, POST /orcamentos
+# e PUT /orcamentos/{id}.
+#
+# O fluxo tem DUAS fases, e a primeira não escreve nada no Tiny:
+#   1) MODELAR  — monta o orçamento exatamente como vai sair, valida cada item e
+#                 descobre o cliente (só leitura). É o que a PRÉVIA devolve.
+#   2) ENVIAR   — só depois da modelagem limpa: cadastra o cliente se preciso,
+#                 resolve os produtos por id e cria (ou atualiza) o orçamento.
+# Prévia e exportação usam a MESMA modelagem — o que a prévia mostra é o que sai.
 
-    PAYLOAD MINIMO:
-      {"proposta": "1050851", "cliente": "...", "cnpj": "58619404000814",
-       "usuario_nome": "Leonardo", "introducao": "", "observacao": "",
-       "prazo_entrega": "", "frete": 0, "desconto": 0,
-       "itens": [{"descricao_final": "...", "quantidade": 10, "unidade": "UN",
-                  "preco_un": 250.0, "sku_fornecedor": "",
-                  "specs_complementares": ""}]}
+def _sku_tiny(it: dict, i: int) -> str:
+    """Código do produto no Tiny. SKU do fornecedor vence; sem ele, deriva da
+    descrição — TRUNCADO: um código de 47 caracteres derrubou a proposta 1050862.
+    Derivado do ITEM (não do cliente) para o mesmo produto compartilhar código."""
+    s = (it.get("sku_fornecedor") or "").strip()
+    if s:
+        return s[:30]
+    base = _slug_agente(it.get("descricao_final") or it.get("descricao_original") or "")
+    return (base[:30].rstrip("-") or f"item-{i}").upper()
 
-    Orçamento e não pedido de propósito: a venda só existe quando o cliente
-    aprova e devolve a PO, e o Tiny converte orçamento em pedido nesse momento.
 
-    O cliente PRECISA existir no Tiny — a rota não cadastra contato sozinha.
-    Cadastro duplicado no ERP é dor que dura anos, e o Tiny já tem 4.745
-    contatos para casar.
-    """
-    if not _TINY_OK:
-        raise HTTPException(status_code=503, detail="modulo tiny nao carregado")
+def _carregar_payload_exportacao(payload: dict):
+    """(numero, itens, cnpj_digitos) — completando pelo banco o que não veio.
+    Só o número basta: o agente não precisa remontar itens e CNPJ no payload."""
     numero = str(payload.get("proposta") or payload.get("numero_proposta") or "").strip()
     itens = payload.get("itens") or []
-    cnpj = "".join(c for c in str(payload.get("cnpj") or "") if c.isdigit())
-
-    # Só o número basta. O agente acabou de salvar a proposta; exigir que ele
-    # remonte itens e CNPJ no payload é pedir que carregue no contexto (e pague
-    # por) algo que o banco já tem. Foi o que derrubou a primeira exportação do
-    # Dwight com 422.
+    cnpj = re.sub(r"\D", "", str(payload.get("cnpj") or ""))
     if numero and (not itens or len(cnpj) < 11):
         try:
             sb0 = get_supabase()
@@ -2044,95 +2046,84 @@ async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verifica
                         payload[campo] = prop[campo]
                 if not itens:
                     itens = (sb0.table("itens_proposta").select("*")
-                             .eq("proposta_id", prop["id"]).execute().data or [])
+                             .eq("proposta_id", prop["id"]).order("id").execute().data or [])
                     payload["itens"] = itens
         except Exception:
             pass
+    return numero, itens, cnpj
 
-    if not itens:
-        raise HTTPException(
-            status_code=422,
-            detail=(f"proposta {numero or '?'} sem itens. Salve com "
-                    "POST /salvar-proposta antes de exportar, ou mande os itens no payload."))
-    if len(cnpj) < 11:
-        raise HTTPException(status_code=422,
-                            detail="CNPJ do cliente ausente ou invalido")
 
-    try:
-        contato = _tiny.achar_contato(cnpj)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"falha ao buscar contato: {str(e)[:200]}")
+def _norm_desc_tiny(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s or "").strip().upper())
 
-    contato_criado = None
-    if (not contato or not contato.get("id")) and payload.get("criar_contato_se_ausente"):
-        # OPT-IN (v3.69): só cadastra quando o PEDIDO pede — nunca por padrão.
-        # HISTÓRICO: a rota recusava mesmo com CNPJ real e dados completos via
-        # BrasilAPI (caso Igreja Universal, filial de Porto Alegre). Mas isto
-        # grava direto no ERP financeiro, e o esquema do corpo NÃO foi
-        # confirmado contra uma conta Tiny real — por isso o padrão continua
-        # sendo recusar, e criar só quando pedido explicitamente.
-        try:
-            receita = _consulta_receita(cnpj) or {}
-            novo = _tiny.criar_contato(cnpj, receita)
-            contato = novo
-            contato_criado = {"id": novo.get("id"), "nome": novo.get("nome"),
-                              "cnpj": _cnpj_formatado(cnpj),
-                              "fonte_dados": "BrasilAPI" if receita else "so o CNPJ"}
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail=(f"cliente {_cnpj_formatado(cnpj)} nao existe no Tiny e o cadastro "
-                        f"automatico falhou: {str(e)[:200]} — cadastre manualmente."))
 
-    if not contato or not contato.get("id"):
-        raise HTTPException(
-            status_code=404,
-            detail=(f"cliente {_cnpj_formatado(cnpj)} nao existe no Tiny. Cadastre-o la "
-                    "primeiro, ou mande \"criar_contato_se_ausente\": true para a Cabine "
-                    "cadastrar sozinha com os dados da Receita."))
+def _modelar_orcamento_tiny(payload: dict, itens: list) -> dict:
+    """Monta o orçamento como vai sair — FUNÇÃO PURA, sem rede (testável).
 
-    # SKU derivado do ITEM, não do cliente: assim o mesmo produto vendido a dois
-    # clientes compartilha código, e um dia dá para olhar para trás e ver quantas
-    # vezes aquilo foi vendido.
-    def _sku(it, i):
-        """Código do produto no Tiny. Curto de propósito.
+    Devolve {linhas, itens_modelados, corpo_sem_contato, avisos, erros, total}.
+    `erros` bloqueia o envio; `avisos` só informa.
 
-        SKU do fornecedor vence quando existe. Sem ele, deriva da descrição —
-        mas TRUNCADO: um código de 47 caracteres derrubou a proposta 1050862,
-        e a mesma passou com um curto. Código curto também é o que alguém
-        consegue procurar na tela do ERP depois.
-        """
-        s = (it.get("sku_fornecedor") or "").strip()
-        if s:
-            return s[:30]
-        base = _slug_agente(it.get("descricao_final") or it.get("descricao_original") or "")
-        return (base[:30].rstrip("-") or f"item-{i}").upper()
-
-    linhas = []
-    for i, it in enumerate(itens, 1):
+    Correções de casamento em relação à versão anterior:
+    - dois itens DIFERENTES que derivavam o mesmo código (mesma SKU do
+      fornecedor, ou descrições longas com o mesmo começo) viravam o MESMO
+      produto no Tiny — o segundo aparecia com a descrição do primeiro. Agora o
+      código repetido com descrição diferente ganha sufixo (-2, -3);
+    - descrição com mais de 120 caracteres era cortada no cadastro do produto e
+      o resto se perdia. Agora a descrição inteira vai também na descrição
+      complementar da linha;
+    - quantidade zero ou negativa bloqueia (o Tiny recusaria o orçamento
+      inteiro); preço zero só avisa (pode ser item cortesia).
+    """
+    avisos, erros = [], []
+    linhas, modelados = [], []
+    usados: dict = {}          # SKU (maiúsculo) -> descrição normalizada
+    total = 0.0
+    for i, it in enumerate(itens or [], 1):
         desc = (it.get("descricao_final") or it.get("descricao_original") or "").strip()
         if not desc:
+            avisos.append(f"Item {i} sem descrição — ficou de fora.")
             continue
         qtd = _num_br(it.get("quantidade"), 1)
-        val = _num_br(it.get("preco_un") or it.get("preco_venda"))
-        compl = (it.get("specs_complementares") or "").strip()
+        if qtd <= 0:
+            erros.append(f"Item {i} ({desc[:50]}): quantidade {qtd:g} — corrija antes de exportar.")
+            continue
+        val = round(_num_br(it.get("preco_un") or it.get("preco_venda")), 2)
+        if val <= 0:
+            avisos.append(f"Item {i} ({desc[:50]}): sem preço de venda — vai a R$ 0,00.")
         un = (it.get("unidade") or "UN").strip()[:6] or "UN"
-        linhas.append({
-            "produto": {"sku": _sku(it, i), "descricao": desc[:120],
-                        "tipo": "P", "unidade": un},
-            "quantidade": qtd,
-            "valorUnitario": round(val, 2),
-            "descrComplementarOrc": (f"{un} | {compl}" if compl else un)[:500],
-        })
-    if not linhas:
-        raise HTTPException(status_code=422, detail="nenhum item com descricao")
 
-    hoje = _dt_ext.utcnow().date().isoformat()
+        base = _sku_tiny(it, i)
+        sku, n, chave = base, 2, _norm_desc_tiny(desc)
+        while sku.upper() in usados and usados[sku.upper()] != chave:
+            sku = f"{base[:27].rstrip('-')}-{n}"
+            n += 1
+        if sku != base:
+            avisos.append(f"Item {i} ({desc[:40]}): o código {base} já era de outro item desta "
+                          f"proposta — usei {sku} para não virar o mesmo produto no Tiny.")
+        usados[sku.upper()] = chave
+
+        partes = [un]
+        if len(desc) > 120:
+            partes.append(desc)            # o cadastro do produto corta em 120
+        compl = (it.get("specs_complementares") or "").strip()
+        if compl:
+            partes.append(compl)
+        linhas.append({
+            "produto": {"sku": sku, "descricao": desc[:120], "unidade": un},
+            "quantidade": qtd,
+            "valorUnitario": val,
+            "descrComplementarOrc": " | ".join(partes)[:500],
+        })
+        modelados.append({"n": i, "sku": sku, "descricao": desc[:120], "unidade": un,
+                          "quantidade": qtd, "valor_unitario": val,
+                          "subtotal": round(qtd * val, 2)})
+        total += qtd * val
+
+    if not linhas:
+        erros.append("Nenhum item com descrição para exportar.")
+
     corpo = {
-        "contato": {"id": contato["id"]},
-        "data": hoje,
-        "situacao": "Rascunho",
-        "numeroProposta": numero or None,
+        "data": _dt_ext.utcnow().date().isoformat(),
         "introducao": (payload.get("introducao") or "")[:2000] or None,
         "observacao": (payload.get("observacao") or "")[:2000] or None,
         "assinatura": {
@@ -2141,58 +2132,183 @@ async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verifica
             "responsavel": (payload.get("usuario_nome") or "").strip() or "Departamento de vendas",
         },
         "condicoesGerais": {
-            "validade": int(payload.get("validade") or 7),
+            "validade": int(_num_br(payload.get("validade"), 7) or 7),
             "descricaoPrazoEntrega": (payload.get("prazo_entrega") or "")[:200] or None,
         },
         "itens": linhas,
         "extras": {
-            "frete": _num_br(payload.get("frete")),
-            "desconto": _num_br(payload.get("desconto")),
+            "frete": round(_num_br(payload.get("frete")), 2),
+            "desconto": round(_num_br(payload.get("desconto")), 2),
         },
     }
-
-    # "Outros itens ou serviços" do orçamento. Confirmado lendo um orçamento
-    # real: o campo é `extras.descricao` e o Tiny guarda como HTML. Texto puro
-    # vira parágrafo; se o operador já mandou HTML, respeitamos o que veio.
+    # "Outros itens ou serviços": `extras.descricao`, guardado como HTML.
     outros = (payload.get("outros_itens") or "").strip()
     if outros:
         if "<" not in outros:
-            outros = "".join(f"<p>{l.strip()}</p>"
-                             for l in outros.splitlines() if l.strip())
+            outros = "".join(f"<p>{l.strip()}</p>" for l in outros.splitlines() if l.strip())
         corpo["extras"]["descricao"] = outros[:4000]
-
-    # Condição de pagamento. O Tiny guarda em `condicoesComerciais` com
-    # tipo "P" (parcelas) e deriva `dias` a partir do texto — confirmado lendo
-    # um orçamento real: "30" virou dias ["30"]. Mandamos `dias` junto quando o
-    # texto é uma lista de números; em formatos como "6x" deixamos o Tiny
-    # resolver, porque adivinhar a regra dele seria chute.
+    # Condição de pagamento. Documentação: `tipo` ∈ {"Nenhuma", "Parcelas",
+    # "Texto livre"}; `parcelas.condicao` aceita "30 60 90", "3x", "30,60,90",
+    # "30+2x". A v3.71 mandava tipo "P" — o valor que o Tiny DEVOLVE na leitura,
+    # não o que ele ACEITA na escrita.
     cond = (payload.get("condicao_pagamento") or "").strip()
     if cond:
-        cc = {"tipo": "P", "parcelas": {"condicao": cond[:60]}}
+        cc = {"tipo": "Parcelas", "parcelas": {"condicao": cond[:60]}}
         numeros = re.findall(r"\d+", cond)
         if numeros and re.fullmatch(r"[\d\s/,;-]+", cond):
             cc["parcelas"]["dias"] = numeros
             cc["parcelas"]["obs"] = [""] * len(numeros)
         corpo["condicoesComerciais"] = cc
-
     corpo = {k: v for k, v in corpo.items() if v is not None}
+    frete = corpo["extras"]["frete"]
+    desconto = corpo["extras"]["desconto"]
+    return {"linhas": linhas, "itens_modelados": modelados, "corpo_sem_contato": corpo,
+            "avisos": avisos, "erros": erros,
+            "total_itens": round(total, 2),
+            "total": round(total + frete - desconto, 2)}
 
-    # Já foi exportada? Então ATUALIZA o orçamento existente em vez de criar
-    # outro. Sem isto, "regerar depois de editar" deixaria dois orçamentos no
-    # Tiny para a mesma proposta, e o cliente poderia receber o errado.
+
+def _cliente_tiny(cnpj: str, criar_se_ausente: bool = True) -> dict:
+    """Descobre o cliente no Tiny SEM escrever nada. Decide a ação:
+      "usar"      -> existe (id conhecido)
+      "criar"     -> não existe; vai ser cadastrado com os dados da Receita
+      "bloqueado" -> não dá para seguir com segurança (motivo em `erro`)
+    `_receita` volta junto (uso interno) para o envio não consultar duas vezes.
+    """
+    dig = re.sub(r"\D", "", cnpj or "")
+    base = {"cnpj": _cnpj_formatado(dig) if len(dig) == 14 else dig,
+            "avisos": [], "tentativas": []}
+    if len(dig) not in (11, 14):
+        return {**base, "status": "invalido", "acao": "bloqueado",
+                "erro": "CNPJ do cliente ausente ou com tamanho errado."}
+    if len(dig) == 14 and not _cnpj_valido(dig):
+        return {**base, "status": "invalido", "acao": "bloqueado",
+                "erro": f"CNPJ {_cnpj_formatado(dig)} com dígito verificador inválido — confira o número."}
+    res = _tiny.resolver_contato(dig)
+    base.update(status=res["status"], avisos=list(res.get("avisos") or []),
+                tentativas=res.get("tentativas") or [])
+    st = res["status"]
+    if st == "encontrado":
+        c = res["contato"] or {}
+        return {**base, "acao": "usar", "id": c.get("id"),
+                "nome": c.get("nome") or c.get("fantasia") or "",
+                "situacao_tiny": c.get("situacao")}
+    if st == "ausente":
+        if not criar_se_ausente:
+            return {**base, "acao": "bloqueado",
+                    "erro": "Cliente não existe no Tiny e o cadastro automático foi desligado neste envio."}
+        receita = (_consulta_receita(dig) or {}) if len(dig) == 14 else {}
+        dados = _tiny.montar_corpo_contato(dig, receita)
+        aviso = [] if receita else ["A Receita não respondeu — o cadastro sai só com CNPJ e nome."]
+        return {**base, "acao": "criar", "nome": dados.get("nome"),
+                "dados_cadastro": dados, "fonte_dados": "Receita (BrasilAPI)" if receita else "só o CNPJ",
+                "avisos": base["avisos"] + aviso, "_receita": receita}
+    if st == "excluido":
+        return {**base, "acao": "bloqueado",
+                "erro": ("O cliente existe no Tiny, mas está EXCLUÍDO. Reative o cadastro no Tiny "
+                         "e exporte de novo — cadastrar outro por cima duplicaria o cliente.")}
+    return {**base, "acao": "bloqueado",
+            "erro": ("Não consegui consultar o Tiny agora, então não sei se o cliente existe — "
+                     "e não cadastro no escuro. Tente de novo em 1 minuto; se repetir, "
+                     f"confira a conexão do Tiny. Detalhe: {res.get('erro', '')[:200]}")}
+
+
+def _previa_exportacao(payload: dict) -> dict:
+    """Tudo que a exportação faria, sem escrever NADA no Tiny."""
+    if not _TINY_OK:
+        raise HTTPException(status_code=503, detail="modulo tiny nao carregado")
+    numero, itens, cnpj = _carregar_payload_exportacao(payload)
+    mod = _modelar_orcamento_tiny(payload, itens)
+    if not itens:
+        mod["erros"].insert(0, f"Proposta {numero or '?'} sem itens — salve antes de exportar.")
+    cliente = _cliente_tiny(cnpj, bool(payload.get("criar_contato_se_ausente", True)))
+    erros = list(mod["erros"])
+    if cliente.get("acao") == "bloqueado":
+        erros.insert(0, cliente.get("erro") or "cliente bloqueado")
     ja = None
     if numero:
         try:
-            r0 = (get_supabase().table("propostas").select("tiny_id")
+            r0 = (get_supabase().table("propostas").select("tiny_id,tiny_numero")
                   .eq("numero_proposta", numero).limit(1).execute().data or [])
-            ja = (r0[0].get("tiny_id") if r0 else None)
+            ja = r0[0] if r0 and r0[0].get("tiny_id") else None
         except Exception:
             ja = None
+    return {
+        "pronto": not erros,
+        "numero": numero,
+        "cliente": {k: v for k, v in cliente.items() if not k.startswith("_")},
+        "_cliente_interno": cliente,
+        "operacao": (f"atualizar o orçamento {ja.get('tiny_numero') or ja.get('tiny_id')} já existente"
+                     if ja else "criar um orçamento novo"),
+        "_tiny_id_existente": (ja or {}).get("tiny_id"),
+        "itens": mod["itens_modelados"],
+        "total_itens": mod["total_itens"],
+        "total": mod["total"],
+        "avisos": cliente.get("avisos", []) + mod["avisos"],
+        "erros": erros,
+        "_modelagem": mod, "_itens": itens, "_cnpj": cnpj,
+    }
 
+
+def _publico(previa: dict) -> dict:
+    return {k: v for k, v in previa.items() if not k.startswith("_")}
+
+
+@app.post("/propostas/exportar-tiny/previa")
+async def propostas_exportar_tiny_previa(payload: dict, usuario: str = Depends(verificar_token)):
+    """PRÉVIA da exportação — mesmo payload do /propostas/exportar-tiny.
+
+    Mostra o cliente (encontrado / vai ser cadastrado / bloqueado e por quê),
+    cada item exatamente como vai para o Tiny (código, descrição, quantidade,
+    valor), o total, os avisos e os erros que impediriam o envio. Só LÊ o
+    Tiny: não cadastra cliente, produto nem orçamento.
+    """
+    return _publico(_previa_exportacao(payload))
+
+
+@app.post("/propostas/exportar-tiny")
+async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verificar_token)):
+    """Lança a proposta como ORÇAMENTO (proposta comercial) no Tiny.
+
+    PAYLOAD MINIMO: {"proposta": "1050851"} — o resto vem do banco. Pode mandar
+    também cliente, cnpj, usuario_nome, introducao, observacao, prazo_entrega,
+    frete, desconto, condicao_pagamento, outros_itens e itens.
+
+    Orçamento e não pedido: a venda só existe quando o cliente aprova e devolve
+    a PO, e o Tiny converte orçamento em pedido nesse momento.
+
+    Passa pela MESMA modelagem da prévia (/propostas/exportar-tiny/previa). Se
+    a modelagem tiver erro, nada é escrito no Tiny e a resposta lista o que
+    corrigir. Cliente que não existe é cadastrado com os dados da Receita
+    (desligue com "criar_contato_se_ausente": false); cliente com consulta
+    falhando NUNCA é cadastrado (evita duplicar no ERP).
+    """
+    previa = _previa_exportacao(payload)
+    if not previa["pronto"]:
+        raise HTTPException(status_code=422, detail="Exportação não enviada: " + " | ".join(previa["erros"]))
+
+    numero, itens, cnpj = previa["numero"], previa["_itens"], previa["_cnpj"]
+    mod, cliente = previa["_modelagem"], previa["_cliente_interno"]
+
+    contato_criado = None
+    if cliente["acao"] == "criar":
+        try:
+            novo = _tiny.criar_contato(cnpj, cliente.get("_receita") or {})
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=(
+                f"O cliente {cliente.get('cnpj')} não existe no Tiny e o cadastro automático "
+                f"falhou: {str(e)[:250]}"))
+        contato_id, contato_nome = novo["id"], novo.get("nome")
+        contato_criado = {"id": contato_id, "nome": contato_nome, "cnpj": cliente.get("cnpj"),
+                          "fonte_dados": cliente.get("fonte_dados")}
+    else:
+        contato_id, contato_nome = cliente["id"], cliente.get("nome")
+
+    corpo = {"contato": {"id": contato_id}, **mod["corpo_sem_contato"]}
+    ja = previa.get("_tiny_id_existente")
     try:
         if ja:
             r = _tiny.atualizar_orcamento(int(ja), corpo)
-            r = {**(r or {}), "id": int(ja)}
         else:
             r = _tiny.criar_orcamento(corpo)
     except Exception as e:
@@ -2204,21 +2320,16 @@ async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verifica
     # Amarra as duas numerações. Sem isso ninguém liga a proposta ao orçamento.
     if numero and tiny_id:
         try:
-            get_supabase().table("propostas").update({
-                "tiny_id": tiny_id, "tiny_numero": tiny_num,
-                "tiny_exportado_em": _dt_ext.utcnow().isoformat(),
-                "tiny_por": usuario,
-            }).eq("numero_proposta", numero).execute()
+            upd = {"tiny_id": tiny_id, "tiny_exportado_em": _dt_ext.utcnow().isoformat(),
+                   "tiny_por": usuario}
+            if tiny_num:
+                upd["tiny_numero"] = tiny_num
+            get_supabase().table("propostas").update(upd).eq("numero_proposta", numero).execute()
         except Exception:
             pass   # o orçamento já existe no Tiny; perder o vínculo não o desfaz
 
-    # ALIMENTA O BANCO DE PREÇOS. Exportar para o ERP é o mesmo marco comercial
-    # que gerar o CSV — a proposta foi fechada —, então tem que ensinar o banco
-    # igual. Sem isto, quem usasse só este caminho deixaria o banco parado, e o
-    # banco que cresce sozinho é metade do valor do sistema.
-    #
-    # Roda DEPOIS do Tiny aceitar e nunca derruba a exportação: o orçamento já
-    # existe lá, e falhar em aprender não desfaz o que foi feito.
+    # ALIMENTA O BANCO DE PREÇOS — mesmo marco comercial do CSV. Roda DEPOIS do
+    # Tiny aceitar e nunca derruba a exportação.
     banco = None
     if any(_num_br(i.get("preco_un") or i.get("preco_venda")) > 0 for i in itens):
         try:
@@ -2228,8 +2339,10 @@ async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verifica
 
     saida = {"ok": 1, "tiny_id": tiny_id, "tiny_numero": tiny_num,
              "acao": "atualizado" if ja else "criado",
-             "itens": len(linhas), "contato_id": contato["id"],
-             "cliente_tiny": contato.get("nome") or contato.get("razaoSocial")}
+             "itens": len(mod["linhas"]), "total": previa["total"],
+             "contato_id": contato_id, "cliente_tiny": contato_nome,
+             "produtos": (r or {}).get("produtos") or [],
+             "avisos": previa["avisos"]}
     if banco:
         saida["banco"] = banco
     if contato_criado:

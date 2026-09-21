@@ -64,6 +64,23 @@ async function _extrairAssincrono(form, authHeaders, onProgresso) {
 // Identidade estável do item (v3.61). O save apaga e recria as linhas da proposta,
 // então o `id` muda a cada auto-save. O `item_uid` nasce aqui, viaja com o item e é
 // por ele que o resultado da pesquisa do Dwight volta para a linha certa.
+// Texto da confirmação antes de exportar ao Tiny (v3.72) — puro, testável.
+export function mensagemPreviaTiny(pv) {
+  const c = (pv && pv.cliente) || {};
+  const linhaCliente = c.acao === "criar"
+    ? `Cliente NÃO existe no Tiny — vou CADASTRAR: ${c.nome} (${c.cnpj}), dados da ${c.fonte_dados}.`
+    : `Cliente: ${c.nome} (${c.cnpj}) — id ${c.id} no Tiny.`;
+  const avisos = (pv && pv.avisos) || [];
+  return [
+    `Exportar proposta ${(pv && pv.numero) || ""} para o Tiny?`,
+    "",
+    linhaCliente,
+    `Operação: ${pv && pv.operacao}.`,
+    `${((pv && pv.itens) || []).length} itens · total ${brl((pv && pv.total) || 0)}.`,
+    ...(avisos.length ? ["", "Avisos:", ...avisos.map((a) => "• " + a)] : []),
+  ].join("\n");
+}
+
 function novoUid() {
   try { if (crypto?.randomUUID) return crypto.randomUUID(); } catch { /* segue */ }
   const h = "0123456789abcdef";
@@ -2726,16 +2743,26 @@ export default function App() {
   // Vai como ORÇAMENTO (proposta comercial), não como pedido: a venda só existe
   // quando o cliente aprova e devolve a PO — e o Tiny converte orçamento em
   // pedido nesse momento. O CSV continua existindo como caminho alternativo.
+  // v3.72: PRIMEIRO a prévia (modelada pelo contrato oficial do Tiny, sem
+  // escrever nada lá), DEPOIS a confirmação, e só então o envio. O que a
+  // prévia mostra é exatamente o que sai — as duas rotas usam a mesma modelagem.
   async function exportarTiny(idx) {
     const prop = propostas[idx];
     if (!prop) return;
+    const corpo = JSON.stringify({ ...prop, usuario_nome: usuario.nome });
+    const cab = { "Content-Type": "application/json", ...authHeaders() };
     setTinyEnvio({ estado: "enviando" });
     try {
-      const res = await fetch(`${API}/propostas/exportar-tiny`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ ...prop, usuario_nome: usuario.nome }),
-      });
+      const rp = await fetch(`${API}/propostas/exportar-tiny/previa`, { method: "POST", headers: cab, body: corpo });
+      const pv = await rp.json().catch(() => ({}));
+      if (!rp.ok) throw new Error(pv.detail || `erro ${rp.status} na prévia`);
+      if (!pv.pronto) {
+        setTinyEnvio({ estado: "erro", msg: "Não enviei ao Tiny: " + (pv.erros || []).join(" · ") });
+        return;
+      }
+      if (!window.confirm(mensagemPreviaTiny(pv))) { setTinyEnvio(null); return; }
+
+      const res = await fetch(`${API}/propostas/exportar-tiny`, { method: "POST", headers: cab, body: corpo });
       const d = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(d.detail || `erro ${res.status}`);
       setTinyEnvio({ estado: "ok", ...d });
@@ -3008,7 +3035,7 @@ export default function App() {
                 {tinyEnvio?.estado === "ok" && (
                   <div className="mt-2 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-signal/40 bg-signal/10 px-3 py-2 text-[12.5px] text-ink">
                     <span>
-                      Proposta comercial criada no Tiny como <b>rascunho</b> para{" "}
+                      Proposta comercial {tinyEnvio.acao === "atualizado" ? "atualizada" : "criada"} no Tiny para{" "}
                       {tinyEnvio.cliente_tiny || "o cliente"} — número{" "}
                       <span className="font-mono">{tinyEnvio.tiny_numero || tinyEnvio.tiny_id}</span>,{" "}
                       {tinyEnvio.itens} {tinyEnvio.itens === 1 ? "item" : "itens"}.
@@ -3016,7 +3043,18 @@ export default function App() {
                         <> Banco de preços: {tinyEnvio.banco.atualizados || 0} atualizados,{" "}
                         {tinyEnvio.banco.inseridos || 0} novos.</>
                       )}
+                      {tinyEnvio.contato_criado && (
+                        <> Cliente <b>cadastrado agora</b> no Tiny: {tinyEnvio.contato_criado.nome}.</>
+                      )}
+                      {(tinyEnvio.produtos || []).some((p) => p.acao === "cadastrado") && (
+                        <> {(tinyEnvio.produtos || []).filter((p) => p.acao === "cadastrado").length} produto(s) novo(s) no catálogo.</>
+                      )}
                       {" "}Revise antes de enviar ao cliente.
+                      {(tinyEnvio.avisos || []).length > 0 && (
+                        <span className="mt-1 block text-[11.5px] text-sub">
+                          {tinyEnvio.avisos.map((a, k) => <span key={k} className="block">• {a}</span>)}
+                        </span>
+                      )}
                     </span>
                     {tinyEnvio.tiny_id && (
                       /* O PDF é gerado PELO Tiny: documento comercial da Kist sai
