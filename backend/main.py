@@ -84,6 +84,15 @@ except Exception:
     _tiny = None
     _TINY_OK = False
 
+# Conhecimento de pesquisa (v3.82): extrato, julgamento, ficha, observações,
+# vereditos. Import protegido — sem o módulo, a pesquisa funciona como antes.
+try:
+    import conhecimento as _con
+    _CON_OK = True
+except Exception:
+    _con = None
+    _CON_OK = False
+
 # Versão do backend. O núcleo do Analista guarda a versão que ele descreve; se as
 # duas divergirem, o agente é avisado de que o conhecimento dele está atrasado.
 # Conhecimento velho não avisa que é velho — ele responde com a mesma confiança
@@ -92,7 +101,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_ext
 
-VERSAO_BACKEND = "3.81"
+VERSAO_BACKEND = "3.82"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -394,6 +403,7 @@ _ROTAS_ESCOPO_PESQUISA = (
     ("GET",  re.compile(r"^/propostas/[^/]+/fonte/?$")),
     ("GET",  re.compile(r"^/api/whoami/?$")),
     ("GET",  re.compile(r"^/api/guia/[a-z-]+/?$")),
+    ("GET",  re.compile(r"^/catalogo/itens(/[^/]+)?/?$")),
 )
 
 # Escopo `dwight_dispatch` (v3.70): um agente PRÓPRIO do Leonardo pode pedir a
@@ -406,6 +416,7 @@ _ROTAS_ESCOPO_DWIGHT_DISPATCH = (
     ("POST", re.compile(r"^/propostas/[^/]+/pesquisa-kistbot-dwight/?$")),
     ("GET",  re.compile(r"^/api/whoami/?$")),
     ("GET",  re.compile(r"^/api/guia/[a-z-]+/?$")),
+    ("GET",  re.compile(r"^/catalogo/itens(/[^/]+)?/?$")),
 )
 
 def _rota_permitida_dwight_dispatch(metodo: str, caminho: str) -> bool:
@@ -2524,9 +2535,17 @@ def _previa_exportacao(payload: dict) -> dict:
             ja = _l if _l and _l.get("tiny_id") else None
         except Exception:
             ja = None
+    try:
+        _lpv = _achar_por_numero(get_supabase(), numero) if numero else None
+        _pts = _pontos_a_validar(get_supabase(), _lpv["id"]) if _lpv else []
+    except Exception:
+        _pts = []
+    avisos_pontos = ([f"{len(_pts)} ponto(s) da pesquisa a validar com o cliente: "
+                      + "; ".join(p["ponto"] for p in _pts[:4])] if _pts else [])
     return {
         "pronto": not erros,
         "numero": numero,
+        "pontos_a_validar": _pts,
         "cliente": {k: v for k, v in cliente.items() if not k.startswith("_")},
         "_cliente_interno": cliente,
         "operacao": (f"atualizar o orçamento {ja.get('tiny_numero') or ja.get('tiny_id')} já existente"
@@ -2539,7 +2558,7 @@ def _previa_exportacao(payload: dict) -> dict:
         "guia": "/api/guia/exportacao-tiny",
         "total_itens": mod["total_itens"],
         "total": mod["total"],
-        "avisos": cliente.get("avisos", []) + mod["avisos"],
+        "avisos": cliente.get("avisos", []) + mod["avisos"] + avisos_pontos,
         "erros": erros,
         "_modelagem": mod, "_itens": itens, "_cnpj": cnpj,
     }
@@ -2712,6 +2731,14 @@ async def propostas_exportar_tiny(payload: dict, usuario: str = Depends(verifica
                 sbx.table("propostas").update(upd).eq("id", linha["id"]).execute()
         except Exception:
             pass   # o orçamento já existe no Tiny; perder o vínculo não o desfaz
+
+    # Veredito automático dos bots: o que saiu para o cliente bateu com a escolha?
+    try:
+        _lp = _achar_por_numero(get_supabase(), numero_final or numero)
+        if _lp:
+            _registrar_vereditos(get_supabase(), _lp["id"], itens, "exportacao")
+    except Exception:
+        pass
 
     # ALIMENTA O BANCO DE PREÇOS — mesmo marco comercial do CSV. Roda DEPOIS do
     # Tiny aceitar e nunca derruba a exportação.
@@ -3105,7 +3132,9 @@ def whoami(request: Request, usuario: str = Depends(verificar_token)):
         # Onde o bot aprende a preencher cada campo (texto puro, gerado das
         # mesmas regras que a tela e a prévia aplicam). Leia antes de exportar.
         "guias": {"proposta": "/api/guia/proposta",
-                  "exportacao_tiny": "/api/guia/exportacao-tiny"},
+                  "exportacao_tiny": "/api/guia/exportacao-tiny",
+                  "pesquisa_retorno": "/api/guia/pesquisa-retorno"},
+        "catalogo": "/catalogo/itens?q=<PN ou descrição> · /catalogo/itens/<PN>?formato=texto",
         "docs": "/docs",
     }
 
@@ -6097,8 +6126,48 @@ def _buscar_cache(sb, chaves: set) -> dict:
     return achados
 
 
-def _montar_payload_lote(prop: dict, itens_lote: list, external_key: str, motor: str = "dwight") -> dict:
+def _contexto_itens(sb, itens: list) -> dict:
+    """{chave_item: {ficha_id, pn, alertas, faixa, n_pesquisas, bloco_bot}} para os
+    itens que a Kist já conhece. Uma consulta por tabela, não por item."""
+    if not (_CON_OK and sb and itens):
+        return {}
+    try:
+        chaves = {}
+        for k, desc, pn in itens:
+            pns = [pn] if pn else _con.extrair_pns(desc)
+            cands = [_con.chave_ficha(p, "") for p in pns[:3]] + [_con.chave_ficha("", desc)]
+            chaves[k] = [c for c in cands if c]
+        todas = sorted({c for cs in chaves.values() for c in cs})
+        if not todas:
+            return {}
+        fichas = {f["chave"]: f for f in (sb.table("itens_ficha").select("*").in_("chave", todas)
+                                            .limit(500).execute().data or [])}
+        ids = [f["id"] for f in fichas.values()]
+        if not ids:
+            return {}
+        equivs = sb.table("itens_equivalencias").select("*").in_("ficha_id", ids).limit(2000).execute().data or []
+        obs = (sb.table("mercado_observacoes").select("*").in_("ficha_id", ids)
+                 .order("observado_em", desc=True).limit(2000).execute().data or [])
+        out = {}
+        for k, cs in chaves.items():
+            f = next((fichas[c] for c in cs if c in fichas), None)
+            if not f:
+                continue
+            eq = [e for e in equivs if e["ficha_id"] == f["id"]]
+            ob = [o for o in obs if o["ficha_id"] == f["id"]]
+            out[k] = {"ficha_id": f["id"], "pn": f.get("pn"), "n_pesquisas": f.get("n_pesquisas") or 0,
+                      "alertas": _con.alertas(eq), "faixa": _con.faixa_precos(ob),
+                      "bloco_bot": _con.bloco_contexto_bot(f, eq, ob)}
+        return out
+    except Exception:
+        return {}
+
+
+def _montar_payload_lote(prop: dict, itens_lote: list, external_key: str, motor: str = "dwight",
+                         sb=None) -> dict:
     numero = str(prop.get("numero_proposta") or "")
+    ctx = _contexto_itens(sb, [(u, it.get("descricao_original") or it.get("descricao_final") or "", "")
+                               for u, it in itens_lote]) if sb is not None else {}
     return {
         "source": "cabine",
         "action": "pesquisa",
@@ -6115,6 +6184,7 @@ def _montar_payload_lote(prop: dict, itens_lote: list, external_key: str, motor:
             "qty": _num_br(it.get("quantidade"), 1),
             "unidade": it.get("unidade") or "UN",
             "obs": _txt(it.get("specs_complementares"), 1500),
+            **({"conhecimento": ctx[u]["bloco_bot"]} if u in ctx else {}),
         } for u, it in itens_lote],
         "retorno": {"metodo": "POST",
                     "url": f"{CABINE_PUBLIC_URL}/propostas/{numero or prop['id']}/pesquisa-resultado"},
@@ -6192,7 +6262,7 @@ def _bombear_fila_motor(sb, motor: str) -> int:
             lote = [(u, it) for u, it in lote if it is not None]
             if lote:
                 _threading.Thread(target=_despachar_webhook_dwight,
-                                  args=(_montar_payload_lote(prop, lote, external_key, motor), external_key, motor),
+                                  args=(_montar_payload_lote(prop, lote, external_key, motor, sb), external_key, motor),
                                   daemon=True).start()
                 enviados += len(lote)
             lotes_em_voo += 1
@@ -6416,6 +6486,307 @@ async def _disparar_pesquisa(ref: str, request: Request, usuario: str, motor: st
             "itens_cache": [u for u, _ in do_cache], "itens_fila": [u for u, _ in para_fila]}
 
 
+# ── CONHECIMENTO DE PESQUISA (v3.82) ─────────────────────────────────────────
+# Tudo aqui é "melhor esforço": falhar ao catalogar NUNCA derruba o retorno da
+# pesquisa — o operador precisa do preço na gaveta mesmo se a ficha não gravar.
+
+def _gravar_extrato(sb, prop: dict, external_key: str, motor: str, extrato: dict):
+    if not (_CON_OK and extrato):
+        return None
+    try:
+        linha = {"external_key": external_key or None, "proposta_id": prop["id"],
+                 "numero_proposta": str(prop.get("numero_proposta") or ""), "motor": motor,
+                 "resumo": extrato["resumo"], "passos": extrato["passos"],
+                 "limitacoes": extrato["limitacoes"], "sugestoes": extrato["sugestoes"],
+                 "saude": extrato["saude"]}
+        if external_key:
+            ja = (sb.table("pesquisa_extratos").select("id").eq("external_key", external_key)
+                    .limit(1).execute().data or [])
+            if ja:
+                sb.table("pesquisa_extratos").update(linha).eq("id", ja[0]["id"]).execute()
+                return ja[0]["id"]
+        r = sb.table("pesquisa_extratos").insert(linha).execute()
+        return (r.data or [{}])[0].get("id")
+    except Exception:
+        return None
+
+
+def _ficha_upsert(sb, identidade: Optional[dict], item: dict) -> Optional[int]:
+    """Acha ou cria a ficha do item. Chave: PN (do bot, ou um PN único no texto do
+    cliente) ou a descrição normalizada."""
+    ident = identidade or {}
+    desc = item.get("descricao_original") or item.get("descricao_final") or ""
+    pn = ident.get("pn") or ""
+    if not pn:
+        pns = _con.extrair_pns(desc)
+        pn = pns[0] if len(pns) == 1 else ""
+    chave = _con.chave_ficha(pn, desc)
+    if not chave:
+        return None
+    ja = sb.table("itens_ficha").select("*").eq("chave", chave).limit(1).execute().data or []
+    agora = _dt_ext.utcnow().isoformat()
+    if ja:
+        f = ja[0]
+        specs = list(f.get("specs") or [])
+        for sp in ident.get("specs") or []:
+            if sp not in specs:
+                specs.append(sp)
+        sb.table("itens_ficha").update({
+            "pn": f.get("pn") or pn or None, "fabricante": f.get("fabricante") or ident.get("fabricante") or None,
+            "specs": specs[:_con.MAX_SPECS], "n_pesquisas": int(f.get("n_pesquisas") or 0) + 1,
+            "atualizado_em": agora}).eq("id", f["id"]).execute()
+        return f["id"]
+    r = sb.table("itens_ficha").insert({
+        "chave": chave, "pn": pn or None, "fabricante": ident.get("fabricante") or None,
+        "descricao_ref": _txt(desc, 300), "specs": (ident.get("specs") or [])[:_con.MAX_SPECS],
+        "n_pesquisas": 1}).execute()
+    return (r.data or [{}])[0].get("id")
+
+
+def _gravar_conhecimento_item(sb, prop, uid, pesquisa_id, r, ofertas, escolha, motor,
+                              extrato_id, item, chave_cache, usuario):
+    if not _CON_OK:
+        return
+    try:
+        ident = _con.normalizar_identidade(r.get("identidade"))
+        ficha_id = _ficha_upsert(sb, ident, item)
+        for e in (ident or {}).get("equivalencias") or []:
+            ja = (sb.table("itens_equivalencias").select("id,status").eq("ficha_id", ficha_id)
+                    .eq("pn_outro", e["pn_outro"]).limit(1).execute().data or [])
+            if ja:
+                if ja[0]["status"] == "sugerida":   # decisão do operador nunca é sobrescrita
+                    sb.table("itens_equivalencias").update({**e, "extrato_id": extrato_id}).eq("id", ja[0]["id"]).execute()
+            elif ficha_id:
+                sb.table("itens_equivalencias").insert({**e, "ficha_id": ficha_id, "status": "sugerida",
+                    "extrato_id": extrato_id, "sugerido_por": f"{motor}:{usuario}"}).execute()
+        obs = _con.observacoes_do_item(r, ofertas, escolha)
+        if obs:
+            sb.table("mercado_observacoes").insert([{**o, "ficha_id": ficha_id, "chave_cache": chave_cache,
+                "motor": motor, "extrato_id": extrato_id, "proposta_id": prop["id"], "item_uid": uid}
+                for o in obs]).execute()
+    except Exception:
+        pass
+
+
+def _registrar_vereditos(sb, proposta_id, itens_finais: list, momento: str) -> int:
+    """Veredito automático por item: a escolha do bot bateu com o que saiu
+    (momento='exportacao') ou com o que foi comprado (momento='compra')?"""
+    if not _CON_OK:
+        return 0
+    n = 0
+    try:
+        uids = [str(i.get("item_uid") or "").lower() for i in itens_finais if i.get("item_uid")]
+        if not uids:
+            return 0
+        rows = (sb.table("pesquisa_resultados").select("id,item_uid,motor,resultado,respondido_em")
+                  .eq("proposta_id", proposta_id).eq("status", "concluido").in_("item_uid", uids)
+                  .order("respondido_em", desc=True).limit(500).execute().data or [])
+        ultima = {}
+        for row in rows:
+            ultima.setdefault(str(row["item_uid"]).lower(), row)
+        for it in itens_finais:
+            row = ultima.get(str(it.get("item_uid") or "").lower())
+            if not row:
+                continue
+            res = row.get("resultado") or {}
+            v = _con.veredito(res.get("ofertas") or [], res.get("escolha") or 0, it)
+            if not v:
+                continue
+            linha = {"pesquisa_id": row["id"], "item_uid": row["item_uid"], "proposta_id": proposta_id,
+                     "motor": row.get("motor") or "dwight", "momento": momento,
+                     "veredito": v["veredito"], "detalhe": v}
+            ja = (sb.table("pesquisa_vereditos").select("id").eq("pesquisa_id", row["id"])
+                    .eq("momento", momento).limit(1).execute().data or [])
+            if ja:
+                sb.table("pesquisa_vereditos").update(linha).eq("id", ja[0]["id"]).execute()
+            else:
+                sb.table("pesquisa_vereditos").insert(linha).execute()
+            n += 1
+    except Exception:
+        pass
+    return n
+
+
+def _pontos_a_validar(sb, proposta_id) -> list:
+    """Riscos e pontos a validar com o cliente, do último julgamento de cada item."""
+    try:
+        rows = (sb.table("pesquisa_resultados").select("item_uid,descricao,julgamento,respondido_em")
+                  .eq("proposta_id", proposta_id).eq("status", "concluido")
+                  .order("respondido_em", desc=True).limit(500).execute().data or [])
+    except Exception:
+        return []
+    vistos, out = set(), []
+    for r in rows:
+        u = r.get("item_uid")
+        if u in vistos:
+            continue
+        vistos.add(u)
+        j = r.get("julgamento") or {}
+        for t in (j.get("validar_com_cliente") or []) + (j.get("riscos") or []):
+            out.append({"item_uid": u, "item": (r.get("descricao") or "")[:60], "ponto": t})
+    return out
+
+
+# ── consulta do conhecimento ────────────────────────────────────────────────
+
+def _ficha_completa(sb, ficha: dict) -> dict:
+    fid = ficha["id"]
+    eq = (sb.table("itens_equivalencias").select("*").eq("ficha_id", fid)
+            .order("criado_em", desc=True).limit(100).execute().data or [])
+    ob = (sb.table("mercado_observacoes").select("*").eq("ficha_id", fid)
+            .order("observado_em", desc=True).limit(200).execute().data or [])
+    props = sorted({o.get("proposta_id") for o in ob if o.get("proposta_id")})
+    nums = []
+    if props:
+        nums = [{"id": p["id"], "numero": p.get("numero_proposta"), "cliente": p.get("cliente")}
+                for p in (sb.table("propostas").select("id,numero_proposta,cliente").in_("id", props[:50])
+                            .execute().data or [])]
+    return {"ficha": ficha, "equivalencias": eq, "observacoes": ob, "faixa": _con.faixa_precos(ob),
+            "alertas": _con.alertas(eq), "propostas": nums,
+            "extratos": sorted({o.get("extrato_id") for o in ob if o.get("extrato_id")})}
+
+
+@app.get("/catalogo/itens")
+async def catalogo_buscar(q: str = "", limite: int = 30, usuario: str = Depends(verificar_token)):
+    """Busca fichas por PN ou descrição. Conhecimento da Kist inteira."""
+    if not _CON_OK:
+        raise HTTPException(503, "módulo de conhecimento não carregado")
+    sb = get_supabase()
+    t = (q or "").strip()
+    lim = max(1, min(int(limite or 30), 100))
+    if not t:
+        rows = sb.table("itens_ficha").select("*").order("atualizado_em", desc=True).limit(lim).execute().data or []
+    else:
+        pn = _con.pn_norm(t)
+        rows = (sb.table("itens_ficha").select("*").ilike("pn", f"%{pn}%").limit(lim).execute().data or []) if pn else []
+        if len(rows) < lim:
+            mais = (sb.table("itens_ficha").select("*").ilike("descricao_ref", f"%{_ilike_literal(t)}%")
+                      .limit(lim).execute().data or [])
+            ids = {r["id"] for r in rows}
+            rows += [m for m in mais if m["id"] not in ids][: lim - len(rows)]
+    return {"itens": rows}
+
+
+@app.get("/catalogo/itens/{ref}")
+async def catalogo_ficha(ref: str, formato: str = "json", usuario: str = Depends(verificar_token)):
+    """Ficha completa: identidade, equivalências, observações de mercado, faixa de
+    preço, propostas onde apareceu. `?formato=texto` para bots."""
+    if not _CON_OK:
+        raise HTTPException(503, "módulo de conhecimento não carregado")
+    sb = get_supabase()
+    t = (ref or "").strip()
+    f = []
+    if t.isdigit():
+        f = sb.table("itens_ficha").select("*").eq("id", int(t)).limit(1).execute().data or []
+    if not f:
+        f = sb.table("itens_ficha").select("*").eq("chave", f"pn:{_con.pn_norm(t)}").limit(1).execute().data or []
+    if not f:
+        raise HTTPException(404, "Ficha não encontrada.")
+    d = _ficha_completa(sb, f[0])
+    if str(formato).lower() == "texto":
+        return PlainTextResponse(_con.texto_ficha(d["ficha"], d["equivalencias"], d["observacoes"]))
+    return d
+
+
+@app.post("/catalogo/equivalencias/{eid}")
+async def catalogo_decidir_equivalencia(eid: int, payload: dict, request: Request,
+                                        usuario: str = Depends(verificar_token)):
+    """Operador confirma ou rejeita uma equivalência sugerida. Só pela tela:
+    equivalência vira regra por decisão humana, nunca de bot."""
+    esc, _, _ = _credencial_do_request(request.headers.get("authorization") or "")
+    if esc is not None:
+        raise HTTPException(403, "Equivalência só é confirmada ou rejeitada pelo operador, na tela.")
+    status = str(payload.get("status") or "").strip().lower()
+    if status not in ("confirmada", "rejeitada", "sugerida"):
+        raise HTTPException(422, "status deve ser confirmada, rejeitada ou sugerida")
+    r = (get_supabase().table("itens_equivalencias").update({
+        "status": status, "decidido_por": usuario, "decidido_em": _dt_ext.utcnow().isoformat()})
+        .eq("id", eid).execute())
+    if not r.data:
+        raise HTTPException(404, "Equivalência não encontrada.")
+    return r.data[0]
+
+
+@app.post("/catalogo/contexto")
+async def catalogo_contexto(payload: dict, usuario: str = Depends(verificar_token)):
+    """O que a Kist já sabe de cada item de uma proposta (alerta na linha).
+    Corpo: {itens: [{k, descricao, pn?}]}. Resposta: {k: {ficha_id, pn, alertas, faixa, n_pesquisas}}."""
+    itens = [(str(i.get("k")), str(i.get("descricao") or ""), str(i.get("pn") or ""))
+             for i in (payload.get("itens") or [])[:300] if isinstance(i, dict) and i.get("k") is not None]
+    ctx = _contexto_itens(get_supabase(), itens)
+    return {k: {kk: vv for kk, vv in v.items() if kk != "bloco_bot"} for k, v in ctx.items()}
+
+
+@app.get("/propostas/{ref}/extratos")
+async def propostas_extratos(ref: str, usuario: str = Depends(verificar_token)):
+    """Extratos das pesquisas desta proposta + julgamentos por item + pontos a validar."""
+    sb = get_supabase()
+    prop = _resolver_proposta(sb, ref)
+    ext = (sb.table("pesquisa_extratos").select("*").eq("proposta_id", prop["id"])
+             .order("criado_em", desc=True).limit(50).execute().data or [])
+    jul = (sb.table("pesquisa_resultados").select("item_uid,descricao,motor,julgamento,resultado,extrato_id,respondido_em")
+             .eq("proposta_id", prop["id"]).eq("status", "concluido")
+             .order("respondido_em", desc=True).limit(500).execute().data or [])
+    vistos, julgamentos = set(), []
+    for j in jul:
+        if j["item_uid"] in vistos:
+            continue
+        vistos.add(j["item_uid"])
+        julgamentos.append(j)
+    return {"numero": prop.get("numero_proposta"), "extratos": ext, "julgamentos": julgamentos,
+            "pontos_a_validar": _pontos_a_validar(sb, prop["id"])}
+
+
+@app.get("/pesquisa/extratos/{eid}")
+async def pesquisa_extrato(eid: int, usuario: str = Depends(verificar_token)):
+    r = get_supabase().table("pesquisa_extratos").select("*").eq("id", eid).limit(1).execute().data or []
+    if not r:
+        raise HTTPException(404, "Extrato não encontrado.")
+    return r[0]
+
+
+@app.get("/pesquisa/boletim")
+async def pesquisa_boletim(dias: int = 30, usuario: str = Depends(verificar_token)):
+    """Boletim dos bots: vereditos (acertou / escolheu outra / não achou / custo
+    divergente) por motor e momento, e os problemas de saúde mais citados."""
+    sb = get_supabase()
+    desde = (_dt_ext.utcnow() - _td_ext(days=max(1, min(int(dias or 30), 365)))).isoformat()
+    ver = (sb.table("pesquisa_vereditos").select("motor,momento,veredito")
+             .gte("criado_em", desde).limit(10000).execute().data or [])
+    por = {}
+    for v in ver:
+        k = (v.get("motor") or "dwight", v["momento"])
+        d = por.setdefault(k, {"motor": k[0], "momento": k[1], "total": 0, "acertou": 0,
+                               "escolheu_outra": 0, "nao_achou": 0, "custo_divergente": 0})
+        d["total"] += 1
+        d[v["veredito"]] += 1
+    for d in por.values():
+        d["taxa_acerto"] = round(100 * d["acertou"] / d["total"], 1) if d["total"] else None
+    ext = (sb.table("pesquisa_extratos").select("motor,saude,passos").gte("criado_em", desde)
+             .limit(5000).execute().data or [])
+    saude = {}
+    tempos = {}
+    for e in ext:
+        for s_ in e.get("saude") or []:
+            saude[s_] = saude.get(s_, 0) + 1
+        ms = [p.get("ms") for p in (e.get("passos") or []) if isinstance(p, dict) and p.get("ms")]
+        if ms:
+            tempos.setdefault(e.get("motor") or "dwight", []).append(sum(ms))
+    return {"dias": dias, "vereditos": sorted(por.values(), key=lambda d: (d["motor"], d["momento"])),
+            "saude_mais_citada": sorted(({"problema": k, "vezes": v} for k, v in saude.items()),
+                                        key=lambda x: -x["vezes"])[:10],
+            "tempo_medio_s": {m: round(sum(t) / len(t) / 1000, 1) for m, t in tempos.items()},
+            "extratos": len(ext)}
+
+
+@app.get("/api/guia/pesquisa-retorno")
+async def guia_pesquisa_retorno(usuario: str = Depends(verificar_token)):
+    """Contrato do retorno de pesquisa, com as seções de conhecimento (v3.82)."""
+    if not _CON_OK:
+        raise HTTPException(503, "módulo de conhecimento não carregado")
+    return PlainTextResponse(_con.GUIA_RETORNO)
+
+
 @app.post("/propostas/{ref}/pesquisa-resultado")
 async def pesquisa_resultado_receber(ref: str, payload: dict,
                                      usuario: str = Depends(verificar_token)):
@@ -6457,6 +6828,17 @@ async def pesquisa_resultado_receber(ref: str, payload: dict,
                 .eq("external_key", ekey_geral).limit(200).execute().data or [])
         if rc and all(str(l.get("despacho_erro") or "").startswith("cancelado") for l in rc):
             cancelados.add(ekey_geral)
+    _motor_lote = None
+    if ekey_geral:
+        try:
+            _ml = (sb.table("pesquisa_resultados").select("motor").eq("external_key", ekey_geral)
+                     .limit(1).execute().data or [])
+            _motor_lote = (_ml[0].get("motor") if _ml else None)
+        except Exception:
+            _motor_lote = None
+    extrato_id = _gravar_extrato(sb, prop, ekey_geral, _motor_lote or "dwight",
+                                 _con.normalizar_extrato(payload.get("extrato")) if _CON_OK else None) \
+        if ekey_geral not in cancelados else None
     for r in resultados[:200]:
         if not isinstance(r, dict):
             ignorados.append({"item_id": None, "motivo": "resultado não é objeto"})
@@ -6491,29 +6873,39 @@ async def pesquisa_resultado_receber(ref: str, payload: dict,
         dados = {
             "status": status,
             "resultado": {"ofertas": ofertas, "escolha": escolha,
-                          "obs": _txt(r.get("obs"), 500)},
+                          "obs": _txt(r.get("obs"), 500),
+                          **({"resumo_mercado": _con.resumo_mercado(r)} if _CON_OK and _con.resumo_mercado(r) else {})},
+            "julgamento": _con.normalizar_julgamento(r.get("julgamento")) if _CON_OK else None,
+            "extrato_id": extrato_id,
             "telemetria": _norm_telemetria(r.get("telemetria") or payload.get("telemetria")),
             "respondido_por": usuario,
             "respondido_em": agora,
         }
 
-        q = (sb.table("pesquisa_resultados").select("id,external_key")
+        q = (sb.table("pesquisa_resultados").select("id,external_key,motor,chave_cache")
                .eq("proposta_id", prop["id"]).eq("item_uid", uid)
                .eq("status", "aguardando").order("criado_em", desc=True).limit(20).execute())
         pend = q.data or []
         alvo = next((x for x in pend if ekey and x.get("external_key") == ekey), None) or \
                (pend[0] if pend else None)
+        it = atuais[uid]
         if alvo:
             sb.table("pesquisa_resultados").update(dados).eq("id", alvo["id"]).execute()
+            pesquisa_id, motor_item, chave_item = alvo["id"], alvo.get("motor") or "dwight", alvo.get("chave_cache")
         else:
-            it = atuais[uid]
-            sb.table("pesquisa_resultados").insert({
+            ins = sb.table("pesquisa_resultados").insert({
                 **dados,
                 "proposta_id": prop["id"],
                 "numero_proposta": str(prop.get("numero_proposta") or ""),
-                "item_uid": uid, "external_key": ekey or None, "origem": "dwight",
+                "item_uid": uid, "external_key": ekey or None, "origem": _motor_lote or "dwight",
+                "motor": _motor_lote or "dwight", "chave_cache": _chave_cache_item(it),
                 "descricao": _txt(it.get("descricao_original") or it.get("descricao_final"), 500),
             }).execute()
+            pesquisa_id = (ins.data or [{}])[0].get("id")
+            motor_item, chave_item = _motor_lote or "dwight", _chave_cache_item(it)
+        if status == "concluido":
+            _gravar_conhecimento_item(sb, prop, uid, pesquisa_id, r, ofertas, escolha, motor_item,
+                                      extrato_id, it, chave_item, usuario)
         recebidos += 1
 
     if recebidos:
@@ -7567,6 +7959,28 @@ async def criar_oc(payload: dict, usuario: str = Depends(verificar_token)):
                 "sku_fornecedor":      _campo("sku_fornecedor"),
             })
         sb.table("oc_itens").insert(rows).execute()
+
+        # Veredito dos bots no momento da COMPRA (v3.82): o que vai ser comprado
+        # bate com a escolha do bot? Sinal mais forte que a proposta — é dinheiro.
+        try:
+            _ids = [r_.get("item_proposta_id") for r_ in rows if r_.get("item_proposta_id")]
+            if _ids:
+                _ip = (sb.table("itens_proposta").select("id,item_uid,proposta_id").in_("id", _ids)
+                         .execute().data or [])
+                _por = {x["id"]: x for x in _ip}
+                grupos = {}
+                for r_ in rows:
+                    x = _por.get(r_.get("item_proposta_id"))
+                    if not (x and x.get("item_uid")):
+                        continue
+                    grupos.setdefault(x["proposta_id"], []).append({
+                        "item_uid": x["item_uid"], "link_fornecedor": r_.get("link_fornecedor"),
+                        "fornecedor": r_.get("nome_fornecedor") or r_.get("fornecedor"),
+                        "preco_custo": r_.get("preco_custo")})
+                for pid_, finais in grupos.items():
+                    _registrar_vereditos(sb, pid_, finais, "compra")
+        except Exception:
+            pass
 
     return {"oc_id": oc_id}
 

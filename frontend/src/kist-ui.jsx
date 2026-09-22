@@ -173,6 +173,8 @@ export function Sidebar({ active, onNavigate, usuario, stats, onLogout, isAdmin,
     { k: "nova",        label: "Nova proposta",     Icon: IconNova },
     { k: "propostas",   label: "Propostas",         Icon: IconList },
     { k: "ordens",      label: "Ordens de compra",  Icon: IconBoard },
+    // v3.82: conhecimento de pesquisa da Kist inteira (fichas, mercado, extratos, boletim dos bots)
+    { k: "catalogo",    label: "Catálogo",          Icon: IconSearch },
     { k: "requisicoes", label: "Requisições",       Icon: IconChat },
     // Agentes é de TODOS: quem conserta o agente parado é o dono dele, não o
     // admin. O backend já filtra por dono — sem `todos=1`, cada um vê só os

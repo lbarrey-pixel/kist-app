@@ -6,6 +6,7 @@ import Analista from "./Analista.jsx";
 import ChamadosAdmin from "./ChamadosAdmin.jsx";
 import Agentes from "./Agentes.jsx";
 import Suporte from "./Suporte.jsx";
+import Catalogo, { ConhecimentoSelo, ExtratoModal, ExtratosPropostaModal } from "./Catalogo.jsx";
 import { DatasheetBotao, DatasheetLote, DatasheetBaixarTodos } from "./Datasheet.jsx";
 import {
   CONF, brl, btnPrimary, btnGhost, Eyebrow, StateLabel, PageHeader,
@@ -570,7 +571,9 @@ const MARKETPLACES = [
 ];
 
 // ── Linha de item da revisão ───────────────────────────────────────────────
-function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, cnpj, propostaId, onSalvar, dwight, onPesquisarItem }) {
+function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, cnpj, propostaId, onSalvar, dwight, onPesquisarItem,
+                   conhecimento, onAbrirFicha }) {
+  const [extratoAberto, setExtratoAberto] = useState(null);   // v3.82
   // ── Alerta ────────────────────────────────────────────────────────────
   // ── Termo de busca ────────────────────────────────────────────────────
   // O que os atalhos disparam. Fica VISÍVEL e editável na própria linha: se
@@ -1043,6 +1046,9 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
                 herdado
               </span>
             )}
+            {/* v3.82: o que a Kist já sabe deste item (qualquer cliente, qualquer bot). */}
+            <ConhecimentoSelo conhecimento={conhecimento}
+              onAbrir={() => onAbrirFicha && conhecimento && onAbrirFicha(conhecimento.ficha_id)} />
             {/* Motor de preços: banco + internet + conferir numa gaveta só.
                 O rótulo carrega o veredito, como antes carregava no toggle do banco. */}
             <button onClick={() => setMotorAberto((v) => !v)}
@@ -1508,6 +1514,23 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
                     )}
                     {dwight?.status === "aguardando" && (
                       <div className="mt-1 text-[12px] text-sub">Pesquisando…</div>
+                    )}
+                    {dwight?.status === "concluido" && (dwight?.julgamento || dwight?.extrato_id) && (
+                      <div className="mt-1 space-y-0.5 text-[11.5px]">
+                        {dwight.julgamento?.motivo && <div className="text-sub">por quê: {dwight.julgamento.motivo}</div>}
+                        {(dwight.julgamento?.riscos || []).map((r, k) => <div key={k} className="text-rose">⚠ {r}</div>)}
+                        {(dwight.julgamento?.validar_com_cliente || []).map((r, k) => <div key={k} className="text-amber">? validar: {r}</div>)}
+                        {dwight.resultado?.resumo_mercado && <div className="text-faint">mercado: {dwight.resultado.resumo_mercado}</div>}
+                        {dwight.extrato_id && (
+                          <button onClick={() => setExtratoAberto(dwight.extrato_id)} className="text-[11px] text-kist hover:underline">
+                            ver extrato da pesquisa
+                          </button>
+                        )}
+                      </div>
+                    )}
+                    {extratoAberto && (
+                      <ExtratoModal token={token} apiUrl={apiUrl} extratoId={extratoAberto}
+                        itemUid={item.item_uid} onClose={() => setExtratoAberto(null)} />
                     )}
                     {dwight?.status === "concluido" && dwight?.origem === "cache" && (
                       <div className="mt-0.5 text-[10.5px] text-faint">
@@ -2162,6 +2185,9 @@ export default function App() {
   const [tinyEnvio, setTinyEnvio] = useState(null);
   const [guiaTiny, setGuiaTiny] = useState(null);   // regras de campo do Tiny (v3.75)
   const [motores, setMotores] = useState({});       // motores de pesquisa prontos (v3.79)
+  const [conhecimentoItens, setConhecimentoItens] = useState({});   // v3.82: o que a Kist já sabe de cada item
+  const [catalogoFicha, setCatalogoFicha] = useState(null);
+  const [extratosAbertos, setExtratosAbertos] = useState(false);
   // "Não importar preços sem rastreabilidade": ON pro Fábio por padrão, OFF pros demais.
   // Ele pode desmarcar. Diferente do antigo checkbox de preservar descrição (que criava
   // duas verdades no mesmo dado), este não muda o que o sistema SABE — só o que ele
@@ -2549,6 +2575,19 @@ export default function App() {
   }
   const autoAplicadosRef = useRef(new Set());         // uid já aplicado automaticamente
   const numeroAtual = String(propostas[propostaIdx]?.proposta || numeroProposta || "").trim();
+
+  // v3.82: consulta o catálogo para os itens da proposta aberta (uma chamada só).
+  const _chaveItensCtx = ((propostas[propostaIdx]?.itens) || [])
+    .map((it, i) => `${it.item_uid || i}|${(it.descricao_original || it.descricao_final || "").slice(0, 80)}`).join("~");
+  useEffect(() => {
+    if (!token) return;
+    const itens = ((propostas[propostaIdx]?.itens) || []).map((it, i) => ({
+      k: String(it.item_uid || i), descricao: it.descricao_original || it.descricao_final || "" }));
+    if (!itens.length) { setConhecimentoItens({}); return; }
+    fetch(`${API}/catalogo/contexto`, { method: "POST", headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ itens }) })
+      .then((r) => (r.ok ? r.json() : {})).then((d) => setConhecimentoItens(d || {})).catch(() => {});
+  }, [token, _chaveItensCtx]);
 
   useEffect(() => {
     if (!token) return;
@@ -3002,6 +3041,8 @@ export default function App() {
           <OrdensCompra token={token} usuario={usuario}
             novaOC={novaOCPayload}
             onNovaOCProcessada={() => setNovaOCPayload(null)} />
+        ) : pagina === "catalogo" ? (
+          <Catalogo token={token} apiUrl={API} fichaInicial={catalogoFicha} />
         ) : pagina === "requisicoes" ? (
           <Analista token={token} usuario={usuario} onAlertasChange={carregarAlertas} />
         ) : pagina === "agentes" ? (
@@ -3500,6 +3541,14 @@ export default function App() {
                     className="rounded-lg border border-line2 bg-surface px-3 py-1.5 font-medium text-kist hover:border-kist disabled:opacity-50">
                     🔎 pesquisar com o KistBot Dwight{motores.kistbot === false ? " (aguardando túnel)" : ""}
                   </button>
+                  {/* v3.82: o relatório da pesquisa — processo, julgamentos e pontos a validar. */}
+                  <button onClick={() => setExtratosAbertos(true)} disabled={!numeroAtual}
+                    className="rounded-lg border border-line2 bg-surface px-3 py-1.5 font-medium text-sub hover:border-kist hover:text-kist disabled:opacity-50">
+                    📋 extrato da pesquisa
+                  </button>
+                  {extratosAbertos && numeroAtual && (
+                    <ExtratosPropostaModal token={token} apiUrl={API} numero={numeroAtual} onClose={() => setExtratosAbertos(false)} />
+                  )}
                   {(() => {
                     const n = (prop.itens || []).filter((it) => {
                       const of = ofertaRecomendada(it);
@@ -3624,7 +3673,9 @@ export default function App() {
                           dwight={item?.item_uid ? pesq.itens[String(item.item_uid).toLowerCase()] : null}
                           onPesquisarItem={item?.item_uid
                             ? () => pesquisarComDwight(true, [String(item.item_uid).toLowerCase()])
-                            : null} />
+                            : null}
+                          conhecimento={conhecimentoItens[String(item?.item_uid || i)]}
+                          onAbrirFicha={(fid) => { setCatalogoFicha(fid); setPagina("catalogo"); }} />
                       ))}
                     </tbody>
                   </table>
