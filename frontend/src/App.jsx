@@ -874,14 +874,17 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
 
   // "usar esta" da oferta do Dwight: mesmo caminho da ficha da internet — custo e
   // origem entram, venda fica em branco, descrição do cliente não é tocada.
-  // Custo = custoDaOferta: Pix quando confiável, senão o cheio (ver pixSuspeito).
+  // Custo = custoDaOferta: Pix quando houver, senão o cheio. Oferta com preço
+  // divergente (precoDivergente) só entra pelos botões "usar Pix" / "usar cheio",
+  // que marcam o item como confirmado pelo operador.
   // O frete estimado NÃO entra sozinho: é estimativa, o operador decide.
-  function usarOfertaDwight(of) {
-    const preco = custoDaOferta(of);
+  function usarOfertaDwight(of, precoEscolhido = null) {
+    const preco = precoEscolhido != null ? precoEscolhido : custoDaOferta(of);
     usarFichaInternet({
       preco_brl: preco, url: of.link || "", fonte: of.loja || "",
       sku: of.sku || "", apresentacao: of.pn || "",
     });
+    if (precoEscolhido != null) onChange(index, "_preco_confirmado", true);
   }
 
   // "usar esta" do card do BANCO: carrega TUDO que veio do banco — preço de VENDA,
@@ -1564,6 +1567,22 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
                               : (of.loja || "—")}
                             {of.pn && <span className="ml-1.5 font-mono text-[10.5px] text-faint">{of.pn}</span>}
                           </div>
+                          {precoDivergente(of) ? (
+                            <div className="flex flex-shrink-0 items-center gap-1.5"
+                              title="Pix e cheio divergentes (ou OCR/outlier): um dos dois está errado. Abra o anúncio e escolha.">
+                              <span className="text-[10.5px] text-amber">confirme:</span>
+                              {pixDaOferta(of) != null && (
+                                <button onClick={() => usarOfertaDwight(of, pixDaOferta(of))}
+                                  className="rounded-md border border-amber/60 px-1.5 py-0.5 font-mono text-[10.5px] text-ink hover:border-kist">
+                                  Pix {brl(pixDaOferta(of))}
+                                </button>)}
+                              {Number(of.preco_cheio) > 0 && (
+                                <button onClick={() => usarOfertaDwight(of, Number(of.preco_cheio))}
+                                  className="rounded-md border border-amber/60 px-1.5 py-0.5 font-mono text-[10.5px] text-ink hover:border-kist">
+                                  cheio {brl(Number(of.preco_cheio))}
+                                </button>)}
+                            </div>
+                          ) : (
                           <div className="flex flex-shrink-0 items-center gap-2">
                             {custoDaOferta(of) != null
                               ? <span className="font-mono text-[12.5px] text-ink">{brl(custoDaOferta(of))}</span>
@@ -1572,7 +1591,7 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
                               className="rounded-md border border-line2 px-1.5 py-0.5 text-[10.5px] font-medium text-sub hover:border-kist hover:text-kist">
                               usar
                             </button>
-                          </div>
+                          </div>)}
                         </div>
                       );
                       const jaUsada = (item.link_fornecedor || "") === (rec.link || "\u0000");
@@ -1581,9 +1600,9 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
                           {linha(rec, k0)}
                           <div className="flex flex-wrap items-center gap-x-1.5 text-[10.5px] text-faint">
                             {rec.estoque && <span>{rec.estoque}</span>}
-                            {rec.preco_cheio != null && rec.preco_pix != null && (pixSuspeito(rec)
-                              ? <span className="text-amber" title="Pix muito abaixo do cheio ou marcado como OCR/outlier: a Cabine usa o cheio">· Pix {brl(rec.preco_pix)} descartado</span>
-                              : <span>· cheio {brl(rec.preco_cheio)}</span>)}
+                            {rec.preco_cheio != null && rec.preco_pix != null && !precoDivergente(rec) && <span>· cheio {brl(rec.preco_cheio)}</span>}
+                            {precoDivergente(rec) && <span className="text-amber">· Pix e cheio divergentes — nada foi carregado sozinho</span>}
+                            {custoAConfirmar(item, rec) && <span className="text-rose">· o custo do item veio desta oferta e não foi confirmado</span>}
                             {rec.frete != null && <span>· frete est. {brl(rec.frete)}</span>}
                             {rec.prazo && <span>· {rec.prazo}</span>}
                             {jaUsada && <span className="text-signal">· carregada no item</span>}
@@ -1934,22 +1953,46 @@ export function ofertaDwight(it, mapa) {
   return ofertas[r.resultado?.escolha || 0] || null;
 }
 
-// Pix suspeito (regra do Leonardo, 23/09 — caso R-1375, Duracell R$ 19,69 × R$ 198,90):
-// Pix mais de 35% abaixo do cheio, OU a oferta avisa OCR/outlier. Desconto de Pix
-// real não chega nisso; é leitura errada. Nesses casos a Cabine usa o CHEIO.
-// Espelho de `_pix_suspeito` no backend — mudou um, mude o outro.
+// PREÇO DIVERGENTE (regra do Leonardo, 23/09 — revista no mesmo dia, v3.84):
+// Pix mais de 35% abaixo do cheio, OU oferta que avisa OCR/outlier, quer dizer que
+// UM dos dois preços está errado — não diz qual. Casos reais: Duracell Pix 19,69 ×
+// cheio 198,90 (o Pix era o erro); trena de bolso Pix 19,27 × cheio 716,90 (o
+// cheio era o erro). Por isso a Cabine NÃO escolhe: oferta divergente não carrega
+// custo nem venda sozinha. O card mostra os dois com "usar Pix" / "usar cheio".
+// Espelho de `_preco_divergente` no backend — mudou um, mude o outro.
 export const PIX_DIVERGENCIA_MAX = 0.35;
-export function pixSuspeito(of) {
-  const pix = Number(of?.preco_pix), cheio = Number(of?.preco_cheio);
+export function pixDaOferta(of) {
+  // v3.83 (só naquela versão) anulava o Pix e guardava em preco_pix_descartado.
+  const v = of?.preco_pix != null ? Number(of.preco_pix) : Number(of?.preco_pix_descartado);
+  return v > 0 ? v : null;
+}
+export function precoDivergente(of) {
+  if (!of) return false;
+  if (of.preco_divergente || of.preco_pix_descartado != null) return true;
+  const pix = pixDaOferta(of), cheio = Number(of.preco_cheio);
   if (!(pix > 0) || !(cheio > 0)) return false;
   if (pix < cheio * (1 - PIX_DIVERGENCIA_MAX)) return true;
-  return /ocr|outlier/i.test(String(of?.obs || ""));
+  return /ocr|outlier/i.test(String(of.obs || ""));
 }
 
-// Custo da oferta: Pix quando houver (e for confiável), senão o cheio.
+// Custo da oferta: Pix quando houver, senão o cheio. Oferta divergente não tem
+// custo automático (null) — quem escolhe é o operador.
 export function custoDaOferta(of) {
-  const v = (of?.preco_pix != null && !pixSuspeito(of)) ? of.preco_pix : of?.preco_cheio;
+  if (precoDivergente(of)) return null;
+  const v = of?.preco_pix != null ? of.preco_pix : of?.preco_cheio;
   return v == null ? null : Number(v);
+}
+
+// O custo do item veio de uma oferta divergente e o operador ainda não confirmou?
+// (custo igual ao Pix ou ao cheio dela, mesma loja/link). Aí nada automático toca
+// nesse item — nem venda —, porque o número pode ser o errado.
+export function custoAConfirmar(it, of) {
+  if (!precoDivergente(of) || it?._preco_confirmado) return false;
+  const c = Number(it?.preco_custo);
+  if (!(c > 0)) return false;
+  const link = (it?.link_fornecedor || "").trim();
+  if (link && of?.link && link !== of.link) return false;
+  return [pixDaOferta(of), Number(of?.preco_cheio)].some((v) => v > 0 && Math.abs(c - v) < 0.005);
 }
 
 // QUANDO o Dwight escreve no item (regra do Leonardo, 17/09):
@@ -1957,10 +2000,11 @@ export function custoDaOferta(of) {
 //   · item com origem MAIS CARA que a dele → escreve (troca por mais barato);
 //   · item com origem e SEM custo para comparar → não escreve (aparece no card
 //     como alternativa; sem número dos dois lados não existe "mais barato").
+//   · oferta com preço divergente → nunca escreve sozinho (v3.84).
 // Devolve 'vazio' | 'mais_barato' | 'nao' + a economia, para a tela explicar.
 export function decidirEscrita(it, of) {
   const novo = custoDaOferta(of);
-  if (novo == null || !(novo > 0)) return { escreve: false, motivo: "nao" };
+  if (novo == null || !(novo > 0)) return { escreve: false, motivo: precoDivergente(of) ? "divergente" : "nao" };
   const temOrigem = !!((it?.link_fornecedor || "").trim() || (it?.fornecedor || "").trim())
                     || Number(it?.preco_custo) > 0;
   if (!temOrigem) return { escreve: true, motivo: "vazio" };
@@ -1982,6 +2026,7 @@ export function vendaPelaMediana(custo, fator) {
 export function precisaCarregarDwight(it, of) {
   if (!of) return false;
   if (decidirEscrita(it, of).escreve) return true;
+  if (custoAConfirmar(it, of)) return false;
   return !(Number(it?.preco_un) > 0) && Number(it?.preco_custo) > 0;
 }
 
@@ -1993,7 +2038,7 @@ export function precisaCarregarDwight(it, of) {
 // PRÓPRIA — venda entra sempre que estiver em branco e existir custo para
 // multiplicar, de agora (oferta nova) ou de antes (custo que já estava lá).
 export function planoCarregamentoDwight(itens, mapaPesquisa, markups, uidsFiltro) {
-  const escrever = [], trocados = [], recusados = [], elegiveisVenda = [];
+  const escrever = [], trocados = [], recusados = [], elegiveisVenda = [], divergentes = [];
   (itens || []).forEach((it, i) => {
     if (uidsFiltro && !uidsFiltro.includes(String(it.item_uid || "").toLowerCase())) return;
     const of = ofertaDwight(it, mapaPesquisa);
@@ -2006,13 +2051,15 @@ export function planoCarregamentoDwight(itens, mapaPesquisa, markups, uidsFiltro
         if (d.motivo === "mais_barato") trocados.push({ i, economia: d.economia });
       } else {
         recusados.push(i);
+        if (d.motivo === "divergente") divergentes.push(i);
       }
     }
     // Custo que vai valer DEPOIS desta operação: o novo, se for escrito agora;
     // senão o que já está no item. Cobre os DOIS casos que já causaram bug:
     // item novo (custo chega agora, pela oferta) e item que já tinha o mesmo
     // custo de antes (não é reescrito, mas a venda ainda pode ser calculada).
-    if (markups && !(Number(it.preco_un) > 0)) {
+    // Custo que veio de oferta divergente e não foi confirmado: sem venda automática.
+    if (markups && !(Number(it.preco_un) > 0) && !(of && !seraEscrito && custoAConfirmar(it, of))) {
       const custoFinal = seraEscrito ? custoDaOferta(of) : Number(it.preco_custo);
       if (custoFinal > 0) elegiveisVenda.push(i);
     }
@@ -2032,7 +2079,7 @@ export function planoCarregamentoDwight(itens, mapaPesquisa, markups, uidsFiltro
       if (v != null) { vendas.set(i, v); if (mk.fonte) fontes.add(mk.fonte); }
     });
   }
-  return { escrever, trocados, recusados, vendas, fontes };
+  return { escrever, trocados, recusados, vendas, fontes, divergentes };
 }
 
 // Aplica a oferta: custo e origem. A VENDA não é tocada — a internet é custo,
@@ -2228,6 +2275,16 @@ export default function App() {
   const [numeroProposta, setNumeroProposta] = useState("");
   const [propostas, setPropostas] = useState([]);   // array de propostas extraídas
   const [propostaIdx, setPropostaIdx] = useState(0);
+  // v3.84: o auto-save lê o estado MAIS RECENTE por ref. O timer era criado no
+  // mesmo clique que agenda a mudança (antes de o React aplicá-la), então gravava
+  // o estado anterior à última edição — e ainda limpava o "modificado". Resultado
+  // real (R-1375, 23/09): digitado 331,37, gravado 331,30, e o "Salvar rascunho"
+  // não regravava. Todo último ajuste antes de uma pausa podia se perder.
+  const propostasRef = useRef(propostas);
+  propostasRef.current = propostas;
+  const propostaIdxRef = useRef(propostaIdx);
+  propostaIdxRef.current = propostaIdx;
+  const modSeqRef = useRef(0);                               // conta edições
   const [downloadados, setDownloadados] = useState(new Set());
   const [stats, setStats] = useState(null);
   const [bancoInfo, setBancoInfo] = useState(null);
@@ -2522,6 +2579,7 @@ export default function App() {
 
   function _dispararAutoSave() {
     modificadoRef.current = true;
+    modSeqRef.current += 1;
     if (autoSaveRef.current) clearTimeout(autoSaveRef.current);
     autoSaveRef.current = setTimeout(() => salvarRascunho(true), 1500);
   }
@@ -2540,7 +2598,8 @@ export default function App() {
 
   async function salvarRascunho(silent = false) {
     if (!modificadoRef.current) return;
-    const prop = propostas[propostaIdx];
+    const prop = propostasRef.current[propostaIdxRef.current];
+    const seq = modSeqRef.current;           // edição que este save está levando
     if (!prop || !(prop.proposta || numeroProposta)) return;
     if (!silent) setSalvando(true);
     else setSalvando(true);
@@ -2564,9 +2623,13 @@ export default function App() {
       });
       const d = await r.json();
       if (d.proposta_id && !propostaId) setPropostaId(d.proposta_id);
+      if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
       setUltimoSalvo(new Date());
-      modificadoRef.current = false;
-    } catch (e) { /* auto-save silencioso */ }
+      // Só limpa se ninguém editou enquanto o save ia e voltava; senão agenda outro.
+      if (modSeqRef.current === seq) modificadoRef.current = false;
+      else { if (autoSaveRef.current) clearTimeout(autoSaveRef.current);
+             autoSaveRef.current = setTimeout(() => salvarRascunho(true), 1500); }
+    } catch (e) { /* auto-save silencioso; continua "modificado" para a próxima tentativa */ }
     finally { setSalvando(false); }
   }
 
@@ -2673,7 +2736,10 @@ export default function App() {
         : "Nenhuma oferta do Dwight para carregar.");
       return 0;
     }
-    const antes = plano.escrever.map(([i]) => ({ i, item: lista[i] }));
+    // Desfazer guarda TODO item tocado: o que teve custo reescrito e o que só
+    // ganhou venda (antes ficava de fora e o "desfazer" não voltava a venda).
+    const tocados = new Set([...plano.escrever.map(([i]) => i), ...plano.vendas.keys()]);
+    const antes = [...tocados].map((i) => ({ i, item: lista[i] }));
     const mapa = new Map(plano.escrever);
     setPropostas((prev) => prev.map((p, pi) => pi !== propostaIdx ? p : {
       ...p,
@@ -2690,6 +2756,7 @@ export default function App() {
     const econ = plano.trocados.reduce((a, t) => a + (t.economia || 0), 0);
     const comVenda = plano.vendas.size;
     setPesqMsg(`Carregado em ${plano.escrever.length} ${plano.escrever.length === 1 ? "item" : "itens"}`
+      + (plano.divergentes.length ? ` · ${plano.divergentes.length} com Pix e cheio divergentes — escolha no card` : "")
       + (plano.trocados.length ? ` · ${plano.trocados.length} ${plano.trocados.length === 1 ? "estava" : "estavam"} mais caro${plano.trocados.length === 1 ? "" : "s"} (economia ${brl(econ)})` : "")
       + (plano.recusados.length ? ` · ${plano.recusados.length} mantido${plano.recusados.length === 1 ? "" : "s"} como ${plano.recusados.length === 1 ? "estava" : "estavam"}` : "")
       + (markups

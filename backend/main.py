@@ -101,7 +101,7 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_ext
 
-VERSAO_BACKEND = "3.83"
+VERSAO_BACKEND = "3.84"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -5984,16 +5984,17 @@ def _link_seguro(v) -> str:
     return u if re.match(r"^https?://", u, re.I) else ""
 
 
-# Pix suspeito (regra do Leonardo, 23/09 — caso R-1375): Pix mais de 35% abaixo
-# do cheio, OU a oferta avisa OCR/outlier. Desconto de Pix real não chega nisso;
-# é leitura errada. A oferta sai com o Pix anulado (guardado em
-# `preco_pix_descartado`) e todo consumidor passa a usar o cheio.
-# Espelho de `pixSuspeito` no frontend — mudou um, mude o outro.
+# PREÇO DIVERGENTE (regra do Leonardo, 23/09, revista na v3.84): Pix mais de 35%
+# abaixo do cheio, OU oferta que avisa OCR/outlier, quer dizer que UM dos dois está
+# errado — não qual. Duracell: Pix 19,69 × cheio 198,90 (Pix errado); trena de bolso:
+# Pix 19,27 × cheio 716,90 (cheio errado). A oferta guarda OS DOIS e sai marcada
+# `preco_divergente`; nenhum consumidor usa preço dela sozinho — o operador escolhe.
+# Espelho de `precoDivergente` no frontend — mudou um, mude o outro.
 _PIX_DIVERGENCIA_MAX = 0.35
 _PIX_OBS_SUSPEITA = re.compile(r"ocr|outlier", re.I)
 
 
-def _pix_suspeito(pix, cheio, obs="") -> bool:
+def _preco_divergente(pix, cheio, obs="") -> bool:
     try:
         pix, cheio = float(pix or 0), float(cheio or 0)
     except (TypeError, ValueError):
@@ -6026,11 +6027,8 @@ def _norm_oferta(o: dict) -> dict:
     # Oferta sem loja, sem link e sem preço não é oferta.
     if not (of["loja"] or of["link"] or of["preco_pix"] or of["preco_cheio"]):
         return {}
-    if _pix_suspeito(of["preco_pix"], of["preco_cheio"], of["obs"]):
-        of["preco_pix_descartado"] = of["preco_pix"]
-        of["preco_pix"] = None
-        of["obs"] = _txt(f"Pix R$ {of['preco_pix_descartado']:.2f} descartado (diverge do cheio"
-                         f" ou OCR/outlier) — custo pelo cheio. {of['obs']}".strip(), 500)
+    if _preco_divergente(of["preco_pix"], of["preco_cheio"], of["obs"]):
+        of["preco_divergente"] = True
     return of
 
 

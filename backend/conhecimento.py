@@ -185,7 +185,10 @@ def observacoes_do_item(r: dict, ofertas_norm: list, escolha: int) -> list:
                 out.append(ob)
     else:
         for i, o in enumerate((ofertas_norm or [])[:MAX_OBSERVADAS]):
-            ob = normalizar_observada({**o, "preco": o.get("preco_pix") or o.get("preco_cheio")},
+            # Oferta com preço divergente (v3.84): não se sabe qual valor vale —
+            # a observação guarda loja e link, sem preço.
+            preco_ob = None if o.get("preco_divergente") else (o.get("preco_pix") or o.get("preco_cheio"))
+            ob = normalizar_observada({**o, "preco": preco_ob, "preco_pix": None, "preco_cheio": None},
                                       escolhida=(i == escolha))
             if ob:
                 out.append(ob)
@@ -270,8 +273,12 @@ def veredito(ofertas: list, escolha: int, item_final: dict, tolerancia_custo: fl
         escolha = 0
     rec = ofertas[escolha]
     if _mesma_oferta(rec, item_final):
-        preco_bot = num(rec.get("preco_pix")) or num(rec.get("preco_cheio"))
         custo = num(item_final.get("preco_custo"))
+        preco_bot = num(rec.get("preco_pix")) or num(rec.get("preco_cheio"))
+        if rec.get("preco_divergente") and custo:
+            # O operador escolheu um dos dois; compara com o mais próximo.
+            cands = [v for v in (num(rec.get("preco_pix")), num(rec.get("preco_cheio"))) if v]
+            preco_bot = min(cands, key=lambda v: abs(v - custo)) if cands else preco_bot
         if preco_bot and custo and abs(custo - preco_bot) / preco_bot > tolerancia_custo:
             return {"veredito": "custo_divergente", "preco_bot": preco_bot, "custo_final": custo,
                     "loja": rec.get("loja")}
