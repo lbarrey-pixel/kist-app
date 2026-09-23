@@ -102,7 +102,8 @@ import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_ext
 
 # v3.87 — PDF digitalizado (sem texto) vai inteiro para a IA ler pela imagem (caso Thiago, Construcap BR-040, 23/09).
-VERSAO_BACKEND = "3.87"
+# v3.88 — acerto de cache da pesquisa grava o motor do botão (KistBot Dwight dava 500 na R-1393).
+VERSAO_BACKEND = "3.88"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -6510,9 +6511,12 @@ async def _disparar_pesquisa(ref: str, request: Request, usuario: str, motor: st
     linhas = []
     for u, it in do_cache:
         c = cache[chaves[u]]
+        # v3.88 — a linha do cache leva o motor do BOTÃO que disparou (caso R-1393,
+        # alicate). Sem a chave, o insert em lote (cache + fila) mandava motor NULL
+        # e o Postgres recusava tudo (23502); só com cache, caía no default 'dwight'.
         linhas.append({
             "proposta_id": prop["id"], "numero_proposta": numero, "item_uid": u,
-            "origem": "cache", "status": "concluido", "chave_cache": chaves[u],
+            "origem": "cache", "motor": motor, "status": "concluido", "chave_cache": chaves[u],
             "descricao": _txt(it.get("descricao_original") or it.get("descricao_final"), 500),
             "resultado": c.get("resultado"),
             "telemetria": {**(c.get("telemetria") or {}), "cache_de": c.get("respondido_em"),

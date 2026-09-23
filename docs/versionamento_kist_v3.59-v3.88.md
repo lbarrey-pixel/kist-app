@@ -1,4 +1,4 @@
-# Kist Cabine: versionamento v3.59 a v3.87
+# Kist Cabine: versionamento v3.59 a v3.88
 
 Atualizado em 23/09/2026. Continua o histórico até a v3.58 que está no núcleo do Analista (`config_kist['capacidades_nucleo']`).
 
@@ -199,6 +199,12 @@ Versões que não têm commit próprio: **v3.69** está dentro de bcd73d0 (v3.70
 - Dados: `mercado_observacoes` 146 e 272 (Pix de OCR de 19,40 e 19,69) ficaram sem preço (backup `_bkp_20260923_mercado_observacoes`). R-1375: o Duracell ficou com custo 198,90 e venda 331,37, confirmados pelo Leonardo (backup `_bkp_20260923_itens_r1375`).
 - Propostas antigas com custo tirado de oferta divergente (vão aparecer com o aviso no card): 1050902 (terrômetro, 4.333,26), 1050903 (estilete, trena 19,27, torquês, chave ajustável 74,79), 1051007 e 1051012.
 
+## v3.88 · 23/09 · Acerto de cache da pesquisa grava o motor do botão
+- **Caso** (23/09): R-1393, alicate decapador 7" (item `26d16dbf…`), já pesquisado pelo KistBot Dwight na R-1384 às 15:27 UTC. O botão do KistBot Dwight dava HTTP 500 e nada era gravado. O mesmo aconteceu na R-1389 e, em 22/09, no redisparo parcial da R-1364 (anel hid0019).
+- **Causa**: em `_disparar_pesquisa`, a linha copiada do cache (`origem='cache'`) não tinha a chave `motor`, e a linha da fila tinha. O insert em lote do PostgREST junta as chaves de todas as linhas, então a linha do cache ia com `motor` NULL explícito e o Postgres recusava o lote inteiro (23502, a coluna é NOT NULL). Num lote só de cache, a coluna caía no default `'dwight'`: não dava erro, mas o motor ficava errado quando o botão era o do KistBot.
+- [B] A linha do cache grava o motor do botão que disparou: `kistbot` em `/pesquisa-kistbot-dwight`, `dwight` em `/pesquisa-dwight`. Vale para o acerto de cache e para o redisparo parcial (mesmo caminho). O webhook continua chamado só para os itens fora do cache (`para_fila`). O contrato da gaveta (`/pesquisa-resultado`) não mudou.
+- Teste no banco real, numa transação desfeita: a linha antiga (motor NULL) volta 23502; o lote cache (`kistbot`) + fila da R-1393 grava.
+
 ## v3.87 · 23/09 · PDF digitalizado é lido pela imagem
 - **Caso** (Thiago, 23/09): e-mail da Construcap (Consórcio BR-040) com 4 PDFs — RIM 1212, RIM 1214, 0617_001 e Requisição 1084. Todos DIGITALIZADOS: 0 caracteres na camada de texto. O leitor de PDF (`_pdf_po_texto`, pdfplumber) só extrai texto, então cada anexo virava "(anexo não convertido — o operador precisa abrir à mão)" e a IA devolvia um item-placeholder ("Itens não extraídos…", R-1394). Mandando o PDF sozinho, o conteúdo ia vazio e a extração quebrava com `JSONDecodeError` (R-1390 a R-1392).
 - [B] `ingestao.py`: um só construtor de bloco de anexo (`_bloco_anexo`) para `.eml`, `.msg` e arquivo solto (antes o mesmo código em 3 lugares). PDF com menos de `PDF_VISUAL_MIN_CHARS` (30) caracteres úteis — ou que o conversor não leu, ou maior que `_PDF_MAX_BYTES` — fica marcado `pdf_visual` e guarda os bytes.
@@ -224,7 +230,7 @@ Decisão de layout delegada pelo Leonardo (23/09: "decida como um designer profi
 
 ---
 
-## ROTAS NOVAS OU ALTERADAS v3.59–v3.87
+## ROTAS NOVAS OU ALTERADAS v3.59–v3.88
 
 | Método e rota | Para que serve | Versão |
 |---|---|---|
@@ -280,6 +286,7 @@ Decisão de layout delegada pelo Leonardo (23/09: "decida como um designer profi
 | POST /propostas/{ref}/pesquisa-resultado | anula Pix suspeito (`preco_pix_descartado`) | v3.83 |
 | POST /propostas/{ref}/pesquisa-resultado | marca `preco_divergente` e guarda os dois preços | v3.84 |
 | POST /extrair | PDF digitalizado vai como documento para leitura visual | v3.87 |
+| POST /propostas/{ref}/pesquisa-dwight e /pesquisa-kistbot-dwight | linha copiada do cache grava o motor do botão (antes: NULL → 500) | v3.88 |
 
 ## REGRAS DE NEGÓCIO NOVAS
 
