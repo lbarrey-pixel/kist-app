@@ -3545,6 +3545,7 @@ export default function App() {
                                 : nt.tipo === "anexo_redundante"   ? "Anexo repetido — usei o corpo do e-mail"
                                 : nt.tipo === "pdf_visual"         ? "PDF digitalizado — lido pela imagem, confira"
                                 : nt.tipo === "pdf_visual_cortado" ? "PDF digitalizado ficou de fora"
+                                : nt.tipo === "uma_por_arquivo"    ? "Regra do cliente — uma proposta por arquivo"
                                 : "Aviso da leitura"}
                             </div>
                             <div className="mt-0.5 text-[12.5px] leading-relaxed text-sub">{nt.mensagem}</div>

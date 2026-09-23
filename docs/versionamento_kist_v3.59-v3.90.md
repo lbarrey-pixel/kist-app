@@ -1,4 +1,4 @@
-# Kist Cabine: versionamento v3.59 a v3.89
+# Kist Cabine: versionamento v3.59 a v3.90
 
 Atualizado em 23/09/2026. Continua o histórico até a v3.58 que está no núcleo do Analista (`config_kist['capacidades_nucleo']`).
 
@@ -199,6 +199,13 @@ Versões que não têm commit próprio: **v3.69** está dentro de bcd73d0 (v3.70
 - Dados: `mercado_observacoes` 146 e 272 (Pix de OCR de 19,40 e 19,69) ficaram sem preço (backup `_bkp_20260923_mercado_observacoes`). R-1375: o Duracell ficou com custo 198,90 e venda 331,37, confirmados pelo Leonardo (backup `_bkp_20260923_itens_r1375`).
 - Propostas antigas com custo tirado de oferta divergente (vão aparecer com o aviso no card): 1050902 (terrômetro, 4.333,26), 1050903 (estilete, trena 19,27, torquês, chave ajustável 74,79), 1051007 e 1051012.
 
+## v3.90 · 23/09 · Uma proposta por arquivo para a Construcap; matching tenta de novo
+- **Lei por cliente** (Leonardo, 23/09): para o CNPJ de ORIGEM 63.945.143/0001-96 (Consórcio Construcap Copasa OHLA, BR-040), cada ARQUIVO anexo vira UMA proposta própria, mesmo com o mesmo destino. Arquivo com dois destinos dentro continua quebrando por destino. Para todos os outros clientes continua a regra geral de DESTINO (caso Universal: 6 PDFs = uma aba).
+  - [B] `CNPJS_UMA_PROPOSTA_POR_ARQUIVO` (constante — cliente novo entra ali) e `_cnpjs_no_texto`. Na extração, se o texto do e-mail traz um desses CNPJs e há mais de um arquivo anexo, entra no começo do pedido uma instrução "REGRA DESTE CLIENTE" com a lista de arquivos e o pedido de usar a identificação do documento como título. Nota nova ao operador: `uma_por_arquivo`.
+  - [F] Rótulo da nota.
+- **Matching com nova tentativa** (pendência do teste da v3.87): um lote de 1 item devolveu 348 linhas de JSON indentado, bateu o teto de 4000 tokens, o JSON veio cortado e o item ficou sem match. Agora: prompt pede JSON compacto (motivo curto, até 5 diferenças), teto de 8000 tokens, timeout de 60 s, e resposta cortada ou JSON quebrado ganha UMA nova tentativa — lote de vários itens dividido ao meio, item sozinho repete. Só depois disso vira aviso.
+- Dados: rascunhos vazios do Thiago apagados a pedido do Leonardo — R-1390, R-1391, R-1392 (sem itens) e R-1394 (só o item "Itens não extraídos…"). Backup `_bkp_20260923_propostas_vazias_thiago` e `_bkp_20260923_itens_vazias_thiago`. R-1393 (Fábio, Convergint, 8 itens) mantido.
+
 ## v3.89 · 23/09 · Login renova sozinho também depois de recarregar a página
 - [F] O token do Google vale 1 h. A renovação silenciosa (5 min antes de vencer) só era agendada no login por CLIQUE. Quem voltava com o token guardado — refresh, aba nova; mais comum desde a v3.85 — passava da 1 h com a tela parecendo logada e toda chamada dando **401**. Agora um efeito em `[token]` agenda a renovação a partir de qualquer token ativo. Achado no teste da v3.87 (token restaurado às 13:06, vencido às 14:06, extração recusada com 401).
 - [B] Só `VERSAO_BACKEND` = 3.89.
@@ -235,7 +242,7 @@ Decisão de layout delegada pelo Leonardo (23/09: "decida como um designer profi
 
 ---
 
-## ROTAS NOVAS OU ALTERADAS v3.59–v3.89
+## ROTAS NOVAS OU ALTERADAS v3.59–v3.90
 
 | Método e rota | Para que serve | Versão |
 |---|---|---|
@@ -335,6 +342,7 @@ Decisão de layout delegada pelo Leonardo (23/09: "decida como um designer profi
 | O auto-save sempre grava a última edição; save com erro continua pendente | v3.84 |
 | O login da Cabine vale em todas as abas do navegador (localStorage) | v3.85 |
 | PDF digitalizado (sem texto) é lido pela imagem das páginas e o operador é avisado para conferir | v3.87 |
+| Construcap BR-040 (CNPJ 63.945.143/0001-96): uma proposta por arquivo anexo, mesmo com o mesmo destino; demais clientes seguem a regra de destino | v3.90 |
 
 ## Objetos de banco usados pela primeira vez neste intervalo (todos existem no Supabase, conferido em 23/09)
 

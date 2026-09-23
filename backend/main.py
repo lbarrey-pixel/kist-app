@@ -104,7 +104,8 @@ from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_
 # v3.87 — PDF digitalizado (sem texto) vai inteiro para a IA ler pela imagem (caso Thiago, Construcap BR-040, 23/09).
 # v3.88 — acerto de cache da pesquisa grava o motor do botão (KistBot Dwight dava 500 na R-1393).
 # v3.89 — só frontend (renovação do login para token restaurado); o número sobe para o deploy ser conferível.
-VERSAO_BACKEND = "3.89"
+# v3.90 — lei por cliente (Construcap: uma proposta por arquivo) + matching com nova tentativa quando a resposta vem cortada.
+VERSAO_BACKEND = "3.90"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -566,6 +567,21 @@ def get_supabase():
     return _supabase_client
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
+# v3.90 — "LEI" POR CLIENTE (Leonardo, 23/09): para estes CNPJs de ORIGEM, cada
+# ARQUIVO anexo (PDF, planilha…) vira UMA proposta própria, mesmo que os arquivos
+# tenham o mesmo destino. Arquivo com dois destinos dentro continua quebrando por
+# destino. Para os demais clientes vale a regra geral de DESTINO do SYSTEM_EXTRACAO
+# (caso Universal: 6 PDFs = uma demanda = uma aba). Só dígitos.
+CNPJS_UMA_PROPOSTA_POR_ARQUIVO = {
+    "63945143000196",   # CONSORCIO CONSTRUCAP COPASA OHLA (BR-040) — caso Thiago, 23/09
+}
+_RE_CNPJ_TXT = re.compile(r"\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b")
+
+
+def _cnpjs_no_texto(txt: str) -> set:
+    return {re.sub(r"\D", "", m) for m in _RE_CNPJ_TXT.findall(txt or "")}
+
+
 SYSTEM_EXTRACAO = """Você é o assistente comercial da Kist Soluções em Telecom e Energia.
 Extraia itens de cotação de e-mails, textos, planilhas ou imagens e retorne JSON.
 
@@ -3784,9 +3800,13 @@ def _fazer_matching(itens_raw: list, claude, sb, cliente: str = "",
     itens_ia = [i for i in pendentes if candidatos_por_item[i]]
     lotes = [itens_ia[i:i + _LOTE_MATCHING] for i in range(0, len(itens_ia), _LOTE_MATCHING)]
 
-    def _rodar_lote(lote):
-        """Uma chamada Haiku para um lote de poucos itens. Devolve dict de matches
-        (vazio em falha — quem chama já sabe registrar o aviso)."""
+    def _rodar_lote(lote, _tentativa=0):
+        """Uma chamada Haiku para um lote de poucos itens. Devolve dict de matches.
+
+        v3.90 — resposta cortada ou JSON quebrado ganha UMA nova tentativa antes de
+        virar aviso: lote de vários itens é dividido ao meio; item sozinho repete.
+        Caso Construcap (23/09): 1 item devolveu 348 linhas de JSON indentado, bateu
+        o teto de 4000 tokens e o item ficou sem match, sem nova tentativa."""
         # As specs_complementares vão JUNTO. Elas estavam sendo descartadas — e é
         # nelas que a divergência mora (69% dos itens têm specs preenchidas). O
         # matcher casava "suporte 60cm" com "suporte 60cm" e dava alta, sem ver que
@@ -3810,14 +3830,31 @@ Candidatos do banco de preços:{candidatos_txt}
 
 Para cada item, decida se algum candidato é O MESMO ITEM — comparando a DESCRIÇÃO **e** as SPECS.
 Preencha veredito, motivo, diferencas e falta. Lembre: fabricante diferente = null; categoria
-diferente = null; spec divergente = não é o mesmo item, mesmo que a descrição bata."""
+diferente = null; spec divergente = não é o mesmo item, mesmo que a descrição bata.
+Responda em JSON COMPACTO, numa linha só, sem indentação. "motivo" em uma frase curta;
+no máximo 5 entradas em "diferencas"."""
 
-        resp_match = claude.messages.create(
-            model="claude-haiku-4-5-20251001", max_tokens=4000,
-            system=SYSTEM_MATCHING + _excludentes_matching(sb),
-            messages=[{"role": "user", "content": prompt_matching}],
-            temperature=0.0, timeout=45.0
-        )
+        try:
+            resp_match = claude.messages.create(
+                model="claude-haiku-4-5-20251001", max_tokens=8000,
+                system=SYSTEM_MATCHING + _excludentes_matching(sb),
+                messages=[{"role": "user", "content": prompt_matching}],
+                temperature=0.0, timeout=60.0
+            )
+            if getattr(resp_match, "stop_reason", "") == "max_tokens":
+                raise ValueError("resposta do matching cortada no teto de tokens")
+            return _ler_resposta_matching(resp_match)
+        except Exception:
+            if _tentativa:
+                raise
+            if len(lote) > 1:
+                _meio = len(lote) // 2
+                _r = _rodar_lote(lote[:_meio], 1)
+                _r.update(_rodar_lote(lote[_meio:], 1))
+                return _r
+            return _rodar_lote(lote, 1)
+
+    def _ler_resposta_matching(resp_match):
         raw_match = resp_match.content[0].text.strip()
         raw_match = re.sub(r'^```(?:json)?\s*', '', raw_match)
         raw_match = re.sub(r'\s*```$', '', raw_match.strip())
@@ -4717,6 +4754,25 @@ def _extrair_nucleo(sb, usuario, numero_proposta, so_rastreavel, ignorar_cache,
         # pela regra de DESTINO — endereço/CNPJ diferente = proposta diferente —
         # e para decidir isso ele precisa ver o pedido inteiro de uma vez.
         _content, _rel_ing = _ing_montar_payload(documentos, texto_extra=(texto or ""))
+        # v3.90 — lei por cliente: origem na lista → uma proposta por ARQUIVO.
+        _txt_todo = "\n".join(d.render_texto() for d in documentos) + "\n" + (texto or "")
+        _cnpj_lei = _cnpjs_no_texto(_txt_todo) & CNPJS_UMA_PROPOSTA_POR_ARQUIVO
+        _arquivos_lei = [b.nome for d in documentos for b in d.blocos
+                         if b.tipo == "anexo" and b.nome]
+        if _cnpj_lei and len(_arquivos_lei) > 1:
+            _content.insert(0, {"type": "text", "text": (
+                "REGRA DESTE CLIENTE (vem antes da regra de destino): cada ARQUIVO anexo é "
+                "uma proposta própria, mesmo que os arquivos tenham o mesmo destino — "
+                f"{len(_arquivos_lei)} arquivos = pelo menos {len(_arquivos_lei)} propostas. "
+                "Um arquivo com dois destinos dentro continua virando duas. Use como "
+                "\"titulo\" a identificação do documento (ex.: número da RIM/requisição). "
+                "Arquivos: " + " | ".join(_arquivos_lei))})
+            notas_extracao.append({
+                "tipo": "uma_por_arquivo", "arquivo": ", ".join(_arquivos_lei),
+                "mensagem": (f"Regra deste cliente: uma proposta por arquivo "
+                             f"({len(_arquivos_lei)} arquivos)."),
+                "exclusivos": [],
+            })
         propostas_raw.extend(_chamar_com_content(_content))
         # v3.87 — PDF digitalizado foi lido pela imagem: é leitura visual (tipo
         # OCR) e pode errar dígito. O operador confere contra o PDF.
