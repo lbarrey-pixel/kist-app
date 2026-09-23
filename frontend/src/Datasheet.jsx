@@ -20,7 +20,7 @@
 // lá dentro é retrabalho caro na próxima.
 // ─────────────────────────────────────────────────────────────────────────
 import { useState, useRef, useEffect, useCallback } from "react";
-import { btnPrimary, btnGhost, IconX, IconCheck, IconDownload, IconBolt } from "./kist-ui.jsx";
+import { btnPrimary, btnGhost, btnTool, IconX, IconCheck, IconDownload, IconBolt } from "./kist-ui.jsx";
 
 // Tudo que difere entre os dois irmãos mora aqui. Um lugar só — duas cópias
 // divergem em três meses (a lição do `lerContato`).
@@ -490,7 +490,7 @@ export function DatasheetBaixarTodos({ itens, token, apiUrl, modo = "tecnico",
   return (
     <>
       <button onClick={baixar} disabled={baixando}
-        className={`${btnGhost} text-[12px] disabled:opacity-50`}
+        className={btnTool}
         title={`Baixa num único zip ${cfg.curto}s de ${ids.length} item(ns) desta proposta`}>
         <IconDownload size={14} />
         {baixando ? "montando…" : `Baixar ${cfg.curto}s (${ids.length})`}
@@ -547,7 +547,7 @@ export function DatasheetLote({ itens, token, apiUrl, fonteTexto, onChange,
   return (
     <>
       {!fila && (
-        <button onClick={iniciar} className={`${btnGhost} text-[12px]`}
+        <button onClick={iniciar} className={btnTool}
           title={`${cfg.ajuda} Um por vez, com sua aprovação.`}>
           {cfg.lote} ({pendentes.length})
         </button>

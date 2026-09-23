@@ -1,4 +1,4 @@
-# Kist Cabine: versionamento v3.59 a v3.85
+# Kist Cabine: versionamento v3.59 a v3.86
 
 Atualizado em 23/09/2026. Continua o histórico até a v3.58 que está no núcleo do Analista (`config_kist['capacidades_nucleo']`).
 
@@ -199,6 +199,16 @@ Versões que não têm commit próprio: **v3.69** está dentro de bcd73d0 (v3.70
 - Dados: `mercado_observacoes` 146 e 272 (Pix de OCR de 19,40 e 19,69) ficaram sem preço (backup `_bkp_20260923_mercado_observacoes`). R-1375: o Duracell ficou com custo 198,90 e venda 331,37, confirmados pelo Leonardo (backup `_bkp_20260923_itens_r1375`).
 - Propostas antigas com custo tirado de oferta divergente (vão aparecer com o aviso no card): 1050902 (terrômetro, 4.333,26), 1050903 (estilete, trena 19,27, torquês, chave ajustável 74,79), 1051007 e 1051012.
 
+## v3.86 · 23/09 · Reorganização visual: proposta, itens e lista
+Decisão de layout delegada pelo Leonardo (23/09: "decida como um designer profissional"). Nenhuma regra de negócio mudou; só lugar, agrupamento e rótulo.
+- [F] **Largura**: a tela da proposta e a lista de Propostas passam de `max-w-5xl` (1024px) para `max-w-6xl` (1152px). O espaço já existia e ficava vazio dos lados.
+- [F] **Topo da proposta**: fica só com as ações da proposta, numa linha: Recomeçar (link discreto), "✓ Salvo hh:mm", Salvar rascunho, Exportar para o Tiny e **Confirmar e baixar CSV** (principal, na ponta). Antes eram 8 botões que quebravam em 2 ou 3 linhas. `btnPrimary` e `btnGhost` passam a ter `whitespace-nowrap`; o `PageHeader` deixa as ações quebrarem para a direita sem espremer o título.
+- [F] **Barra de ferramentas** (card abaixo da triagem) com dois grupos com rótulo: **Pesquisa de preço** (🔎 Dwight, 🔎 KistBot Dwight, 📋 extrato, carregar…, preencher sozinho, desfazer) e **Documentos** (gerar e baixar datasheets e apresentações, que saíram do topo). "Itens aguardando" e as mensagens da pesquisa ficam numa linha própria embaixo. Botão novo `btnTool`/`btnToolKist` em `kist-ui.jsx`.
+- [F] **Cabeçalho do item** em três linhas: 1) descrição + atalhos de busca; 2) ESTADO (selo, código do cliente, herdado, já pesquisado, motor de preços, termo de busca à direita); 3) AÇÕES (descrição complementar, origem, datasheet, apresentação, excluir na ponta). Antes era tudo numa linha que quebrava sem ordem, e o termo de busca sumia espremido.
+- [F] **Lista de Propostas**: "Rascunho" embaixo do número; cliente ocupa a sobra e é cortado com "…" (nome inteiro no hover); valor, data e itens não quebram; data em dd/mm/aaaa; ações viram **Abrir** · lixeira · seta que gira ao abrir os itens (antes "Abrir e editar", "excluir", "ver itens" quebrando em duas linhas).
+- Teste: o build novo foi carregado dentro da aba logada do Leonardo, contra os dados reais (lista de Propostas e R-1375), antes do push; sem erro no console.
+- [B] Só `VERSAO_BACKEND` = 3.86.
+
 ## v3.85 · 23/09 · Gaveta do item não vaza mais; login vale em todas as abas
 - [F] **Gaveta "motor de preços" quebrava o card** (problema antigo, desde que o card do Dwight entrou na coluna da internet, v3.61). A caixa "Referência de mercado na internet" / "Buscando preço…" tinha `h-full` (100% da coluna) e ficava EMBAIXO do card do Dwight: sobrava a altura do card, que vazava por cima do item seguinte. Além disso, o "procurar outro no banco" é forçado na coluna 1 e abria uma 2ª linha na grade; a coluna da internet caía nessa linha, desalinhada do card do banco. Correção: coluna da internet em `flex flex-col gap-2` com a caixa em `flex-1`, presa em `md:col-start-2 md:row-start-1 md:row-span-2`; grade em `md:items-start`. Visto e testado na R-1375, item 03.
 - [F] **Login em `localStorage`** (pedido do Leonardo, 23/09). Antes ficava no `sessionStorage` e cada aba nova pedia login. Token vencido continua sendo descartado ao abrir; e-mail fora da equipe também.
@@ -206,7 +216,7 @@ Versões que não têm commit próprio: **v3.69** está dentro de bcd73d0 (v3.70
 
 ---
 
-## ROTAS NOVAS OU ALTERADAS v3.59–v3.85
+## ROTAS NOVAS OU ALTERADAS v3.59–v3.86
 
 | Método e rota | Para que serve | Versão |
 |---|---|---|

@@ -17,9 +17,14 @@ export const brl = (n) =>
   (Number(n) || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 export const btnPrimary =
-  "inline-flex items-center gap-1.5 rounded-lg bg-kist px-3.5 py-2 text-[13px] font-medium text-white transition-colors hover:bg-kist600 disabled:opacity-40";
+  "inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg bg-kist px-3.5 py-2 text-[13px] font-medium text-white transition-colors hover:bg-kist600 disabled:opacity-40";
 export const btnGhost =
-  "inline-flex items-center gap-1.5 rounded-lg border border-line2 bg-surface px-3.5 py-2 text-[13px] font-medium text-sub transition-colors hover:border-faint hover:text-ink";
+  "inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-line2 bg-surface px-3.5 py-2 text-[13px] font-medium text-sub transition-colors hover:border-faint hover:text-ink";
+
+// v3.85 — botão compacto das barras de ferramentas (pesquisa, documentos).
+const _btnTool = "inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-line2 bg-surface px-3 py-1.5 text-[12px] font-medium transition-colors hover:border-kist hover:text-kist disabled:opacity-50";
+export const btnTool = `${_btnTool} text-sub`;
+export const btnToolKist = `${_btnTool} text-kist`;   // ação principal do grupo
 
 // ── Ícones (stroke 1.6) ───────────────────────────────────────────────────
 const Ic = ({ d, size = 18, fill, ...p }) => (
@@ -76,12 +81,12 @@ export function StateLabel({ conf }) {
 export function PageHeader({ eyebrow, title, sub, actions }) {
   return (
     <div className="flex items-start justify-between gap-4">
-      <div>
+      <div className="min-w-0">
         <Eyebrow>{eyebrow}</Eyebrow>
         <h1 className="mt-1 text-[26px] font-semibold tracking-tight text-ink">{title}</h1>
         {sub && <div className="mt-1 text-[13.5px] text-sub">{sub}</div>}
       </div>
-      {actions && <div className="flex items-center gap-2 pt-1">{actions}</div>}
+      {actions && <div className="flex flex-shrink-0 flex-wrap items-center justify-end gap-2 pt-1">{actions}</div>}
     </div>
   );
 }

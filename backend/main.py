@@ -101,8 +101,8 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_ext
 
-# v3.85 — só frontend (gaveta do item e login em todas as abas); o número sobe para o deploy ser conferível.
-VERSAO_BACKEND = "3.85"
+# v3.86 — só frontend (reorganização visual da proposta e da lista); o número sobe para o deploy ser conferível.
+VERSAO_BACKEND = "3.86"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook

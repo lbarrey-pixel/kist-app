@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, Fragment } from "react";
 import ReceberPO from "./ReceberPO.jsx";
 import {
   brl, btnPrimary, btnGhost, Eyebrow, PageHeader, StateLabel,
-  IconSearch, IconArrow, IconCheck, IconX, IconBolt,
+  IconSearch, IconArrow, IconCheck, IconX, IconBolt, IconTrash,
 } from "./kist-ui.jsx";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
@@ -125,7 +125,7 @@ export default function Propostas({ token, usuario, onCriarOC, onAbrirProposta }
   const propAberta = lista.find((p) => (p.id ?? p.numero_proposta) === expandida);
 
   return (
-    <div className="mx-auto max-w-5xl px-8 py-9 rise">
+    <div className="mx-auto max-w-6xl px-8 py-9 rise">
       <PageHeader eyebrow="Histórico" title="Propostas"
         sub="Tudo que sua equipe gerou. Abra uma proposta, selecione itens e aprove para virar OC."
         actions={
@@ -166,8 +166,10 @@ export default function Propostas({ token, usuario, onCriarOC, onAbrirProposta }
         <table className="w-full">
           <thead>
             <tr className="border-b border-line bg-paper/70">
+              {/* v3.85 — número/valor/data não quebram linha; status mora com o número;
+                  ações compactas (Abrir · lixeira · seta) numa coluna de largura fixa. */}
               {["Proposta", "Cliente", "Itens", "Valor", "Data", "Resp.", ""].map((h, i) => (
-                <th key={i} className={`px-4 py-2.5 text-[10.5px] font-semibold uppercase eyebrow text-faint ${i === 2 || i === 3 ? "text-right" : "text-left"}`}>{h}</th>
+                <th key={i} className={`whitespace-nowrap px-4 py-2.5 text-[10.5px] font-semibold uppercase eyebrow text-faint ${i === 2 || i === 3 ? "text-right" : i === 5 ? "text-center" : "text-left"}`}>{h}</th>
               ))}
             </tr>
           </thead>
@@ -183,40 +185,48 @@ export default function Propostas({ token, usuario, onCriarOC, onAbrirProposta }
                 <Fragment key={id}>
                   <tr onClick={() => abrir(p)}
                     className={`group cursor-pointer border-b border-line/70 transition-colors ${aberta ? "bg-kist/[0.03]" : "hover:bg-paper/60"}`}>
-                    <td className="px-4 py-3 font-mono text-[13px] font-medium text-kist">{p.numero_proposta}</td>
-                    <td className="px-4 py-3">
-                      <div className="text-[13px] font-medium text-ink">{p.cliente}</div>
-                      {p.cnpj && <div className="font-mono text-[11px] text-faint">{p.cnpj}</div>}
+                    <td className="w-px whitespace-nowrap px-4 py-3">
+                      <div className="font-mono text-[13px] font-medium text-kist">{p.numero_proposta}</div>
+                      {p.status === "rascunho" && (
+                        <span className="mt-0.5 inline-block rounded-md bg-amber/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber">
+                          Rascunho
+                        </span>
+                      )}
                     </td>
-                    <td className="px-4 py-3 text-right font-mono text-[13px] text-sub">{p.total_itens}</td>
-                    <td className="px-4 py-3 text-right font-mono text-[13px] font-medium text-ink">R$ {brl(p.valor_total_estimado)}</td>
-                    <td className="px-4 py-3 font-mono text-[12px] text-sub">{(p.data_geracao || "").slice(0, 10)}</td>
-                    <td className="px-4 py-3">
+                    <td className="w-full max-w-0 px-4 py-3">
+                      <div className="truncate text-[13px] font-medium text-ink" title={p.cliente}>{p.cliente}</div>
+                      {p.cnpj && <div className="truncate font-mono text-[11px] text-faint">{p.cnpj}</div>}
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-3 text-right font-mono text-[13px] text-sub">{p.total_itens}</td>
+                    <td className="whitespace-nowrap px-4 py-3 text-right font-mono text-[13px] font-medium text-ink">R$ {brl(p.valor_total_estimado)}</td>
+                    <td className="whitespace-nowrap px-4 py-3 font-mono text-[12px] text-sub">
+                      {(p.data_geracao || "").slice(0, 10).split("-").reverse().join("/")}
+                    </td>
+                    <td className="px-4 py-3 text-center">
                       <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-paper text-[11px] font-semibold text-sub" title={p.usuario_nome}>
                         {(p.usuario_nome || "?").charAt(0).toUpperCase()}
                       </span>
                     </td>
-                    <td className="px-4 py-3">
-                      <div className="flex items-center justify-end gap-2">
-                        {p.status === "rascunho" && (
-                          <span className="rounded-md bg-amber/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber">
-                            Rascunho
-                          </span>
-                        )}
+                    <td className="w-px whitespace-nowrap px-4 py-3">
+                      <div className="flex items-center justify-end gap-1.5">
                         {onAbrirProposta && (
                           <button
                             onClick={(e) => { e.stopPropagation(); onAbrirProposta(p.id ?? p.numero_proposta); }}
-                            className="rounded-md border border-line2 bg-surface px-2 py-0.5 text-[11px] text-sub hover:border-kist/40 hover:text-kist">
-                            Abrir e editar
+                            title="Abrir a proposta para editar"
+                            className="rounded-md border border-line2 bg-surface px-2.5 py-1 text-[11.5px] font-medium text-sub hover:border-kist/40 hover:text-kist">
+                            Abrir
                           </button>
                         )}
                         <button
                           onClick={(e) => excluir(p, e)}
                           title="Excluir proposta"
-                          className="rounded-md border border-line2 bg-surface px-2 py-0.5 text-[11px] text-faint hover:border-rose/40 hover:text-rose">
-                          excluir
+                          className="rounded-md p-1.5 text-faint/70 hover:bg-rosebg hover:text-rose">
+                          <IconTrash size={14} />
                         </button>
-                        <span className="text-[11px] text-faint">{aberta ? "fechar" : "ver itens"}</span>
+                        <span title={aberta ? "Fechar itens" : "Ver itens"}
+                          className={`inline-flex h-6 w-6 items-center justify-center text-faint transition-transform group-hover:text-sub ${aberta ? "rotate-90" : ""}`}>
+                          <IconArrow size={13} />
+                        </span>
                       </div>
                     </td>
                   </tr>

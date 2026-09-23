@@ -9,7 +9,7 @@ import Suporte from "./Suporte.jsx";
 import Catalogo, { ConhecimentoSelo, ExtratoModal, ExtratosPropostaModal } from "./Catalogo.jsx";
 import { DatasheetBotao, DatasheetLote, DatasheetBaixarTodos } from "./Datasheet.jsx";
 import {
-  CONF, brl, btnPrimary, btnGhost, Eyebrow, StateLabel, PageHeader,
+  CONF, brl, btnPrimary, btnGhost, btnTool, btnToolKist, Eyebrow, StateLabel, PageHeader,
   CertaintyStrip, Sidebar,
   IconUpload, IconBolt, IconArrow, IconDownload, IconCheck, IconLink, IconX,
   IconGoogle, IconBell, IconSearch, lerContato } from "./kist-ui.jsx";
@@ -1007,30 +1007,11 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
               )}
             </button>
           </div>
-          <div className="mt-0.5 flex flex-wrap items-center gap-2 pl-1.5">
+          {/* v3.85 — linha 2 = ESTADO do item (selo, o que se sabe, motor de preços,
+              termo de busca); linha 3 = AÇÕES (complementos, origem, documentos,
+              excluir). Antes era tudo numa linha só, que quebrava sem ordem. */}
+          <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 pl-1.5">
             <StateLabel conf={confianca} />
-            {/* Termo que vai para os atalhos de busca. Não é a descrição da
-                proposta — é a query. Editável; o que ele digitar é o que busca. */}
-            <span className="flex min-w-0 flex-1 items-center gap-1"
-              title={`O que os atalhos vão buscar (${termoAuto.motivo}). Pode editar.`}>
-              <IconSearch size={11} className="flex-shrink-0 text-faint/50" />
-              <input
-                value={termo}
-                onChange={(e) => { setTermoTocado(true); setTermo(e.target.value); }}
-                placeholder="termo de busca"
-                spellCheck={false}
-                className="min-w-0 flex-1 rounded bg-transparent px-1 py-0.5 font-mono text-[10.5px]
-                           text-faint outline-none transition-colors placeholder:text-faint/50
-                           hover:bg-paper focus:bg-paper focus:text-ink" />
-              {termoTocado && (
-                <button
-                  onClick={() => { setTermoTocado(false); setTermo(termoAuto.termo); }}
-                  title="Voltar ao termo sugerido pelo sistema"
-                  className="flex-shrink-0 text-[10px] text-faint/60 hover:text-ink">
-                  ↺
-                </button>
-              )}
-            </span>
             {/* Código do item no ERP do cliente. É a chave que liga o mesmo produto
                 entre as abas do pedido — mostrar dá ao operador como conferir a
                 herança de preço sem abrir o e-mail de novo. */}
@@ -1067,6 +1048,30 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
                 : (!item.banco || confianca === "nenhuma") ? "motor de preços · sem banco"
                 : "motor de preços"}
             </button>
+            {/* Termo que vai para os atalhos de busca. Não é a descrição da
+                proposta — é a query. Editável; o que ele digitar é o que busca. */}
+            <span className="ml-auto flex min-w-[9rem] max-w-[16rem] flex-1 items-center gap-1"
+              title={`O que os atalhos vão buscar (${termoAuto.motivo}). Pode editar.`}>
+              <IconSearch size={11} className="flex-shrink-0 text-faint/50" />
+              <input
+                value={termo}
+                onChange={(e) => { setTermoTocado(true); setTermo(e.target.value); }}
+                placeholder="termo de busca"
+                spellCheck={false}
+                className="min-w-0 flex-1 rounded bg-transparent px-1 py-0.5 font-mono text-[10.5px]
+                           text-faint outline-none transition-colors placeholder:text-faint/50
+                           hover:bg-paper focus:bg-paper focus:text-ink" />
+              {termoTocado && (
+                <button
+                  onClick={() => { setTermoTocado(false); setTermo(termoAuto.termo); }}
+                  title="Voltar ao termo sugerido pelo sistema"
+                  className="flex-shrink-0 text-[10px] text-faint/60 hover:text-ink">
+                  ↺
+                </button>
+              )}
+            </span>
+          </div>
+          <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 pl-1.5">
             <button onClick={() => setMostrarSpecs((v) => !v)} className="text-[11px] text-faint hover:text-sub">
               {mostrarSpecs ? "− descrição complementar" : "+ descrição complementar"}
             </button>
@@ -3157,7 +3162,7 @@ export default function App() {
         ) : pagina === "chamados" && isAdmin ? (
           <ChamadosAdmin token={token} usuario={usuario} />
         ) : (
-          <div className="mx-auto max-w-5xl px-8 py-9">
+          <div className="mx-auto max-w-6xl px-8 py-9">
 
             {/* INPUT */}
             {step === "input" && (
@@ -3289,7 +3294,12 @@ export default function App() {
                     {prop.rc_neg && <span className="rounded-md bg-paper px-2 py-0.5 font-mono text-[11px] text-sub">{prop.rc_neg}</span>}
                   </span> : null}
                   actions={<>
-                    <button onClick={reiniciar} className={btnGhost}>Recomeçar</button>
+                    {/* v3.85 — o topo leva só as ações DA PROPOSTA; pesquisa e documentos
+                        foram para a barra de ferramentas abaixo da triagem. */}
+                    <button onClick={reiniciar} className="px-1.5 text-[12.5px] text-faint hover:text-ink"
+                      title="Descarta a tela atual e volta para a entrada (o rascunho salvo continua em Propostas)">
+                      Recomeçar
+                    </button>
                     {/* Indicador de auto-save */}
                     {salvando && <span className="text-[11.5px] text-faint animate-pulse">Salvando…</span>}
                     {!salvando && ultimoSalvo && <span className="text-[11.5px] text-faint">✓ Salvo {ultimoSalvo.toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"})}</span>}
@@ -3297,23 +3307,6 @@ export default function App() {
                       className={`${btnGhost} ${salvando ? "opacity-50" : ""}`}
                       title="Salvar como rascunho para continuar depois">
                       Salvar rascunho
-                    </button>
-                    <DatasheetLote itens={prop.itens || []} token={token} apiUrl={API}
-                      fonteTexto={prop.fonte_texto} onChange={atualizarItem}
-                      propostaId={propostaId} onSalvar={salvarRascunho} modo="tecnico" />
-                    <DatasheetLote itens={prop.itens || []} token={token} apiUrl={API}
-                      fonteTexto={prop.fonte_texto} onChange={atualizarItem}
-                      propostaId={propostaId} onSalvar={salvarRascunho} modo="comercial" />
-                    <DatasheetBaixarTodos itens={prop.itens || []} token={token} apiUrl={API}
-                      modo="tecnico" nomeProposta={prop.proposta || numeroProposta} />
-                    <DatasheetBaixarTodos itens={prop.itens || []} token={token} apiUrl={API}
-                      modo="comercial" nomeProposta={prop.proposta || numeroProposta} />
-                    <button onClick={() => baixarCSV(propostaIdx)} disabled={loading || salvandoBanco || jaBaixado} className={btnPrimary}>
-                      {salvandoBanco
-                        ? <><span className="inline-block animate-spin"><IconBolt size={15} /></span> Salvando…</>
-                        : jaBaixado ? <><IconCheck size={15} /> CSV baixado</>
-                        : loading ? "Gerando…"
-                        : <><IconDownload size={15} /> Confirmar e baixar CSV{propostas.length > 1 ? ` — Proposta ${propostaIdx + 1}` : ""}</>}
                     </button>
                     <button
                       onClick={() => exportarTiny(propostaIdx)}
@@ -3325,6 +3318,13 @@ export default function App() {
                         : tinyEnvio?.estado === "ok"
                         ? <><IconCheck size={15} /> No Tiny: {tinyEnvio.tiny_numero || tinyEnvio.tiny_id}</>
                         : <><IconLink size={15} /> Exportar para o Tiny</>}
+                    </button>
+                    <button onClick={() => baixarCSV(propostaIdx)} disabled={loading || salvandoBanco || jaBaixado} className={btnPrimary}>
+                      {salvandoBanco
+                        ? <><span className="inline-block animate-spin"><IconBolt size={15} /></span> Salvando…</>
+                        : jaBaixado ? <><IconCheck size={15} /> CSV baixado</>
+                        : loading ? "Gerando…"
+                        : <><IconDownload size={15} /> Confirmar e baixar CSV{propostas.length > 1 ? ` — Proposta ${propostaIdx + 1}` : ""}</>}
                     </button>
                   </>} />
 
@@ -3633,70 +3633,92 @@ export default function App() {
 
                 <div className="mt-4"><CertaintyStrip itens={prop.itens || []} /></div>
 
-                {/* Pesquisa pelo Dwight: só itens sem match ou com match incerto */}
-                <div className="mt-3 flex flex-wrap items-center gap-2 text-[12px]">
-                  <button onClick={() => pesquisarComDwight(false)} disabled={pesqEnviando || !numeroAtual}
-                    className="rounded-lg border border-line2 bg-surface px-3 py-1.5 font-medium text-kist hover:border-kist disabled:opacity-50">
-                    {pesqEnviando ? "Enviando…" : "🔎 pesquisar com o Dwight"}
-                  </button>
-                  {/* v3.78: segundo motor, mesmas regras (fila, cache, retorno na gaveta). */}
-                  <button onClick={() => pesquisarComDwight(false, null, "kistbot")}
-                    disabled={pesqEnviando || !numeroAtual || motores.kistbot === false}
-                    title={motores.kistbot === false
-                      ? "KistBot Dwight aguardando o túnel público (URL vazia no Render)"
-                      : "Pesquisar com o KistBot Dwight — fila própria, mesmas regras do Dwight"}
-                    className="rounded-lg border border-line2 bg-surface px-3 py-1.5 font-medium text-kist hover:border-kist disabled:opacity-50">
-                    🔎 pesquisar com o KistBot Dwight{motores.kistbot === false ? " (aguardando túnel)" : ""}
-                  </button>
-                  {/* v3.82: o relatório da pesquisa — processo, julgamentos e pontos a validar. */}
-                  <button onClick={() => setExtratosAbertos(true)} disabled={!numeroAtual}
-                    className="rounded-lg border border-line2 bg-surface px-3 py-1.5 font-medium text-sub hover:border-kist hover:text-kist disabled:opacity-50">
-                    📋 extrato da pesquisa
-                  </button>
-                  {extratosAbertos && numeroAtual && (
-                    <ExtratosPropostaModal token={token} apiUrl={API} numero={numeroAtual} onClose={() => setExtratosAbertos(false)} />
-                  )}
-                  {(() => {
-                    const n = (prop.itens || []).filter((it) => {
-                      const of = ofertaRecomendada(it);
-                      return of && decidirEscrita(it, of).escreve;
-                    }).length;
-                    if (!n) return null;
-                    return (
-                      <button onClick={() => carregarDwight()}
-                        className="rounded-lg border border-line2 bg-surface px-3 py-1.5 font-medium text-sub hover:border-kist hover:text-kist"
-                        title="Carrega custo e origem: item em branco, ou oferta mais barata que a que está lá">
-                        carregar itens do Dwight ({n})
-                      </button>
-                    );
-                  })()}
-                  {(() => {
-                    const n = (prop.itens || []).filter((it) =>
-                      precisaCarregarDwight(it, ofertaRecomendada(it))).length;
-                    if (!n) return null;
-                    return (
-                      <button onClick={() => carregarDwightComVenda()} disabled={pesqEnviando}
-                        className="rounded-lg border border-line2 bg-surface px-3 py-1.5 font-medium text-sub hover:border-kist hover:text-kist disabled:opacity-50"
-                        title="Carrega custo e origem e preenche a venda com a mediana de lucro praticada (este item com este cliente, depois este item, depois este cliente)">
-                        carregar com venda ({n})
-                      </button>
-                    );
-                  })()}
-                  <label className="flex items-center gap-1.5 text-faint" title="Carrega sozinho quando o resultado chega">
-                    <input type="checkbox" checked={pesqAuto} onChange={(e) => alternarAuto(e.target.checked)} />
-                    preencher sozinho
-                  </label>
-                  {desfazer && (
-                    <button onClick={desfazerDwight} className="text-[11.5px] text-kist hover:underline">desfazer</button>
-                  )}
-                  {pesq.aguardando > 0 && (
-                    <span className="text-sub">
-                      {pesq.aguardando} {pesq.aguardando === 1 ? "item aguardando" : "itens aguardando"} pesquisa
-                      {pesq.na_fila > 0 && ` (${pesq.na_fila} na fila)`}
-                    </span>
-                  )}
-                  {pesqMsg && <span className="text-faint">{pesqMsg}</span>}
+                {/* v3.85 — BARRA DE FERRAMENTAS: dois grupos com rótulo. Pesquisa de preço
+                    (Dwight: só itens sem match ou com match incerto) e Documentos (antes no
+                    topo, onde empilhavam 8 botões). Andamento e mensagens em linha própria. */}
+                <div className="mt-3 flex flex-wrap items-center justify-between gap-x-6 gap-y-2 rounded-xl border border-line bg-surface px-3 py-2.5 text-[12px]">
+                  <div className="flex min-w-0 flex-wrap items-center gap-2">
+                    <span className="eyebrow mr-1 text-[9.5px] font-semibold uppercase text-faint">Pesquisa de preço</span>
+                    <button onClick={() => pesquisarComDwight(false)} disabled={pesqEnviando || !numeroAtual}
+                      className={btnToolKist}>
+                      {pesqEnviando ? "Enviando…" : "🔎 Dwight"}
+                    </button>
+                    {/* v3.78: segundo motor, mesmas regras (fila, cache, retorno na gaveta). */}
+                    <button onClick={() => pesquisarComDwight(false, null, "kistbot")}
+                      disabled={pesqEnviando || !numeroAtual || motores.kistbot === false}
+                      title={motores.kistbot === false
+                        ? "KistBot Dwight aguardando o túnel público (URL vazia no Render)"
+                        : "Pesquisar com o KistBot Dwight — fila própria, mesmas regras do Dwight"}
+                      className={btnToolKist}>
+                      🔎 KistBot Dwight{motores.kistbot === false ? " (aguardando túnel)" : ""}
+                    </button>
+                    {/* v3.82: o relatório da pesquisa — processo, julgamentos e pontos a validar. */}
+                    <button onClick={() => setExtratosAbertos(true)} disabled={!numeroAtual}
+                      className={btnTool}>
+                      📋 extrato
+                    </button>
+                    {extratosAbertos && numeroAtual && (
+                      <ExtratosPropostaModal token={token} apiUrl={API} numero={numeroAtual} onClose={() => setExtratosAbertos(false)} />
+                    )}
+                    {(() => {
+                      const n = (prop.itens || []).filter((it) => {
+                        const of = ofertaRecomendada(it);
+                        return of && decidirEscrita(it, of).escreve;
+                      }).length;
+                      if (!n) return null;
+                      return (
+                        <button onClick={() => carregarDwight()}
+                          className={btnTool}
+                          title="Carrega custo e origem: item em branco, ou oferta mais barata que a que está lá">
+                          carregar itens do Dwight ({n})
+                        </button>
+                      );
+                    })()}
+                    {(() => {
+                      const n = (prop.itens || []).filter((it) =>
+                        precisaCarregarDwight(it, ofertaRecomendada(it))).length;
+                      if (!n) return null;
+                      return (
+                        <button onClick={() => carregarDwightComVenda()} disabled={pesqEnviando}
+                          className={btnTool}
+                          title="Carrega custo e origem e preenche a venda com a mediana de lucro praticada (este item com este cliente, depois este item, depois este cliente)">
+                          carregar com venda ({n})
+                        </button>
+                      );
+                    })()}
+                    <label className="flex items-center gap-1.5 whitespace-nowrap text-faint" title="Carrega sozinho quando o resultado chega">
+                      <input type="checkbox" checked={pesqAuto} onChange={(e) => alternarAuto(e.target.checked)} />
+                      preencher sozinho
+                    </label>
+                    {desfazer && (
+                      <button onClick={desfazerDwight} className="text-[11.5px] text-kist hover:underline">desfazer</button>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="eyebrow mr-1 text-[9.5px] font-semibold uppercase text-faint">Documentos</span>
+                    <DatasheetLote itens={prop.itens || []} token={token} apiUrl={API}
+                      fonteTexto={prop.fonte_texto} onChange={atualizarItem}
+                      propostaId={propostaId} onSalvar={salvarRascunho} modo="tecnico" />
+                    <DatasheetLote itens={prop.itens || []} token={token} apiUrl={API}
+                      fonteTexto={prop.fonte_texto} onChange={atualizarItem}
+                      propostaId={propostaId} onSalvar={salvarRascunho} modo="comercial" />
+                    <DatasheetBaixarTodos itens={prop.itens || []} token={token} apiUrl={API}
+                      modo="tecnico" nomeProposta={prop.proposta || numeroProposta} />
+                    <DatasheetBaixarTodos itens={prop.itens || []} token={token} apiUrl={API}
+                      modo="comercial" nomeProposta={prop.proposta || numeroProposta} />
+                  </div>
                 </div>
+                {(pesq.aguardando > 0 || pesqMsg) && (
+                  <div className="mt-1.5 flex flex-wrap gap-x-3 px-1 text-[11.5px]">
+                    {pesq.aguardando > 0 && (
+                      <span className="text-sub">
+                        {pesq.aguardando} {pesq.aguardando === 1 ? "item aguardando" : "itens aguardando"} pesquisa
+                        {pesq.na_fila > 0 && ` (${pesq.na_fila} na fila)`}
+                      </span>
+                    )}
+                    {pesqMsg && <span className="text-faint">{pesqMsg}</span>}
+                  </div>
+                )}
 
                 {/* Dados da proposta para o Tiny — preenchidos aqui, exportados no CSV */}
                 <div className="mt-4 rounded-xl border border-line bg-surface p-4">
