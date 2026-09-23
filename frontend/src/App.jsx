@@ -874,10 +874,10 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
 
   // "usar esta" da oferta do Dwight: mesmo caminho da ficha da internet — custo e
   // origem entram, venda fica em branco, descrição do cliente não é tocada.
-  // Custo = preço Pix quando houver (é o que o Dwight usa); senão o preço cheio.
+  // Custo = custoDaOferta: Pix quando confiável, senão o cheio (ver pixSuspeito).
   // O frete estimado NÃO entra sozinho: é estimativa, o operador decide.
   function usarOfertaDwight(of) {
-    const preco = of.preco_pix != null ? of.preco_pix : of.preco_cheio;
+    const preco = custoDaOferta(of);
     usarFichaInternet({
       preco_brl: preco, url: of.link || "", fonte: of.loja || "",
       sku: of.sku || "", apresentacao: of.pn || "",
@@ -1581,7 +1581,9 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
                           {linha(rec, k0)}
                           <div className="flex flex-wrap items-center gap-x-1.5 text-[10.5px] text-faint">
                             {rec.estoque && <span>{rec.estoque}</span>}
-                            {rec.preco_cheio != null && rec.preco_pix != null && <span>· cheio {brl(rec.preco_cheio)}</span>}
+                            {rec.preco_cheio != null && rec.preco_pix != null && (pixSuspeito(rec)
+                              ? <span className="text-amber" title="Pix muito abaixo do cheio ou marcado como OCR/outlier: a Cabine usa o cheio">· Pix {brl(rec.preco_pix)} descartado</span>
+                              : <span>· cheio {brl(rec.preco_cheio)}</span>)}
                             {rec.frete != null && <span>· frete est. {brl(rec.frete)}</span>}
                             {rec.prazo && <span>· {rec.prazo}</span>}
                             {jaUsada && <span className="text-signal">· carregada no item</span>}
@@ -1932,9 +1934,21 @@ export function ofertaDwight(it, mapa) {
   return ofertas[r.resultado?.escolha || 0] || null;
 }
 
-// Custo da oferta: Pix quando houver, senão o cheio.
+// Pix suspeito (regra do Leonardo, 23/09 — caso R-1375, Duracell R$ 19,69 × R$ 198,90):
+// Pix mais de 35% abaixo do cheio, OU a oferta avisa OCR/outlier. Desconto de Pix
+// real não chega nisso; é leitura errada. Nesses casos a Cabine usa o CHEIO.
+// Espelho de `_pix_suspeito` no backend — mudou um, mude o outro.
+export const PIX_DIVERGENCIA_MAX = 0.35;
+export function pixSuspeito(of) {
+  const pix = Number(of?.preco_pix), cheio = Number(of?.preco_cheio);
+  if (!(pix > 0) || !(cheio > 0)) return false;
+  if (pix < cheio * (1 - PIX_DIVERGENCIA_MAX)) return true;
+  return /ocr|outlier/i.test(String(of?.obs || ""));
+}
+
+// Custo da oferta: Pix quando houver (e for confiável), senão o cheio.
 export function custoDaOferta(of) {
-  const v = of?.preco_pix != null ? of.preco_pix : of?.preco_cheio;
+  const v = (of?.preco_pix != null && !pixSuspeito(of)) ? of.preco_pix : of?.preco_cheio;
   return v == null ? null : Number(v);
 }
 
@@ -1961,6 +1975,14 @@ export function vendaPelaMediana(custo, fator) {
   const c = Number(custo), f = Number(fator);
   if (!(c > 0) || !(f > 0)) return null;
   return Math.round(c * f * 100) / 100;
+}
+
+// Item que ainda tem o que receber do Dwight: custo/origem (regra de escrita)
+// OU venda em branco sobre um custo que já está lá (v3.83).
+export function precisaCarregarDwight(it, of) {
+  if (!of) return false;
+  if (decidirEscrita(it, of).escreve) return true;
+  return !(Number(it?.preco_un) > 0) && Number(it?.preco_custo) > 0;
 }
 
 // Monta o plano de "carregar itens do Dwight" — SEM tocar em estado do React,
@@ -2016,7 +2038,7 @@ export function planoCarregamentoDwight(itens, mapaPesquisa, markups, uidsFiltro
 // Aplica a oferta: custo e origem. A VENDA não é tocada — a internet é custo,
 // o preço de venda é decisão do operador.
 export function aplicarOfertaDwight(it, of) {
-  const preco = of?.preco_pix != null ? of.preco_pix : of?.preco_cheio;
+  const preco = custoDaOferta(of);
   return {
     ...it,
     ...(preco != null ? { preco_custo: Number(preco) || 0 } : {}),
@@ -2676,33 +2698,43 @@ export default function App() {
     return plano.escrever.length + comVenda;
   }
 
+  // Markup mediano por item (este item com este cliente > este item > este
+  // cliente > geral). Devolve o mapa por item_uid, ou lança erro.
+  async function buscarMarkups(alvos) {
+    const r = await fetch(`${API}/markup-itens`, {
+      method: "POST", headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({
+        cnpj: propostas[propostaIdx]?.cnpj || "",
+        itens: alvos.map((it) => ({
+          k: String(it.item_uid || "").toLowerCase(),
+          banco_id: it.banco_id || null,
+          entrada: it.descricao_original || it.descricao_final || "",
+        })),
+      }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+    return d.itens || {};
+  }
+
   // "carregar com venda": custo e origem do Dwight + venda pela mediana de lucro
-  // praticada (este item com este cliente > este item > este cliente > geral).
-  async function carregarDwightComVenda() {
+  // praticada. Também serve para item que JÁ recebeu o custo do Dwight e ficou
+  // com a venda em branco (antes da v3.83 o "preencher sozinho" não fazia venda).
+  async function carregarDwightComVenda(uidsFiltro = null, silencioso = false) {
     const lista = (propostas[propostaIdx]?.itens) || [];
     const alvos = lista.filter((it) => {
-      const of = ofertaRecomendada(it);
-      return of && decidirEscrita(it, of).escreve;
+      if (uidsFiltro && !uidsFiltro.includes(String(it.item_uid || "").toLowerCase())) return false;
+      return precisaCarregarDwight(it, ofertaRecomendada(it));
     });
-    if (!alvos.length) { setPesqMsg("Nenhuma oferta do Dwight para carregar."); return; }
+    if (!alvos.length) { if (!silencioso) setPesqMsg("Nenhuma oferta do Dwight para carregar."); return; }
     setPesqEnviando(true);
     try {
-      const r = await fetch(`${API}/markup-itens`, {
-        method: "POST", headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify({
-          cnpj: propostas[propostaIdx]?.cnpj || "",
-          itens: alvos.map((it) => ({
-            k: String(it.item_uid || "").toLowerCase(),
-            banco_id: it.banco_id || null,
-            entrada: it.descricao_original || it.descricao_final || "",
-          })),
-        }),
-      });
-      const d = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
-      carregarDwight(null, d.itens || {});
+      const markups = await buscarMarkups(alvos);
+      carregarDwight(uidsFiltro, markups);
     } catch (e) {
-      setPesqMsg(`Carreguei nada: não consegui o markup (${e.message}).`);
+      // Automático: sem markup, o custo e a origem entram mesmo assim (venda em branco).
+      if (silencioso) carregarDwight(uidsFiltro, null);
+      else setPesqMsg(`Carreguei nada: não consegui o markup (${e.message}).`);
     } finally { setPesqEnviando(false); }
   }
 
@@ -2727,13 +2759,14 @@ export default function App() {
       .filter((it) => {
         const uid = String(it.item_uid || "").toLowerCase();
         if (!uid || autoAplicadosRef.current.has(uid)) return false;
-        const of = ofertaDwight(it, pesq.itens);
-        return !!of && decidirEscrita(it, of).escreve;
+        return precisaCarregarDwight(it, ofertaDwight(it, pesq.itens));
       })
       .map((it) => String(it.item_uid).toLowerCase());
     if (!novos.length) return;
     novos.forEach((u) => autoAplicadosRef.current.add(u));
-    carregarDwight(novos);
+    // v3.83: o automático também preenche a VENDA (custo × mediana), igual ao
+    // "carregar com venda". Falhou o markup? custo e origem entram, venda em branco.
+    carregarDwightComVenda(novos, true);
   }, [pesq.itens, pesqAuto, propostaIdx]);
 
   async function pesquisarComDwight(forcar = false, itemUids = null, motor = "dwight") {
@@ -3564,13 +3597,11 @@ export default function App() {
                     );
                   })()}
                   {(() => {
-                    const n = (prop.itens || []).filter((it) => {
-                      const of = ofertaRecomendada(it);
-                      return of && decidirEscrita(it, of).escreve;
-                    }).length;
+                    const n = (prop.itens || []).filter((it) =>
+                      precisaCarregarDwight(it, ofertaRecomendada(it))).length;
                     if (!n) return null;
                     return (
-                      <button onClick={carregarDwightComVenda} disabled={pesqEnviando}
+                      <button onClick={() => carregarDwightComVenda()} disabled={pesqEnviando}
                         className="rounded-lg border border-line2 bg-surface px-3 py-1.5 font-medium text-sub hover:border-kist hover:text-kist disabled:opacity-50"
                         title="Carrega custo e origem e preenche a venda com a mediana de lucro praticada (este item com este cliente, depois este item, depois este cliente)">
                         carregar com venda ({n})
