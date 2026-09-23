@@ -57,6 +57,13 @@ IMG_MIN_ALTURA = 12
 IMG_MIN_LARGURA = 40
 IMG_MIN_AREA = 1500
 TEXTO_MAX_CHARS = 120000    # o corpo NUNCA é cortado antes disto
+# v3.87 — PDF sem camada de texto (digitalizado) vai INTEIRO para a IA, que lê a
+# imagem das páginas. Caso Thiago, 23/09 (Construcap BR-040): 4 RIMs escaneadas,
+# 0 caracteres de texto; a extração devolvia "abra os PDFs à mão".
+PDF_VISUAL_MIN_CHARS = 30         # abaixo disto o texto extraído não é a cotação
+PDF_VISUAL_MAX_N = 8              # PDFs por extração
+PDF_VISUAL_MAX_BYTES = 10_000_000 # por PDF (o pedido inteiro tem teto de 32 MB na API)
+PDF_VISUAL_MAX_TOTAL = 24_000_000
 IMG_MAX_LADO_API = 7900     # a API recusa imagem com lado maior que 8000 px
 IMG_MAX_BYTES_API = 3_700_000   # 5 MB por imagem depois do base64 (que infla 4/3)
 IMG_LADO_REDUZIDO = 2000    # a API já reduz tudo para ~1568 px; nada se perde
@@ -280,6 +287,11 @@ class Documento:
     def imagens(self, incluir_citado=True):
         return [b for b in self.blocos if b.tipo == "imagem"
                 and (incluir_citado or not b.citado)]
+
+    def pdfs_visuais(self):
+        """Anexos PDF sem texto que vão como documento para leitura visual."""
+        return [b for b in self.blocos if b.tipo == "anexo"
+                and (b.meta or {}).get("pdf_visual") and b.dados]
 
     def cabecalho(self):
         p = []
@@ -569,6 +581,33 @@ def _encaixar_imagens(blocos, imagens_por_cid, imagens_soltas):
     return limpos
 
 
+def _bloco_anexo(nome, kind, dados, conversores, limite_txt=20000):
+    """Anexo (não imagem) → Bloco. Um lugar só para .eml, .msg e arquivo solto.
+
+    PDF cujo texto extraído não chega a PDF_VISUAL_MIN_CHARS é digitalizado (ou
+    grande demais para o conversor): o bloco guarda os BYTES e é marcado
+    `pdf_visual` — `montar_payload` manda o PDF inteiro para a IA ler a imagem.
+    """
+    conv = (conversores or {}).get(kind)
+    txt, falhou = "", False
+    if conv:
+        try:
+            txt = conv(dados) or ""
+        except Exception as e:
+            txt, falhou = f"(não consegui ler este anexo: {type(e).__name__})", True
+    if kind == "texto" and not txt:
+        txt = decodificar(dados)[:limite_txt]
+    meta = {"kind": kind, "bytes": len(dados)}
+    if kind == "pdf" and (falhou or len(re.sub(r"\s+", "", txt)) < PDF_VISUAL_MIN_CHARS):
+        meta["pdf_visual"] = True
+        return Bloco("anexo", nome=nome, dados=dados, meta=meta, texto=(
+            "(PDF sem texto — digitalizado. Vai anexado a esta mensagem como "
+            "documento: leia os itens pela imagem das páginas.)"))
+    if not txt:
+        txt = "(anexo não convertido — o operador precisa abrir à mão)"
+    return Bloco("anexo", texto=txt[:40000], nome=nome, meta=meta)
+
+
 def ler_email(bruto, conversores=None):
     """bytes de .eml → Documento. `conversores` = {'pdf': f(bytes)->str,
     'planilha': f(bytes)->str, 'word': f(bytes)->str} (opcionais)."""
@@ -638,19 +677,7 @@ def ler_email(bruto, conversores=None):
     # corpo a contexto que esvaziou a proposta da Universal (NEG-0040613) e
     # fez o PDF cadastral sequestrar o RC 60938.
     for nome, kind, dados in anexos:
-        conv = conversores.get(kind)
-        txt = ""
-        if conv:
-            try:
-                txt = conv(dados) or ""
-            except Exception as e:
-                txt = f"(não consegui ler este anexo: {type(e).__name__})"
-        if kind == "texto" and not txt:
-            txt = decodificar(dados)[:20000]
-        if not txt:
-            txt = "(anexo não convertido — o operador precisa abrir à mão)"
-        blocos.append(Bloco("anexo", texto=txt[:40000], nome=nome,
-                            meta={"kind": kind, "bytes": len(dados)}))
+        blocos.append(_bloco_anexo(nome, kind, dados, conversores))
 
     return Documento(origem=cab("Subject"), remetente=cab("From"),
                      destinatario=cab("To"), data=cab("Date"), blocos=blocos)
@@ -714,19 +741,7 @@ def ler_msg(bruto, conversores=None, tmp_dir="/tmp"):
         blocos = html_para_blocos(html) if html.strip() else texto_para_blocos(corpo)
         blocos = _encaixar_imagens(blocos, img_cid, img_soltas)
         for nome, kind, dados in anexos:
-            conv = conversores.get(kind)
-            txt = ""
-            if conv:
-                try:
-                    txt = conv(dados) or ""
-                except Exception as e:
-                    txt = f"(não consegui ler este anexo: {type(e).__name__})"
-            if kind == "texto" and not txt:
-                txt = decodificar(dados)[:20000]
-            if not txt:
-                txt = "(anexo não convertido — o operador precisa abrir à mão)"
-            blocos.append(Bloco("anexo", texto=txt[:40000], nome=nome,
-                                meta={"kind": kind, "bytes": len(dados)}))
+            blocos.append(_bloco_anexo(nome, kind, dados, conversores))
 
         return Documento(origem=(getattr(m, "subject", "") or "").strip(),
                          remetente=(getattr(m, "sender", "") or "").strip(),
@@ -760,17 +775,8 @@ def documento_de_arquivo(nome, dados, conversores=None):
         return Documento(origem=nome, blocos=[Bloco(
             "imagem", nome=nome, dados=dados,
             meta={"largura": w, "altura": h, "bytes": len(dados)})])
-    conv = conversores.get(kind)
-    txt = ""
-    if conv:
-        try:
-            txt = conv(dados) or ""
-        except Exception as e:
-            txt = f"(não consegui ler: {type(e).__name__})"
-    if not txt and kind == "texto":
-        txt = decodificar(dados)[:40000]
-    return Documento(origem=nome, blocos=[Bloco("anexo", texto=txt or "", nome=nome,
-                                                meta={"kind": kind})])
+    return Documento(origem=nome, blocos=[
+        _bloco_anexo(nome, kind, dados, conversores, limite_txt=40000)])
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -865,7 +871,32 @@ def montar_payload(documentos, texto_extra="", max_imgs=IMG_MAX_N,
             "type": "base64", "media_type": media_type(b.dados),
             "data": base64.standard_b64encode(b.dados).decode()}})
 
+    # ── PDFs digitalizados: vão inteiros, como documento ─────────────────
+    # A API lê a imagem de cada página. Teto por quantidade e por bytes (o
+    # pedido inteiro tem limite de 32 MB); o que passa vira nota ao operador.
+    pdf_env, pdf_cort, pdf_bytes, pdf_nomes = 0, [], 0, []
+    for doc in documentos:
+        for b in doc.pdfs_visuais():
+            if (pdf_env >= PDF_VISUAL_MAX_N or len(b.dados) > PDF_VISUAL_MAX_BYTES
+                    or pdf_bytes + len(b.dados) > PDF_VISUAL_MAX_TOTAL):
+                pdf_cort.append(b.nome)
+                continue
+            pdf_env += 1
+            pdf_bytes += len(b.dados)
+            pdf_nomes.append(b.nome)
+            content.append({"type": "text", "text": (
+                f"[PDF {pdf_env} — {b.nome} — digitalizado, sem texto: leia os itens "
+                "pela imagem das páginas. Código, quantidade e unidade exatamente como "
+                "estão escritos; o que não der para ler com segurança, marque na "
+                "descrição em vez de adivinhar.]")})
+            content.append({"type": "document", "source": {
+                "type": "base64", "media_type": "application/pdf",
+                "data": base64.standard_b64encode(b.dados).decode()}})
+
     relatorio = {
+        "pdfs_visuais": pdf_env,
+        "pdfs_visuais_nomes": pdf_nomes,
+        "pdfs_visuais_cortados": pdf_cort,
         "documentos": len(documentos),
         "chars_texto": len(texto_final),
         "imagens_enviadas": len(sel),

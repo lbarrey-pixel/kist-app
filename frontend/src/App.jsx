@@ -3534,6 +3534,8 @@ export default function App() {
                                 : nt.tipo === "imagem_recuperada"  ? "Imagem corrompida no e-mail — li o que abriu"
                                 : nt.tipo === "imagem_ilegivel"    ? "Imagem que não abriu ficou de fora"
                                 : nt.tipo === "anexo_redundante"   ? "Anexo repetido — usei o corpo do e-mail"
+                                : nt.tipo === "pdf_visual"         ? "PDF digitalizado — lido pela imagem, confira"
+                                : nt.tipo === "pdf_visual_cortado" ? "PDF digitalizado ficou de fora"
                                 : "Aviso da leitura"}
                             </div>
                             <div className="mt-0.5 text-[12.5px] leading-relaxed text-sub">{nt.mensagem}</div>

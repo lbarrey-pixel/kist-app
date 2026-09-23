@@ -101,8 +101,8 @@ import hashlib as _hashlib_ext
 import unicodedata
 from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_ext
 
-# v3.86 — só frontend (reorganização visual da proposta e da lista); o número sobe para o deploy ser conferível.
-VERSAO_BACKEND = "3.86"
+# v3.87 — PDF digitalizado (sem texto) vai inteiro para a IA ler pela imagem (caso Thiago, Construcap BR-040, 23/09).
+VERSAO_BACKEND = "3.87"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -874,6 +874,9 @@ def _hash_conteudo(msg_content: list, modelo: str) -> str:
         elif t == "image":
             src = b.get("source") or {}
             h.update(b"I"); h.update((src.get("data") or "").encode())
+        elif t == "document":   # v3.87 — PDF digitalizado lido pela imagem
+            src = b.get("source") or {}
+            h.update(b"D"); h.update((src.get("data") or "").encode())
     return h.hexdigest()
 
 
@@ -4515,6 +4518,8 @@ def _extrair_nucleo(sb, usuario, numero_proposta, so_rastreavel, ignorar_cache,
         # 91% das cotações reais trazem imagem embutida — quem manda no modelo é
         # o DOCUMENTO, não a contagem antiga de anexos soltos.
         todas_imgs_len = sum(len(d.imagens()) for d in documentos)
+        # v3.87 — PDF digitalizado é imagem para a IA: vai pelo Sonnet também.
+        todas_imgs_len += sum(len(d.pdfs_visuais()) for d in documentos)
     modelo_extracao = "claude-sonnet-4-6" if todas_imgs_len > 0 else "claude-haiku-4-5-20251001"
     claude = get_claude()
 
@@ -4589,16 +4594,17 @@ def _extrair_nucleo(sb, usuario, numero_proposta, so_rastreavel, ignorar_cache,
         return _chamar_com_content(msg_content)
 
     def _erro_de_imagem(e) -> bool:
-        """400 da API por causa de imagem (corrompida, formato, tamanho)."""
+        """400 da API por causa de imagem ou PDF (corrompido, formato, tamanho)."""
         m = str(e).lower()
-        return "image" in m and ("400" in m or "invalid_request" in m)
+        return (("image" in m or "pdf" in m or "document" in m)
+                and ("400" in m or "invalid_request" in m))
 
     def _content_sem_imagens(content):
-        """O mesmo pedido sem as imagens e sem os rótulos delas."""
-        fora = ("[IMAGEM ", "Seguem as ")
+        """O mesmo pedido sem as imagens/PDFs e sem os rótulos deles."""
+        fora = ("[IMAGEM ", "Seguem as ", "[PDF ")
         return [c for c in (content or [])
                 if not (isinstance(c, dict) and (
-                    c.get("type") == "image"
+                    c.get("type") in ("image", "document")
                     or (c.get("type") == "text" and str(c.get("text", "")).startswith(fora))))]
 
     def _chamar_com_content(msg_content):
@@ -4710,6 +4716,26 @@ def _extrair_nucleo(sb, usuario, numero_proposta, so_rastreavel, ignorar_cache,
         # e para decidir isso ele precisa ver o pedido inteiro de uma vez.
         _content, _rel_ing = _ing_montar_payload(documentos, texto_extra=(texto or ""))
         propostas_raw.extend(_chamar_com_content(_content))
+        # v3.87 — PDF digitalizado foi lido pela imagem: é leitura visual (tipo
+        # OCR) e pode errar dígito. O operador confere contra o PDF.
+        if _rel_ing.get("pdfs_visuais"):
+            _n = _rel_ing["pdfs_visuais"]
+            notas_extracao.append({
+                "tipo": "pdf_visual", "arquivo": ", ".join(_rel_ing.get("pdfs_visuais_nomes") or []),
+                "mensagem": (f"{_n} PDF{'s' if _n > 1 else ''} digitalizado{'s' if _n > 1 else ''} "
+                             f"(sem texto) {'foram lidos' if _n > 1 else 'foi lido'} pela imagem "
+                             f"das páginas. Confira códigos e quantidades contra o PDF."),
+                "exclusivos": [],
+            })
+        if _rel_ing.get("pdfs_visuais_cortados"):
+            _c = _rel_ing["pdfs_visuais_cortados"]
+            notas_extracao.append({
+                "tipo": "pdf_visual_cortado", "arquivo": ", ".join(_c),
+                "mensagem": (f"{len(_c)} PDF(s) digitalizado(s) ficaram de fora da leitura "
+                             f"(grandes demais ou além do limite por extração): "
+                             f"{', '.join(_c[:6])}. Envie esses separados."),
+                "exclusivos": list(_c[:40]),
+            })
         if _rel_ing.get("imagens_recuperadas"):
             notas_extracao.append({
                 "tipo": "imagem_recuperada", "arquivo": "",

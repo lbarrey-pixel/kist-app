@@ -1,4 +1,4 @@
-# Kist Cabine: versionamento v3.59 a v3.86
+# Kist Cabine: versionamento v3.59 a v3.87
 
 Atualizado em 23/09/2026. Continua o histórico até a v3.58 que está no núcleo do Analista (`config_kist['capacidades_nucleo']`).
 
@@ -199,6 +199,14 @@ Versões que não têm commit próprio: **v3.69** está dentro de bcd73d0 (v3.70
 - Dados: `mercado_observacoes` 146 e 272 (Pix de OCR de 19,40 e 19,69) ficaram sem preço (backup `_bkp_20260923_mercado_observacoes`). R-1375: o Duracell ficou com custo 198,90 e venda 331,37, confirmados pelo Leonardo (backup `_bkp_20260923_itens_r1375`).
 - Propostas antigas com custo tirado de oferta divergente (vão aparecer com o aviso no card): 1050902 (terrômetro, 4.333,26), 1050903 (estilete, trena 19,27, torquês, chave ajustável 74,79), 1051007 e 1051012.
 
+## v3.87 · 23/09 · PDF digitalizado é lido pela imagem
+- **Caso** (Thiago, 23/09): e-mail da Construcap (Consórcio BR-040) com 4 PDFs — RIM 1212, RIM 1214, 0617_001 e Requisição 1084. Todos DIGITALIZADOS: 0 caracteres na camada de texto. O leitor de PDF (`_pdf_po_texto`, pdfplumber) só extrai texto, então cada anexo virava "(anexo não convertido — o operador precisa abrir à mão)" e a IA devolvia um item-placeholder ("Itens não extraídos…", R-1394). Mandando o PDF sozinho, o conteúdo ia vazio e a extração quebrava com `JSONDecodeError` (R-1390 a R-1392).
+- [B] `ingestao.py`: um só construtor de bloco de anexo (`_bloco_anexo`) para `.eml`, `.msg` e arquivo solto (antes o mesmo código em 3 lugares). PDF com menos de `PDF_VISUAL_MIN_CHARS` (30) caracteres úteis — ou que o conversor não leu, ou maior que `_PDF_MAX_BYTES` — fica marcado `pdf_visual` e guarda os bytes.
+- [B] `montar_payload`: PDF `pdf_visual` vai INTEIRO para a IA como bloco `document` (a API lê a imagem de cada página), com rótulo pedindo código/quantidade/unidade exatamente como escritos e sem adivinhar o ilegível. Tetos: 8 PDFs por extração, 10 MB cada, 24 MB no total (a API aceita 32 MB por pedido). O relatório ganha `pdfs_visuais`, `pdfs_visuais_nomes` e `pdfs_visuais_cortados`.
+- [B] `main.py`: PDF visual conta como imagem na escolha do modelo (Sonnet); o hash do cache inclui o `document`; a rede de segurança da v3.62 também cobre PDF recusado pela API (refaz só com o texto e avisa). Notas novas ao operador: `pdf_visual` ("lido pela imagem — confira códigos e quantidades") e `pdf_visual_cortado`.
+- [F] Rótulos das duas notas novas.
+- Sem mudança de regra de negócio: a quebra em propostas continua pela regra de DESTINO. ⚠ O cliente pediu "uma proposta para cada documento" — levado ao Leonardo.
+
 ## v3.86 · 23/09 · Reorganização visual: proposta, itens e lista
 Decisão de layout delegada pelo Leonardo (23/09: "decida como um designer profissional"). Nenhuma regra de negócio mudou; só lugar, agrupamento e rótulo.
 - [F] **Largura**: a tela da proposta e a lista de Propostas passam de `max-w-5xl` (1024px) para `max-w-6xl` (1152px). O espaço já existia e ficava vazio dos lados.
@@ -216,7 +224,7 @@ Decisão de layout delegada pelo Leonardo (23/09: "decida como um designer profi
 
 ---
 
-## ROTAS NOVAS OU ALTERADAS v3.59–v3.86
+## ROTAS NOVAS OU ALTERADAS v3.59–v3.87
 
 | Método e rota | Para que serve | Versão |
 |---|---|---|
@@ -271,6 +279,7 @@ Decisão de layout delegada pelo Leonardo (23/09: "decida como um designer profi
 | POST /propostas/exportar-tiny/previa | `pontos_a_validar` | v3.82 |
 | POST /propostas/{ref}/pesquisa-resultado | anula Pix suspeito (`preco_pix_descartado`) | v3.83 |
 | POST /propostas/{ref}/pesquisa-resultado | marca `preco_divergente` e guarda os dois preços | v3.84 |
+| POST /extrair | PDF digitalizado vai como documento para leitura visual | v3.87 |
 
 ## REGRAS DE NEGÓCIO NOVAS
 
@@ -313,6 +322,7 @@ Decisão de layout delegada pelo Leonardo (23/09: "decida como um designer profi
 | Pix e cheio divergentes (mais de 35%, ou OCR/outlier) não carregam custo nem venda sozinhos: o operador escolhe no card | v3.84 |
 | O auto-save sempre grava a última edição; save com erro continua pendente | v3.84 |
 | O login da Cabine vale em todas as abas do navegador (localStorage) | v3.85 |
+| PDF digitalizado (sem texto) é lido pela imagem das páginas e o operador é avisado para conferir | v3.87 |
 
 ## Objetos de banco usados pela primeira vez neste intervalo (todos existem no Supabase, conferido em 23/09)
 
