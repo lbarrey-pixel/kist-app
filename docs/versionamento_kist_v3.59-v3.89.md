@@ -1,4 +1,4 @@
-# Kist Cabine: versionamento v3.59 a v3.88
+# Kist Cabine: versionamento v3.59 a v3.89
 
 Atualizado em 23/09/2026. Continua o histórico até a v3.58 que está no núcleo do Analista (`config_kist['capacidades_nucleo']`).
 
@@ -199,6 +199,10 @@ Versões que não têm commit próprio: **v3.69** está dentro de bcd73d0 (v3.70
 - Dados: `mercado_observacoes` 146 e 272 (Pix de OCR de 19,40 e 19,69) ficaram sem preço (backup `_bkp_20260923_mercado_observacoes`). R-1375: o Duracell ficou com custo 198,90 e venda 331,37, confirmados pelo Leonardo (backup `_bkp_20260923_itens_r1375`).
 - Propostas antigas com custo tirado de oferta divergente (vão aparecer com o aviso no card): 1050902 (terrômetro, 4.333,26), 1050903 (estilete, trena 19,27, torquês, chave ajustável 74,79), 1051007 e 1051012.
 
+## v3.89 · 23/09 · Login renova sozinho também depois de recarregar a página
+- [F] O token do Google vale 1 h. A renovação silenciosa (5 min antes de vencer) só era agendada no login por CLIQUE. Quem voltava com o token guardado — refresh, aba nova; mais comum desde a v3.85 — passava da 1 h com a tela parecendo logada e toda chamada dando **401**. Agora um efeito em `[token]` agenda a renovação a partir de qualquer token ativo. Achado no teste da v3.87 (token restaurado às 13:06, vencido às 14:06, extração recusada com 401).
+- [B] Só `VERSAO_BACKEND` = 3.89.
+
 ## v3.88 · 23/09 · Acerto de cache da pesquisa grava o motor do botão
 - **Caso** (23/09): R-1393, alicate decapador 7" (item `26d16dbf…`), já pesquisado pelo KistBot Dwight na R-1384 às 15:27 UTC. O botão do KistBot Dwight dava HTTP 500 e nada era gravado. O mesmo aconteceu na R-1389 e, em 22/09, no redisparo parcial da R-1364 (anel hid0019).
 - **Causa**: em `_disparar_pesquisa`, a linha copiada do cache (`origem='cache'`) não tinha a chave `motor`, e a linha da fila tinha. O insert em lote do PostgREST junta as chaves de todas as linhas, então a linha do cache ia com `motor` NULL explícito e o Postgres recusava o lote inteiro (23502, a coluna é NOT NULL). Num lote só de cache, a coluna caía no default `'dwight'`: não dava erro, mas o motor ficava errado quando o botão era o do KistBot.
@@ -211,7 +215,8 @@ Versões que não têm commit próprio: **v3.69** está dentro de bcd73d0 (v3.70
 - [B] `montar_payload`: PDF `pdf_visual` vai INTEIRO para a IA como bloco `document` (a API lê a imagem de cada página), com rótulo pedindo código/quantidade/unidade exatamente como escritos e sem adivinhar o ilegível. Tetos: 8 PDFs por extração, 10 MB cada, 24 MB no total (a API aceita 32 MB por pedido). O relatório ganha `pdfs_visuais`, `pdfs_visuais_nomes` e `pdfs_visuais_cortados`.
 - [B] `main.py`: PDF visual conta como imagem na escolha do modelo (Sonnet); o hash do cache inclui o `document`; a rede de segurança da v3.62 também cobre PDF recusado pela API (refaz só com o texto e avisa). Notas novas ao operador: `pdf_visual` ("lido pela imagem — confira códigos e quantidades") e `pdf_visual_cortado`.
 - [F] Rótulos das duas notas novas.
-- Sem mudança de regra de negócio: a quebra em propostas continua pela regra de DESTINO. ⚠ O cliente pediu "uma proposta para cada documento" — levado ao Leonardo.
+- Sem mudança de regra de negócio: a quebra em propostas continua pela regra de DESTINO.
+- **Teste real** (produção, 23/09, o `.msg` do Thiago): 4 propostas e 55 itens — RIM 1212 (3), RIM 1121/0617_001 (2), RIM 1214 (37), RIM 1084 (13). A IA seguiu o pedido do cliente de "uma proposta para cada documento". Conferido contra o PDF: RIM 1212 3/3; RIM 1214 36/37 — o item 7 (arruela Ø1.1/4") saiu 38, o PDF diz **36** (erro de leitura da imagem; é o caso que a nota `pdf_visual` manda conferir). Tempo: 2 min 10 s.
 
 ## v3.86 · 23/09 · Reorganização visual: proposta, itens e lista
 Decisão de layout delegada pelo Leonardo (23/09: "decida como um designer profissional"). Nenhuma regra de negócio mudou; só lugar, agrupamento e rótulo.
@@ -230,7 +235,7 @@ Decisão de layout delegada pelo Leonardo (23/09: "decida como um designer profi
 
 ---
 
-## ROTAS NOVAS OU ALTERADAS v3.59–v3.88
+## ROTAS NOVAS OU ALTERADAS v3.59–v3.89
 
 | Método e rota | Para que serve | Versão |
 |---|---|---|

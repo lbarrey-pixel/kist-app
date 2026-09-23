@@ -2395,20 +2395,29 @@ export default function App() {
       localStorage.setItem("kist_token", credential);
       localStorage.setItem("kist_user", JSON.stringify(user));
     } catch (e) {}
-    // Renovar token ~5min antes de expirar (sem interação do usuário)
-    const renovarEm = payload.exp * 1000 - Date.now() - 5 * 60 * 1000;
-    if (renovarEm > 0) {
-      setTimeout(() => {
-        if (window.google) {
-          window.google.accounts.id.initialize({
-            client_id: GOOGLE_CLIENT_ID, callback: handleGoogleResponse,
-            ux_mode: "popup", auto_select: true,
-          });
-          window.google.accounts.id.prompt(() => {});
-        }
-      }, renovarEm);
-    }
   }
+
+  // Renovar o token ~5 min antes de vencer, sem interação do usuário.
+  // v3.87 — agendado a partir de QUALQUER token ativo (efeito em [token]). Antes só
+  // o login por clique agendava; quem voltava com o token guardado (refresh, aba
+  // nova — mais comum desde a v3.85) passava da 1 h com a tela "logada" e toda
+  // chamada dando 401.
+  useEffect(() => {
+    if (!token) return;
+    let exp = 0;
+    try { exp = decodeJwtPayload(token).exp * 1000; } catch { return; }
+    const renovarEm = Math.max(exp - Date.now() - 5 * 60 * 1000, 5000);
+    const t = setTimeout(() => {
+      if (window.google && GOOGLE_CLIENT_ID) {
+        window.google.accounts.id.initialize({
+          client_id: GOOGLE_CLIENT_ID, callback: handleGoogleResponse,
+          ux_mode: "popup", auto_select: true,
+        });
+        window.google.accounts.id.prompt(() => {});
+      }
+    }, renovarEm);
+    return () => clearTimeout(t);
+  }, [token]);
 
   function renderBotaoGoogle(el) {
     if (!el || !window.google || !GOOGLE_CLIENT_ID) return;

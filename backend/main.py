@@ -103,7 +103,8 @@ from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_
 
 # v3.87 — PDF digitalizado (sem texto) vai inteiro para a IA ler pela imagem (caso Thiago, Construcap BR-040, 23/09).
 # v3.88 — acerto de cache da pesquisa grava o motor do botão (KistBot Dwight dava 500 na R-1393).
-VERSAO_BACKEND = "3.88"
+# v3.89 — só frontend (renovação do login para token restaurado); o número sobe para o deploy ser conferível.
+VERSAO_BACKEND = "3.89"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
