@@ -1288,7 +1288,11 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
               </div>
             )}
 
-            <div className="grid gap-3 md:grid-cols-2">
+            {/* v3.85 — items-start: cada card do banco fica do tamanho do conteúdo.
+                A coluna da internet é presa na coluna 2, desde a linha 1, ocupando as
+                duas linhas (o "procurar outro no banco" é forçado na coluna 1 e abria
+                uma 2ª linha: a internet caía nela, desalinhada do card do banco). */}
+            <div className="grid gap-3 md:grid-cols-2 md:items-start">
 
               {/* ── BANCO (esquerda) ── */}
               {item.banco ? (
@@ -1489,9 +1493,12 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
               </div>
 
               {/* ── INTERNET (direita) ── */}
-              <div>
+              {/* v3.85 — coluna em flex: o card do Dwight fica em cima e a caixa da
+                  internet ocupa SÓ o que sobra (flex-1). Antes a caixa tinha h-full
+                  (100% da coluna) embaixo do card e vazava por cima do item seguinte. */}
+              <div className="flex min-w-0 flex-col gap-2 md:col-start-2 md:row-span-2 md:row-start-1 md:self-stretch">
                 {(dwight || onPesquisarItem) && (
-                  <div className="mb-2 rounded-lg border border-line2 bg-surface px-3 py-2">
+                  <div className="rounded-lg border border-line2 bg-surface px-3 py-2">
                     <div className="flex items-center justify-between gap-2">
                       <div className="eyebrow text-[9px] font-semibold uppercase text-faint">{dwight?.motor === "kistbot" ? "KistBot Dwight" : "Dwight"}</div>
                       <div className="flex items-center gap-2">
@@ -1624,7 +1631,7 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
                 )}
 
                 {netLoad && (
-                  <div className="flex h-full items-center rounded-lg border border-line2 bg-surface px-3 py-2.5 text-[12px] text-sub">
+                  <div className="flex flex-1 items-center rounded-lg border border-line2 bg-surface px-3 py-2.5 text-[12px] text-sub">
                     Buscando preço na internet…
                   </div>
                 )}
@@ -1640,7 +1647,7 @@ function ItemRow({ item, index, onChange, onRemove, token, apiUrl, fonteTexto, c
                 )}
 
                 {!netLoad && !net && !netErr && !netBuscadoRef.current && (
-                  <div className="flex h-full flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-line2 bg-surface p-3 text-center">
+                  <div className="flex flex-1 flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-line2 bg-surface p-3 text-center">
                     <div className="text-[12px] text-faint">Referência de mercado na internet</div>
                     <button onClick={() => { netBuscadoRef.current = true; buscarInternet(); }}
                       className="rounded-md border border-line2 px-2.5 py-1 text-[11px] font-medium text-kist hover:border-kist">
@@ -2198,8 +2205,8 @@ function propagarLastro(lista, idxOrigem) {
 
 
 export default function App() {
-  // Sessão persistida em sessionStorage: sobrevive a refresh/deploy,
-  // limpa ao fechar a aba. auto_select no Google reconecta silenciosamente
+  // Sessão persistida em localStorage (v3.85): vale em todas as abas e sobrevive
+  // a refresh/deploy; token vencido é descartado. auto_select no Google reconecta silenciosamente
   // na maioria dos casos sem interação do usuário.
   const [propostaId, setPropostaId]     = useState(null);   // DB id após primeiro save
   const [salvando,   setSalvando]       = useState(false);  // indicator de auto-save
@@ -2209,23 +2216,23 @@ export default function App() {
 
   const [token, setToken] = useState(() => {
     try {
-      const cred = sessionStorage.getItem("kist_token");
+      const cred = localStorage.getItem("kist_token");
       if (!cred) return null;
       const p = decodeJwtPayload(cred);
-      if (p.exp * 1000 < Date.now()) { sessionStorage.removeItem("kist_token"); return null; }
+      if (p.exp * 1000 < Date.now()) { localStorage.removeItem("kist_token"); return null; }
       // Defesa em profundidade: token de e-mail não autorizado não restaura sessão.
       if (!emailAutorizado(p.email)) {
-        sessionStorage.removeItem("kist_token"); sessionStorage.removeItem("kist_user"); return null;
+        localStorage.removeItem("kist_token"); localStorage.removeItem("kist_user"); return null;
       }
       return cred;
     } catch { return null; }
   });
   const [usuario, setUsuario] = useState(() => {
     try {
-      const u = sessionStorage.getItem("kist_user");
+      const u = localStorage.getItem("kist_user");
       if (!u) return null;
       const parsed = JSON.parse(u);
-      if (!emailAutorizado(parsed?.email)) { sessionStorage.removeItem("kist_user"); return null; }
+      if (!emailAutorizado(parsed?.email)) { localStorage.removeItem("kist_user"); return null; }
       return parsed;
     } catch { return null; }
   });
@@ -2369,7 +2376,7 @@ export default function App() {
     // ── Trava de acesso: só e-mails autorizados entram ──────────────────────
     if (!emailAutorizado(payload.email)) {
       try { if (window.google) window.google.accounts.id.disableAutoSelect(); } catch (e) {}
-      try { sessionStorage.removeItem("kist_token"); sessionStorage.removeItem("kist_user"); } catch (e) {}
+      try { localStorage.removeItem("kist_token"); localStorage.removeItem("kist_user"); } catch (e) {}
       setToken(null); setUsuario(null);
       setAuthErro(`Acesso negado para ${payload.email || "esta conta"}. Este sistema é restrito à equipe Kist.`);
       return;
@@ -2378,10 +2385,10 @@ export default function App() {
     const user = { nome: payload.name, email: payload.email, foto: payload.picture };
     setToken(credential);
     setUsuario(user);
-    // Persistir na aba atual — sobrevive a refresh/deploy do Render
+    // Persistir para todas as abas (v3.85) — sobrevive a refresh/deploy do Render
     try {
-      sessionStorage.setItem("kist_token", credential);
-      sessionStorage.setItem("kist_user", JSON.stringify(user));
+      localStorage.setItem("kist_token", credential);
+      localStorage.setItem("kist_user", JSON.stringify(user));
     } catch (e) {}
     // Renovar token ~5min antes de expirar (sem interação do usuário)
     const renovarEm = payload.exp * 1000 - Date.now() - 5 * 60 * 1000;
@@ -2410,7 +2417,7 @@ export default function App() {
   }
 
   function logout() {
-    try { sessionStorage.removeItem("kist_token"); sessionStorage.removeItem("kist_user"); } catch (e) {}
+    try { localStorage.removeItem("kist_token"); localStorage.removeItem("kist_user"); } catch (e) {}
     // Cancelar auto_select para não logar de volta imediatamente após logout explícito
     try { if (window.google) window.google.accounts.id.disableAutoSelect(); } catch (e) {}
     setUsuario(null); setToken(null); setStep("input"); setResultado(null);

@@ -1,4 +1,4 @@
-# Kist Cabine: versionamento v3.59 a v3.84
+# Kist Cabine: versionamento v3.59 a v3.85
 
 Atualizado em 23/09/2026. Continua o histórico até a v3.58 que está no núcleo do Analista (`config_kist['capacidades_nucleo']`).
 
@@ -199,9 +199,14 @@ Versões que não têm commit próprio: **v3.69** está dentro de bcd73d0 (v3.70
 - Dados: `mercado_observacoes` 146 e 272 (Pix de OCR de 19,40 e 19,69) ficaram sem preço (backup `_bkp_20260923_mercado_observacoes`). R-1375: o Duracell ficou com custo 198,90 e venda 331,37, confirmados pelo Leonardo (backup `_bkp_20260923_itens_r1375`).
 - Propostas antigas com custo tirado de oferta divergente (vão aparecer com o aviso no card): 1050902 (terrômetro, 4.333,26), 1050903 (estilete, trena 19,27, torquês, chave ajustável 74,79), 1051007 e 1051012.
 
+## v3.85 · 23/09 · Gaveta do item não vaza mais; login vale em todas as abas
+- [F] **Gaveta "motor de preços" quebrava o card** (problema antigo, desde que o card do Dwight entrou na coluna da internet, v3.61). A caixa "Referência de mercado na internet" / "Buscando preço…" tinha `h-full` (100% da coluna) e ficava EMBAIXO do card do Dwight: sobrava a altura do card, que vazava por cima do item seguinte. Além disso, o "procurar outro no banco" é forçado na coluna 1 e abria uma 2ª linha na grade; a coluna da internet caía nessa linha, desalinhada do card do banco. Correção: coluna da internet em `flex flex-col gap-2` com a caixa em `flex-1`, presa em `md:col-start-2 md:row-start-1 md:row-span-2`; grade em `md:items-start`. Visto e testado na R-1375, item 03.
+- [F] **Login em `localStorage`** (pedido do Leonardo, 23/09). Antes ficava no `sessionStorage` e cada aba nova pedia login. Token vencido continua sendo descartado ao abrir; e-mail fora da equipe também.
+- [B] Só `VERSAO_BACKEND` = 3.85, para o deploy ser conferível.
+
 ---
 
-## ROTAS NOVAS OU ALTERADAS v3.59–v3.84
+## ROTAS NOVAS OU ALTERADAS v3.59–v3.85
 
 | Método e rota | Para que serve | Versão |
 |---|---|---|
@@ -297,6 +302,7 @@ Versões que não têm commit próprio: **v3.69** está dentro de bcd73d0 (v3.70
 | ~~Pix mais de 35% abaixo do cheio, ou marcado como OCR/outlier, é descartado e o custo passa a ser o preço cheio~~ (substituída) | v3.83 |
 | Pix e cheio divergentes (mais de 35%, ou OCR/outlier) não carregam custo nem venda sozinhos: o operador escolhe no card | v3.84 |
 | O auto-save sempre grava a última edição; save com erro continua pendente | v3.84 |
+| O login da Cabine vale em todas as abas do navegador (localStorage) | v3.85 |
 
 ## Objetos de banco usados pela primeira vez neste intervalo (todos existem no Supabase, conferido em 23/09)
 
