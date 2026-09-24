@@ -31,7 +31,7 @@ Vale para toda conversa deste projeto. Atualizado em 23/09/2026.
 - Mensagem: `vX.YY — o que mudou em uma linha`. Exemplo: `v3.83 — venda automática do Dwight + Pix suspeito usa preço cheio`.
 - **Pelo GitHub Desktop:** 1) `git pull` (Fetch/Pull) antes de tudo; 2) conferir a lista de arquivos alterados; 3) Commit to main; 4) Push origin.
 - **Pelo Claude na nuvem:** a conversa precisa começar com o repositório `lbarrey-pixel/kist-app` selecionado no seletor de repositório. O app Claude já está instalado no GitHub com acesso a todos os repositórios. Uma conversa aberta sem o repositório não consegue fazer push (erro 403) e não dá para incluir depois: abra outra.
-- Se o Claude gravar arquivos direto na pasta local, o commit e o push são do Leonardo pelo GitHub Desktop.
+- Se o Claude gravar arquivos direto na pasta local, o commit e o push **são do próprio Claude** (`git commit` + `git push origin main`), sem esperar o Leonardo passar pelo GitHub Desktop. Regra do Leonardo, 24/09: "sempre você sobe, não há mais commits pela minha parte".
 
 ## 6. Depois do push
 1. Conferir que o `main` no GitHub tem o commit (`git fetch` e `git log origin/main`).
