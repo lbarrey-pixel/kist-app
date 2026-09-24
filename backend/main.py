@@ -108,7 +108,8 @@ from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_
 # v3.89 — só frontend (renovação do login para token restaurado); o número sobe para o deploy ser conferível.
 # v3.90 — lei por cliente (Construcap: uma proposta por arquivo) + matching com nova tentativa quando a resposta vem cortada.
 # v3.91 — CRM de leads frios: /crm/leads e afins para os bots trabalharem a fila de prospecção que nunca virou cotação.
-VERSAO_BACKEND = "3.91"
+# v3.92 — CRM: dono_email restringe cada chave ao lead do próprio operador; qualificação automática por IA (real vs genérico) quando chega resposta.
+VERSAO_BACKEND = "3.92"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -10528,6 +10529,34 @@ def _ds_marcar_itens(sb, itens):
 _CRM_ESTAGIOS = ("frio", "aquecendo", "respondeu", "qualificado",
                   "proposta_enviada", "convertido", "descartado")
 
+# Regra do Leonardo, 24/09: "qualificado" é interesse REAL (reunião marcada, pergunta
+# específica a responder) — não resposta educada e vazia ("cadastramos você",
+# "encaminhei pro setor"). Isso não dá pra resolver com regex; é julgamento de texto,
+# então usa o Haiku (barato, já é o modelo de classificação do resto do sistema).
+SYSTEM_CRM_QUALIFICA = """Você julga respostas de e-mail em uma campanha de prospecção B2B (fornecedor tentando virar parceiro comercial do destinatário).
+
+Classifique a resposta em UMA palavra:
+- real: demonstra interesse genuíno — pede reunião/ligação, faz pergunta específica que precisa de resposta, pede orçamento/catálogo/informação concreta, sinaliza demanda futura real.
+- generico: resposta automática, educada mas vazia ("obrigado, vamos analisar", "encaminhei para o setor de compras", "cadastramos seu contato", "sem demanda no momento"), fora do escopo, ou só confirma recebimento sem pedir nada.
+
+Responda só com a palavra: real ou generico."""
+
+def _crm_classificar_interesse(trecho: str) -> str:
+    """'real' ou 'generico' — melhor esforço, nunca derruba o registro do contato."""
+    texto = (trecho or "").strip()
+    if len(texto) < 15:
+        return "generico"
+    try:
+        r = get_claude().messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=10,
+            system=SYSTEM_CRM_QUALIFICA,
+            messages=[{"role": "user", "content": texto[:2000]}],
+        )
+        saida = "".join(b.text for b in r.content if getattr(b, "type", "") == "text").strip().lower()
+        return "real" if "real" in saida else "generico"
+    except Exception:
+        return "generico"
+
 class CrmContatoPayload(BaseModel):
     canal: str = "email"
     direcao: str = "enviado"          # enviado | recebido
@@ -10542,20 +10571,37 @@ class CrmEstagioPayload(BaseModel):
     proximo_followup_em: Optional[str] = None
     observacao: Optional[str] = None
 
-def _crm_dominio_id(sb, dominio: str) -> int:
+def _crm_lead_ou_404(sb, dominio: str) -> dict:
     dominio = (dominio or "").strip().lower()
-    r = sb.table("leads_prospeccao_dominios").select("id").eq("dominio", dominio).limit(1).execute()
+    r = sb.table("leads_prospeccao_dominios").select("*").eq("dominio", dominio).limit(1).execute()
     linhas = r.data or []
     if not linhas:
         raise HTTPException(status_code=404, detail=f"Domínio '{dominio}' não está na base de leads.")
-    return linhas[0]["id"]
+    return linhas[0]
+
+def _crm_exige_dono(lead: dict, usuario: str):
+    """Cada bot roda como o operador dono da chave (comment da linha ~395) — aqui é onde isso
+    vira trava de verdade: bot do Thiago não lê nem escreve lead do Fábio. `dono_email` vazio
+    (lead ainda sem prospecção atribuída) só é visível/editável por ADMIN_EMAILS."""
+    if usuario in ADMIN_EMAILS:
+        return
+    dono = lead.get("dono_email")
+    if dono and dono == usuario:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=("Lead sem dono definido — só admin acessa até ser atribuído." if not dono
+                 else f"Lead pertence a {dono}, fora do alcance desta chave."),
+    )
 
 @app.get("/crm/leads")
 def crm_leads_listar(estagio: str = "", status: str = "", teve_resposta: int = -1,
-                      busca: str = "", limite: int = 100, offset: int = 0,
+                      busca: str = "", limite: int = 100, offset: int = 0, todos: int = 0,
                       usuario: str = Depends(verificar_token)):
     """Fila de leads frios para os bots (ou o dashboard) trabalharem.
 
+    Cada chave só vê os leads do PRÓPRIO dono (`dono_email`) — bot do Thiago não
+    enxerga lead do Fábio. `todos=1` só funciona para quem está em ADMIN_EMAILS.
     `busca` casa por domínio. `teve_resposta=1` filtra só quem já respondeu
     alguma vez (mais quente); `-1` não filtra.
     """
@@ -10565,9 +10611,11 @@ def crm_leads_listar(estagio: str = "", status: str = "", teve_resposta: int = -
         q = get_supabase().table("leads_prospeccao_dominios").select(
             "id,dominio,empresa,cnpj,endereco,telefone_geral,primeiro_envio,ultimo_envio,"
             "ultimo_contato_em,teve_resposta,status,estagio_funil,proximo_followup_em,"
-            "responsavel_bot,observacao,criado_em,atualizado_em",
+            "responsavel_bot,dono_email,observacao,criado_em,atualizado_em",
             count="exact",
         ).order("ultimo_envio", desc=True).range(offset, offset + limite - 1)
+        if not (int(todos or 0) and usuario in ADMIN_EMAILS):
+            q = q.eq("dono_email", usuario)
         if estagio:
             q = q.eq("estagio_funil", estagio.strip().lower())
         if status:
@@ -10582,7 +10630,7 @@ def crm_leads_listar(estagio: str = "", status: str = "", teve_resposta: int = -
     return {"leads": r.data or [], "total": r.count, "limite": limite, "offset": offset}
 
 @app.get("/crm/leads/stream")
-async def crm_leads_stream(intervalo: float = 4.0, usuario: str = Depends(verificar_token)):
+async def crm_leads_stream(intervalo: float = 4.0, todos: int = 0, usuario: str = Depends(verificar_token)):
     """SSE: o dashboard assina isto e recebe atualizações quase em tempo real.
 
     Declarada ANTES de `/crm/leads/{dominio}` de propósito: o FastAPI casa
@@ -10594,9 +10642,13 @@ async def crm_leads_stream(intervalo: float = 4.0, usuario: str = Depends(verifi
     de acesso ao banco, sondeia a cada `intervalo` segundos e empurra só o que
     mudou desde a última rodada. Simples, sem credencial nova, ~mesma
     experiência pro operador olhando o painel.
+
+    Mesma trava de dono do /crm/leads: cada conexão só recebe atualização dos
+    leads que aquela chave pode ver.
     """
     intervalo = max(2.0, min(float(intervalo or 4.0), 30.0))
     sb = get_supabase()
+    ve_tudo = bool(int(todos or 0) and usuario in ADMIN_EMAILS)
 
     async def eventos():
         desde = _dt.now(_tz.utc).isoformat()
@@ -10604,8 +10656,11 @@ async def crm_leads_stream(intervalo: float = 4.0, usuario: str = Depends(verifi
         while True:
             await _asyncio.sleep(intervalo)
             try:
-                r = sb.table("leads_prospeccao_dominios").select("*") \
-                    .gt("atualizado_em", desde).order("atualizado_em").execute()
+                q = sb.table("leads_prospeccao_dominios").select("*") \
+                    .gt("atualizado_em", desde).order("atualizado_em")
+                if not ve_tudo:
+                    q = q.eq("dono_email", usuario)
+                r = q.execute()
                 linhas = r.data or []
             except Exception:
                 linhas = []
@@ -10624,9 +10679,10 @@ async def crm_leads_stream(intervalo: float = 4.0, usuario: str = Depends(verifi
 def crm_lead_detalhe(dominio: str, usuario: str = Depends(verificar_token)):
     """Um domínio: dados do lead + contatos prospectados + histórico de interações."""
     sb = get_supabase()
-    dominio_id = _crm_dominio_id(sb, dominio)
+    lead = _crm_lead_ou_404(sb, dominio)
+    _crm_exige_dono(lead, usuario)
+    dominio_id = lead["id"]
     try:
-        lead = sb.table("leads_prospeccao_dominios").select("*").eq("id", dominio_id).limit(1).execute().data[0]
         contatos = sb.table("leads_prospeccao_contatos").select("*") \
             .eq("dominio_id", dominio_id).order("criado_em").execute().data or []
         interacoes = sb.table("leads_prospeccao_interacoes").select("*") \
@@ -10640,7 +10696,9 @@ def crm_lead_registrar_contato(dominio: str, payload: CrmContatoPayload, request
                                 usuario: str = Depends(verificar_token)):
     """Bot (ou humano) registra uma nova tentativa de contato ou resposta recebida."""
     sb = get_supabase()
-    dominio_id = _crm_dominio_id(sb, dominio)
+    lead = _crm_lead_ou_404(sb, dominio)
+    _crm_exige_dono(lead, usuario)
+    dominio_id = lead["id"]
     agora = _dt.now(_tz.utc).isoformat()
     direcao = payload.direcao if payload.direcao in ("enviado", "recebido") else "enviado"
     # Chave de API (bot) manda pelo escopo; ID token do Google (humano na tela) devolve None.
@@ -10659,12 +10717,26 @@ def crm_lead_registrar_contato(dominio: str, payload: CrmContatoPayload, request
             "origem": "bot" if via_chave_api else "manual",
         }).execute()
         atualiza = {"ultimo_contato_em": agora, "responsavel_bot": usuario}
+        interesse = None
         if direcao == "recebido":
             atualiza["teve_resposta"] = True
+            estagio_atual = (lead.get("estagio_funil") or "frio")
+            # Auto-avanço SÓ dentro de frio/aquecendo/respondeu/qualificado — estágios
+            # que já são decisão humana/bot explícita (proposta_enviada, convertido,
+            # descartado) nunca são tocados por um contato registrado automaticamente.
+            if estagio_atual in ("frio", "aquecendo"):
+                atualiza["estagio_funil"] = "respondeu"
+                estagio_atual = "respondeu"
+            if estagio_atual == "respondeu" and payload.trecho:
+                interesse = _crm_classificar_interesse(payload.trecho)
+                if interesse == "real":
+                    atualiza["estagio_funil"] = "qualificado"
         sb.table("leads_prospeccao_dominios").update(atualiza).eq("id", dominio_id).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Falha ao registrar contato: {e}")
-    return {"ok": True, "dominio_id": dominio_id, "registrado_em": agora}
+    return {"ok": True, "dominio_id": dominio_id, "registrado_em": agora,
+            "estagio_funil": atualiza.get("estagio_funil", lead.get("estagio_funil")),
+            "interesse_classificado": interesse}
 
 @app.post("/crm/leads/{dominio}/estagio")
 def crm_lead_mudar_estagio(dominio: str, payload: CrmEstagioPayload,
@@ -10674,7 +10746,9 @@ def crm_lead_mudar_estagio(dominio: str, payload: CrmEstagioPayload,
     if estagio not in _CRM_ESTAGIOS:
         raise HTTPException(status_code=400, detail=f"estagio_funil inválido. Use um de: {', '.join(_CRM_ESTAGIOS)}")
     sb = get_supabase()
-    dominio_id = _crm_dominio_id(sb, dominio)
+    lead = _crm_lead_ou_404(sb, dominio)
+    _crm_exige_dono(lead, usuario)
+    dominio_id = lead["id"]
     atualiza = {"estagio_funil": estagio, "responsavel_bot": usuario}
     if payload.proximo_followup_em is not None:
         atualiza["proximo_followup_em"] = payload.proximo_followup_em or None
@@ -10689,11 +10763,13 @@ def crm_lead_mudar_estagio(dominio: str, payload: CrmEstagioPayload,
     return {"ok": True, "dominio_id": dominio_id, "estagio_funil": estagio}
 
 @app.get("/crm/painel")
-def crm_painel(usuario: str = Depends(verificar_token)):
-    """Contagens agregadas pro cabeçalho do dashboard."""
+def crm_painel(todos: int = 0, usuario: str = Depends(verificar_token)):
+    """Contagens agregadas pro cabeçalho do dashboard. Mesma trava de dono do /crm/leads."""
     try:
-        r = get_supabase().table("leads_prospeccao_dominios").select("estagio_funil,status").execute()
-        linhas = r.data or []
+        q = get_supabase().table("leads_prospeccao_dominios").select("estagio_funil,status")
+        if not (int(todos or 0) and usuario in ADMIN_EMAILS):
+            q = q.eq("dono_email", usuario)
+        linhas = q.execute().data or []
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Painel indisponível: {e}")
     por_estagio: dict = {}

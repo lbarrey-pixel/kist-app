@@ -16,6 +16,10 @@ const USUARIOS_PERMITIDOS = new Set(
     .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)
 );
 const emailAutorizado = (e) => USUARIOS_PERMITIDOS.has((e || "").trim().toLowerCase());
+const ADMIN_EMAILS = new Set(
+  (import.meta.env.VITE_ADMIN_EMAILS || "leonardobarrey@gmail.com")
+    .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)
+);
 
 function decodeJwtPayload(jwt) {
   const b64 = jwt.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
@@ -35,6 +39,13 @@ const ESTAGIOS = [
 ];
 const ESTAGIO_LABEL = Object.fromEntries(ESTAGIOS.map((e) => [e.chave, e.label]));
 const ESTAGIO_COR = Object.fromEntries(ESTAGIOS.map((e) => [e.chave, e.cor]));
+
+const DONO_LABEL = {
+  "leonardobarrey@gmail.com": "Leonardo",
+  "thiagokist@gmail.com": "Thiago",
+  "fabiokist@gmail.com": "Fábio",
+};
+const donoLabel = (email) => DONO_LABEL[email] || email || "sem dono";
 
 function fmtData(iso) {
   if (!iso) return "—";
@@ -60,7 +71,7 @@ async function api(path, token, opts = {}) {
 
 // Consome o SSE manualmente (fetch + ReadableStream) para poder mandar o
 // Authorization header. Reconecta sozinho se a conexão cair.
-function useLeadsStream(token, onLeads) {
+function useLeadsStream(token, onLeads, verTodos) {
   const abortRef = useRef(null);
   useEffect(() => {
     if (!token) return;
@@ -71,7 +82,7 @@ function useLeadsStream(token, onLeads) {
         const ctrl = new AbortController();
         abortRef.current = ctrl;
         try {
-          const res = await fetch(`${API}/crm/leads/stream`, {
+          const res = await fetch(`${API}/crm/leads/stream?todos=${verTodos ? 1 : 0}`, {
             headers: { Authorization: `Bearer ${token}` },
             signal: ctrl.signal,
           });
@@ -104,7 +115,7 @@ function useLeadsStream(token, onLeads) {
     }
     conectar();
     return () => { parar = true; abortRef.current?.abort(); };
-  }, [token, onLeads]);
+  }, [token, onLeads, verTodos]);
 }
 
 function Login({ onLogin, erro }) {
@@ -151,12 +162,50 @@ function CartaoLead({ lead, onClick }) {
       <div className="cartao-dominio">{lead.dominio}</div>
       <div className="cartao-meta">
         {lead.teve_resposta && <span className="badge badge-resposta">respondeu</span>}
+        <span className="badge badge-dono">{donoLabel(lead.dono_email)}</span>
         <span className="cartao-data">último envio: {fmtData(lead.ultimo_envio)}</span>
       </div>
       {lead.proximo_followup_em && (
         <div className="cartao-followup">📅 follow-up: {fmtData(lead.proximo_followup_em)}</div>
       )}
     </button>
+  );
+}
+
+function ItemInteracao({ i }) {
+  const [aberto, setAberto] = useState(false);
+  const LIMITE = 280;
+  const longo = (i.trecho || "").length > LIMITE;
+
+  return (
+    <li>
+      <div className="timeline-topo">
+        <strong>{i.nome || i.email || "—"}</strong>
+        <span className={`badge badge-${i.direcao}`}>{i.direcao}</span>
+        <span className="muted">{i.canal}</span>
+        <span className="muted">{fmtData(i.data_interacao)}</span>
+      </div>
+      {i.assunto && <div className="timeline-assunto">{i.assunto}</div>}
+      {i.trecho && (
+        <div className="timeline-trecho">
+          {aberto ? i.trecho : i.trecho.slice(0, LIMITE) + (longo ? "…" : "")}
+        </div>
+      )}
+      {(longo || i.email || i.telefone) && (
+        <button className="link-expandir" onClick={() => setAberto((v) => !v)}>
+          {aberto ? "fechar e-mail" : "ver e-mail completo"}
+        </button>
+      )}
+      {aberto && (
+        <div className="timeline-detalhe">
+          {i.email && <div><b>De:</b> {i.nome ? `${i.nome} <${i.email}>` : i.email}</div>}
+          {i.telefone && <div><b>Telefone:</b> {i.telefone}</div>}
+          {i.assunto && <div><b>Assunto:</b> {i.assunto}</div>}
+          <div><b>Data:</b> {fmtData(i.data_interacao)}</div>
+          {i.pasta_outlook && <div><b>Origem:</b> {i.pasta_outlook}</div>}
+        </div>
+      )}
+    </li>
   );
 }
 
@@ -224,7 +273,10 @@ function PainelDetalhe({ dominio, token, onFechar, onAtualizado }) {
     <div className="painel-overlay" onClick={onFechar}>
       <div className="painel" onClick={(e) => e.stopPropagation()}>
         <div className="painel-cabecalho">
-          <h2>{lead.dominio}</h2>
+          <div>
+            <h2>{lead.dominio}</h2>
+            <span className="badge badge-dono">dono: {donoLabel(lead.dono_email)}</span>
+          </div>
           <button className="fechar" onClick={onFechar}>✕</button>
         </div>
         {erro && <div className="erro">{erro}</div>}
@@ -273,16 +325,7 @@ function PainelDetalhe({ dominio, token, onFechar, onAtualizado }) {
           <h3>Histórico de interações ({interacoes.length})</h3>
           <ul className="timeline">
             {interacoes.map((i) => (
-              <li key={i.id}>
-                <div className="timeline-topo">
-                  <strong>{i.nome || i.email || "—"}</strong>
-                  <span className={`badge badge-${i.direcao}`}>{i.direcao}</span>
-                  <span className="muted">{i.canal}</span>
-                  <span className="muted">{fmtData(i.data_interacao)}</span>
-                </div>
-                {i.assunto && <div className="timeline-assunto">{i.assunto}</div>}
-                {i.trecho && <div className="timeline-trecho">{i.trecho.slice(0, 400)}</div>}
-              </li>
+              <ItemInteracao key={i.id} i={i} />
             ))}
           </ul>
         </section>
@@ -302,6 +345,8 @@ export default function App() {
   const [selecionado, setSelecionado] = useState(null);
   const [erro, setErro] = useState("");
   const [carregando, setCarregando] = useState(false);
+  const [verTodos, setVerTodos] = useState(false);
+  const souAdmin = usuario && ADMIN_EMAILS.has((usuario.email || "").toLowerCase());
 
   function handleGoogleResponse(response) {
     const credential = response.credential;
@@ -347,20 +392,21 @@ export default function App() {
   const carregarLeads = useCallback(async () => {
     if (!token) return;
     setCarregando(true); setErro("");
+    const flagTodos = souAdmin && verTodos ? 1 : 0;
     try {
-      let todos = [];
+      let acumulado = [];
       let offset = 0;
       const PASSO = 500;
       while (true) {
-        const pagina = await api(`/crm/leads?limite=${PASSO}&offset=${offset}`, token);
-        todos = todos.concat(pagina.leads || []);
+        const pagina = await api(`/crm/leads?limite=${PASSO}&offset=${offset}&todos=${flagTodos}`, token);
+        acumulado = acumulado.concat(pagina.leads || []);
         offset += PASSO;
-        if (todos.length >= (pagina.total || 0) || (pagina.leads || []).length < PASSO) break;
+        if (acumulado.length >= (pagina.total || 0) || (pagina.leads || []).length < PASSO) break;
       }
       const mapa = {};
-      for (const l of todos) mapa[l.id] = l;
+      for (const l of acumulado) mapa[l.id] = l;
       setLeads(mapa);
-      const p = await api("/crm/painel", token);
+      const p = await api(`/crm/painel?todos=${flagTodos}`, token);
       setPainel(p);
     } catch (e) {
       if (String(e.message || "").includes("401") || String(e.message || "").includes("Token")) {
@@ -370,7 +416,7 @@ export default function App() {
       }
     }
     setCarregando(false);
-  }, [token]);
+  }, [token, souAdmin, verTodos]);
 
   useEffect(() => { carregarLeads(); }, [carregarLeads]);
 
@@ -381,7 +427,7 @@ export default function App() {
       return copia;
     });
   }, []);
-  useLeadsStream(token, onLeadsStream);
+  useLeadsStream(token, onLeadsStream, souAdmin && verTodos);
 
   if (!token || !usuario) {
     return <Login onLogin={handleGoogleResponse} erro={authErro} />;
@@ -412,6 +458,9 @@ export default function App() {
         <div className="topo-filtros">
           <input placeholder="buscar domínio…" value={busca} onChange={(e) => setBusca(e.target.value.toLowerCase())} />
           <label className="check"><input type="checkbox" checked={soComResposta} onChange={(e) => setSoComResposta(e.target.checked)} /> só com resposta</label>
+          {souAdmin && (
+            <label className="check"><input type="checkbox" checked={verTodos} onChange={(e) => setVerTodos(e.target.checked)} /> ver de todos</label>
+          )}
           {carregando && <span className="muted">atualizando…</span>}
         </div>
         <div className="topo-usuario">

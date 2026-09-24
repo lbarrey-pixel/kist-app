@@ -39,6 +39,18 @@ ASSUNTOS_PROSPECCAO = {
 NOMES_PASTA_ENVIADOS = {"itens enviados", "sent", "sent items", "enviados", "itens enviados (this computer only)"}
 NOMES_PASTA_ENTRADA = {"caixa de entrada", "inbox"}
 
+# Dono do lead = quem prospectou primeiro (Leonardo, 24/09): usado pra restringir
+# qual bot pode interagir com qual lead. tbackup e' backup do Thiago; contato@ e'
+# a caixa do Fabio (confirmado por ele).
+STORE_PARA_DONO = {
+    "arquivo de dados do outlook": "leonardobarrey@gmail.com",
+    "leonardo@kistsolucoes.com.br": "leonardobarrey@gmail.com",
+    "thiago@kistsolucoes.com.br": "thiagokist@gmail.com",
+    "tbackup@kistsolucoes.com.br": "thiagokist@gmail.com",
+    "fabio@kistsolucoes.com.br": "fabiokist@gmail.com",
+    "contato@kistsolucoes.com.br": "fabiokist@gmail.com",
+}
+
 DOMINIOS_GENERICOS = {
     "gmail.com", "hotmail.com", "outlook.com", "yahoo.com.br", "yahoo.com",
     "live.com", "icloud.com", "uol.com.br", "bol.com.br", "terra.com.br",
@@ -128,6 +140,7 @@ def coletar_prospectados(namespace, desde):
 
                         total_emails_prospeccao += 1
                         enviado_em = item.SentOn.isoformat() if item.SentOn else None
+                        dono = STORE_PARA_DONO.get(store.Name.strip().lower())
 
                         for rec in item.Recipients:
                             if rec.Type not in (1, 2):  # olTo=1, olCC=2
@@ -141,12 +154,14 @@ def coletar_prospectados(namespace, desde):
                                 continue
 
                             d = prospectados.setdefault(dominio, {
-                                "contatos": {}, "primeiro_envio": enviado_em, "ultimo_envio": enviado_em
+                                "contatos": {}, "primeiro_envio": enviado_em, "ultimo_envio": enviado_em,
+                                "dono_email": dono,
                             })
                             d["contatos"][email] = rec.Name or email
                             if enviado_em:
                                 if not d["primeiro_envio"] or enviado_em < d["primeiro_envio"]:
                                     d["primeiro_envio"] = enviado_em
+                                    d["dono_email"] = dono  # dono = quem mandou o PRIMEIRO contato
                                 if not d["ultimo_envio"] or enviado_em > d["ultimo_envio"]:
                                     d["ultimo_envio"] = enviado_em
                     except Exception as e:
@@ -243,6 +258,7 @@ def main():
                 ],
                 "primeiro_envio": info["primeiro_envio"],
                 "ultimo_envio": info["ultimo_envio"],
+                "dono_email": info.get("dono_email"),
                 "teve_resposta": dom in dominios_com_interacao,
             }
             for dom, info in prospectados.items()

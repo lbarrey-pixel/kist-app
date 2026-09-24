@@ -77,9 +77,9 @@ def main():
         data = json.load(f)
 
     print("Buscando dominios que ja sao clientes (public.clientes_dominios)...")
-    resp = sb.table("clientes_dominios").select("dominio").execute()
-    ja_clientes = {row["dominio"].lower() for row in resp.data if row.get("dominio")}
-    print(f"  {len(ja_clientes)} dominios ja clientes.")
+    resp = sb.table("clientes_dominios").select("dominio,usuario_email").execute()
+    ja_clientes_dono = {row["dominio"].lower(): row.get("usuario_email") for row in resp.data if row.get("dominio")}
+    print(f"  {len(ja_clientes_dono)} dominios ja clientes.")
 
     dominios_raw = {}
     for item in data["dominios"]:
@@ -87,7 +87,8 @@ def main():
         if len(dom) < 4 or "." not in dom or dom in DOMINIOS_GENERICOS:
             continue
         agg = dominios_raw.setdefault(dom, {
-            "contatos": {}, "primeiro_envio": None, "ultimo_envio": None, "teve_resposta": False
+            "contatos": {}, "primeiro_envio": None, "ultimo_envio": None, "teve_resposta": False,
+            "dono_email": None,
         })
         for c in item["contatos_prospectados"]:
             email = limpa_texto(c["email"]).lower()
@@ -99,6 +100,7 @@ def main():
             if v:
                 if campo == "primeiro_envio" and (not agg[campo] or v < agg[campo]):
                     agg[campo] = v
+                    agg["dono_email"] = item.get("dono_email") or agg["dono_email"]
                 if campo == "ultimo_envio" and (not agg[campo] or v > agg[campo]):
                     agg[campo] = v
         agg["teve_resposta"] = agg["teve_resposta"] or item["teve_resposta"]
@@ -107,13 +109,16 @@ def main():
 
     dominios_rows = []
     for dom, info in dominios_raw.items():
-        status = "convertido" if dom in ja_clientes else "frio"
+        dono_cliente = ja_clientes_dono.get(dom)
+        status = "convertido" if dom in ja_clientes_dono else "frio"
         dominios_rows.append({
             "dominio": dom,
             "primeiro_envio": info["primeiro_envio"],
             "ultimo_envio": info["ultimo_envio"],
             "teve_resposta": info["teve_resposta"],
             "status": status,
+            # dono real (clientes_dominios) tem prioridade sobre o palpite da extracao
+            "dono_email": dono_cliente or info.get("dono_email"),
         })
 
     print(f"Gravando {len(dominios_rows)} dominios...")

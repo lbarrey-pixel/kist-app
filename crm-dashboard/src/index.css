@@ -75,6 +75,7 @@ body {
 .badge-resposta { background: #dbeafe; color: #1d4ed8; }
 .badge-enviado { background: #ede9fe; color: #6d28d9; }
 .badge-recebido { background: #dcfce7; color: #15803d; }
+.badge-dono { background: #f1f5f9; color: #334155; }
 
 .painel-overlay {
   position: fixed; inset: 0; background: rgba(15,23,42,.5); display: flex; justify-content: flex-end; z-index: 50;
@@ -104,3 +105,13 @@ body {
 .timeline-topo { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12px; }
 .timeline-assunto { font-size: 12px; font-weight: 600; margin-top: 2px; }
 .timeline-trecho { font-size: 12px; color: #475569; margin-top: 2px; white-space: pre-wrap; }
+.link-expandir {
+  border: none; background: none; color: #059669; font-size: 11px; font-weight: 600;
+  cursor: pointer; padding: 4px 0; text-decoration: underline;
+}
+.timeline-detalhe {
+  background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 8px 10px;
+  margin-top: 4px; font-size: 12px; color: #334155; display: flex; flex-direction: column; gap: 3px;
+}
+.painel-cabecalho { align-items: flex-start; }
+.painel-cabecalho h2 { margin-bottom: 4px; }
