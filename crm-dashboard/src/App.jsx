@@ -71,7 +71,7 @@ async function api(path, token, opts = {}) {
 
 // Consome o SSE manualmente (fetch + ReadableStream) para poder mandar o
 // Authorization header. Reconecta sozinho se a conexão cair.
-function useLeadsStream(token, onLeads, verTodos) {
+function useLeadsStream(token, onLeads, filtroDono) {
   const abortRef = useRef(null);
   useEffect(() => {
     if (!token) return;
@@ -82,7 +82,7 @@ function useLeadsStream(token, onLeads, verTodos) {
         const ctrl = new AbortController();
         abortRef.current = ctrl;
         try {
-          const res = await fetch(`${API}/crm/leads/stream?todos=${verTodos ? 1 : 0}`, {
+          const res = await fetch(`${API}/crm/leads/stream?dono=${encodeURIComponent(filtroDono || "")}`, {
             headers: { Authorization: `Bearer ${token}` },
             signal: ctrl.signal,
           });
@@ -115,7 +115,7 @@ function useLeadsStream(token, onLeads, verTodos) {
     }
     conectar();
     return () => { parar = true; abortRef.current?.abort(); };
-  }, [token, onLeads, verTodos]);
+  }, [token, onLeads, filtroDono]);
 }
 
 function Login({ onLogin, erro }) {
@@ -209,7 +209,7 @@ function ItemInteracao({ i }) {
   );
 }
 
-function PainelDetalhe({ dominio, token, onFechar, onAtualizado }) {
+function PainelDetalhe({ dominio, token, usuario, souAdmin, onFechar, onAtualizado }) {
   const [dados, setDados] = useState(null);
   const [erro, setErro] = useState("");
   const [salvando, setSalvando] = useState(false);
@@ -268,6 +268,7 @@ function PainelDetalhe({ dominio, token, onFechar, onAtualizado }) {
   );
 
   const { lead, contatos, interacoes } = dados;
+  const podeEditar = souAdmin || (usuario && lead.dono_email === usuario.email);
 
   return (
     <div className="painel-overlay" onClick={onFechar}>
@@ -279,18 +280,23 @@ function PainelDetalhe({ dominio, token, onFechar, onAtualizado }) {
           </div>
           <button className="fechar" onClick={onFechar}>✕</button>
         </div>
+        {!podeEditar && (
+          <div className="aviso-somente-leitura">
+            👁️ Somente leitura — este lead é do {donoLabel(lead.dono_email)}. Só ele (ou admin) pode mudar estágio ou registrar contato.
+          </div>
+        )}
         {erro && <div className="erro">{erro}</div>}
 
         <section>
           <h3>Estágio do funil</h3>
           <div className="linha-form">
-            <select value={novoEstagio} onChange={(e) => setNovoEstagio(e.target.value)}>
+            <select disabled={!podeEditar} value={novoEstagio} onChange={(e) => setNovoEstagio(e.target.value)}>
               {ESTAGIOS.map((e) => <option key={e.chave} value={e.chave}>{e.label}</option>)}
             </select>
-            <input type="datetime-local" value={followup} onChange={(e) => setFollowup(e.target.value)} title="Próximo follow-up" />
+            <input disabled={!podeEditar} type="datetime-local" value={followup} onChange={(e) => setFollowup(e.target.value)} title="Próximo follow-up" />
           </div>
-          <textarea placeholder="Observação" value={observacao} onChange={(e) => setObservacao(e.target.value)} rows={2} />
-          <button disabled={salvando} onClick={salvarEstagio}>Salvar</button>
+          <textarea disabled={!podeEditar} placeholder="Observação" value={observacao} onChange={(e) => setObservacao(e.target.value)} rows={2} />
+          {podeEditar && <button disabled={salvando} onClick={salvarEstagio}>Salvar</button>}
         </section>
 
         <section>
@@ -302,24 +308,26 @@ function PainelDetalhe({ dominio, token, onFechar, onAtualizado }) {
           </ul>
         </section>
 
-        <section>
-          <h3>Registrar contato</h3>
-          <div className="linha-form">
-            <select value={msgContato.direcao} onChange={(e) => setMsgContato((m) => ({ ...m, direcao: e.target.value }))}>
-              <option value="enviado">Enviado</option>
-              <option value="recebido">Recebido</option>
-            </select>
-            <select value={msgContato.canal} onChange={(e) => setMsgContato((m) => ({ ...m, canal: e.target.value }))}>
-              <option value="email">E-mail</option>
-              <option value="whatsapp">WhatsApp</option>
-              <option value="linkedin">LinkedIn</option>
-              <option value="telefone">Telefone</option>
-            </select>
-          </div>
-          <textarea placeholder="O que foi dito / resumo" value={msgContato.trecho}
-            onChange={(e) => setMsgContato((m) => ({ ...m, trecho: e.target.value }))} rows={2} />
-          <button disabled={salvando} onClick={registrarContato}>Registrar</button>
-        </section>
+        {podeEditar && (
+          <section>
+            <h3>Registrar contato</h3>
+            <div className="linha-form">
+              <select value={msgContato.direcao} onChange={(e) => setMsgContato((m) => ({ ...m, direcao: e.target.value }))}>
+                <option value="enviado">Enviado</option>
+                <option value="recebido">Recebido</option>
+              </select>
+              <select value={msgContato.canal} onChange={(e) => setMsgContato((m) => ({ ...m, canal: e.target.value }))}>
+                <option value="email">E-mail</option>
+                <option value="whatsapp">WhatsApp</option>
+                <option value="linkedin">LinkedIn</option>
+                <option value="telefone">Telefone</option>
+              </select>
+            </div>
+            <textarea placeholder="O que foi dito / resumo" value={msgContato.trecho}
+              onChange={(e) => setMsgContato((m) => ({ ...m, trecho: e.target.value }))} rows={2} />
+            <button disabled={salvando} onClick={registrarContato}>Registrar</button>
+          </section>
+        )}
 
         <section>
           <h3>Histórico de interações ({interacoes.length})</h3>
@@ -345,7 +353,7 @@ export default function App() {
   const [selecionado, setSelecionado] = useState(null);
   const [erro, setErro] = useState("");
   const [carregando, setCarregando] = useState(false);
-  const [verTodos, setVerTodos] = useState(false);
+  const [filtroDono, setFiltroDono] = useState(""); // "" = todo mundo vê tudo
   const souAdmin = usuario && ADMIN_EMAILS.has((usuario.email || "").toLowerCase());
 
   function handleGoogleResponse(response) {
@@ -392,13 +400,13 @@ export default function App() {
   const carregarLeads = useCallback(async () => {
     if (!token) return;
     setCarregando(true); setErro("");
-    const flagTodos = souAdmin && verTodos ? 1 : 0;
+    const qDono = encodeURIComponent(filtroDono || "");
     try {
       let acumulado = [];
       let offset = 0;
       const PASSO = 500;
       while (true) {
-        const pagina = await api(`/crm/leads?limite=${PASSO}&offset=${offset}&todos=${flagTodos}`, token);
+        const pagina = await api(`/crm/leads?limite=${PASSO}&offset=${offset}&dono=${qDono}`, token);
         acumulado = acumulado.concat(pagina.leads || []);
         offset += PASSO;
         if (acumulado.length >= (pagina.total || 0) || (pagina.leads || []).length < PASSO) break;
@@ -406,7 +414,7 @@ export default function App() {
       const mapa = {};
       for (const l of acumulado) mapa[l.id] = l;
       setLeads(mapa);
-      const p = await api(`/crm/painel?todos=${flagTodos}`, token);
+      const p = await api(`/crm/painel?dono=${qDono}`, token);
       setPainel(p);
     } catch (e) {
       if (String(e.message || "").includes("401") || String(e.message || "").includes("Token")) {
@@ -416,7 +424,7 @@ export default function App() {
       }
     }
     setCarregando(false);
-  }, [token, souAdmin, verTodos]);
+  }, [token, filtroDono]);
 
   useEffect(() => { carregarLeads(); }, [carregarLeads]);
 
@@ -427,7 +435,7 @@ export default function App() {
       return copia;
     });
   }, []);
-  useLeadsStream(token, onLeadsStream, souAdmin && verTodos);
+  useLeadsStream(token, onLeadsStream, filtroDono);
 
   if (!token || !usuario) {
     return <Login onLogin={handleGoogleResponse} erro={authErro} />;
@@ -458,9 +466,12 @@ export default function App() {
         <div className="topo-filtros">
           <input placeholder="buscar domínio…" value={busca} onChange={(e) => setBusca(e.target.value.toLowerCase())} />
           <label className="check"><input type="checkbox" checked={soComResposta} onChange={(e) => setSoComResposta(e.target.checked)} /> só com resposta</label>
-          {souAdmin && (
-            <label className="check"><input type="checkbox" checked={verTodos} onChange={(e) => setVerTodos(e.target.checked)} /> ver de todos</label>
-          )}
+          <select value={filtroDono} onChange={(e) => setFiltroDono(e.target.value)} title="Ver leads de quem">
+            <option value="">Ver: todo mundo</option>
+            {Object.entries(DONO_LABEL).map(([email, label]) => (
+              <option key={email} value={email}>Ver: {label}</option>
+            ))}
+          </select>
           {carregando && <span className="muted">atualizando…</span>}
         </div>
         <div className="topo-usuario">
@@ -490,7 +501,7 @@ export default function App() {
       </main>
 
       {selecionado && (
-        <PainelDetalhe dominio={selecionado} token={token}
+        <PainelDetalhe dominio={selecionado} token={token} usuario={usuario} souAdmin={souAdmin}
           onFechar={() => setSelecionado(null)}
           onAtualizado={carregarLeads} />
       )}

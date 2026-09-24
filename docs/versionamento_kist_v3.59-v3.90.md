@@ -199,6 +199,12 @@ Versões que não têm commit próprio: **v3.69** está dentro de bcd73d0 (v3.70
 - Dados: `mercado_observacoes` 146 e 272 (Pix de OCR de 19,40 e 19,69) ficaram sem preço (backup `_bkp_20260923_mercado_observacoes`). R-1375: o Duracell ficou com custo 198,90 e venda 331,37, confirmados pelo Leonardo (backup `_bkp_20260923_itens_r1375`).
 - Propostas antigas com custo tirado de oferta divergente (vão aparecer com o aviso no card): 1050902 (terrômetro, 4.333,26), 1050903 (estilete, trena 19,27, torquês, chave ajustável 74,79), 1051007 e 1051012.
 
+## v3.93 · 24/09 · CRM: correção — ver é de todo mundo, editar é do dono
+- **Correção da regra da v3.92** (Leonardo, mesmo dia): a trava de dono foi longe demais — bloqueava até a LEITURA. A regra certa: **ver os leads é de todo mundo** (Leonardo, Thiago e Fábio enxergam a base inteira); só **mudar estágio ou registrar contato** continua travado no dono (ou admin).
+- [B] `GET /crm/leads`, `GET /crm/leads/{dominio}`, `GET /crm/painel`, `GET /crm/leads/stream`: removida a trava de leitura. Parâmetro `todos` (antes só-admin) virou `dono=<email>` — filtra por um operador específico; sem o parâmetro, vem tudo, pra qualquer chave autenticada.
+- [B] `_crm_exige_dono()` renomeada para `_crm_exige_dono_para_editar()`, usada só em `POST .../contato` e `POST .../estagio`.
+- [F] Dashboard: o toggle "ver de todos" (só admin) virou um seletor "Ver: todo mundo / Leonardo / Thiago / Fábio", disponível pra qualquer um. Painel de detalhe mostra aviso de "somente leitura" e desabilita os formulários de estágio/contato quando o lead não é do usuário logado (nem admin).
+
 ## v3.92 · 24/09 · CRM: dono por lead (trava de acesso do bot) + qualificação automática por IA
 - **Achado depurando a base com o Leonardo**: `public.clientes_dominios` (a fonte de "isso já é cliente") estava desatualizada há meses e só sincronizada pro Leonardo — Equatorial Energia (27+ propostas confirmadas pelo Fábio) e outros 7 domínios apareciam como "frio". Corrigido rodando `dominios_observados` pelos 3 operadores; a Americanas continua fora da base de e-mail porque o domínio real das propostas dela é `americanas.io` e o do Equatorial é o portal `coupa.com` — nenhum dos dois nunca apareceu num e-mail de prospecção rastreado (não é bug, é limite do método de extração por Outlook).
 - **Regra do Leonardo, 24/09**: cada bot roda como o operador dono da chave de API e só pode enxergar/mexer nos PRÓPRIOS leads — bot do Thiago não vê lead do Fábio.

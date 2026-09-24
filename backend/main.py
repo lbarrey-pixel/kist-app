@@ -109,7 +109,8 @@ from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_
 # v3.90 — lei por cliente (Construcap: uma proposta por arquivo) + matching com nova tentativa quando a resposta vem cortada.
 # v3.91 — CRM de leads frios: /crm/leads e afins para os bots trabalharem a fila de prospecção que nunca virou cotação.
 # v3.92 — CRM: dono_email restringe cada chave ao lead do próprio operador; qualificação automática por IA (real vs genérico) quando chega resposta.
-VERSAO_BACKEND = "3.92"
+# v3.93 — CRM: correção de regra — ver lead é de todo mundo, só mudar estágio/registrar contato fica travado no dono (ou admin).
+VERSAO_BACKEND = "3.93"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -10579,10 +10580,10 @@ def _crm_lead_ou_404(sb, dominio: str) -> dict:
         raise HTTPException(status_code=404, detail=f"Domínio '{dominio}' não está na base de leads.")
     return linhas[0]
 
-def _crm_exige_dono(lead: dict, usuario: str):
-    """Cada bot roda como o operador dono da chave (comment da linha ~395) — aqui é onde isso
-    vira trava de verdade: bot do Thiago não lê nem escreve lead do Fábio. `dono_email` vazio
-    (lead ainda sem prospecção atribuída) só é visível/editável por ADMIN_EMAILS."""
+def _crm_exige_dono_para_editar(lead: dict, usuario: str):
+    """Ver é de todo mundo (regra do Leonardo, 24/09); MEXER (registrar contato,
+    mudar estágio) continua travado no dono do lead. `dono_email` vazio (lead
+    ainda sem prospecção atribuída) só é editável por ADMIN_EMAILS."""
     if usuario in ADMIN_EMAILS:
         return
     dono = lead.get("dono_email")
@@ -10590,20 +10591,20 @@ def _crm_exige_dono(lead: dict, usuario: str):
         return
     raise HTTPException(
         status_code=403,
-        detail=("Lead sem dono definido — só admin acessa até ser atribuído." if not dono
-                 else f"Lead pertence a {dono}, fora do alcance desta chave."),
+        detail=("Lead sem dono definido — só admin edita até ser atribuído." if not dono
+                 else f"Lead pertence a {dono}: você pode ver, mas só o dono (ou admin) edita."),
     )
 
 @app.get("/crm/leads")
 def crm_leads_listar(estagio: str = "", status: str = "", teve_resposta: int = -1,
-                      busca: str = "", limite: int = 100, offset: int = 0, todos: int = 0,
+                      busca: str = "", limite: int = 100, offset: int = 0, dono: str = "",
                       usuario: str = Depends(verificar_token)):
-    """Fila de leads frios para os bots (ou o dashboard) trabalharem.
+    """Fila de leads para os bots (ou o dashboard) trabalharem.
 
-    Cada chave só vê os leads do PRÓPRIO dono (`dono_email`) — bot do Thiago não
-    enxerga lead do Fábio. `todos=1` só funciona para quem está em ADMIN_EMAILS.
-    `busca` casa por domínio. `teve_resposta=1` filtra só quem já respondeu
-    alguma vez (mais quente); `-1` não filtra.
+    Ver é de todo mundo (regra do Leonardo, 24/09) — a chave de um operador lê
+    a base inteira. `dono=email` filtra só os leads de um operador específico;
+    sem o parâmetro, vem tudo. `busca` casa por domínio. `teve_resposta=1`
+    filtra só quem já respondeu alguma vez (mais quente); `-1` não filtra.
     """
     limite = max(1, min(int(limite or 100), 500))
     offset = max(0, int(offset or 0))
@@ -10614,8 +10615,8 @@ def crm_leads_listar(estagio: str = "", status: str = "", teve_resposta: int = -
             "responsavel_bot,dono_email,observacao,criado_em,atualizado_em",
             count="exact",
         ).order("ultimo_envio", desc=True).range(offset, offset + limite - 1)
-        if not (int(todos or 0) and usuario in ADMIN_EMAILS):
-            q = q.eq("dono_email", usuario)
+        if dono:
+            q = q.eq("dono_email", dono.strip().lower())
         if estagio:
             q = q.eq("estagio_funil", estagio.strip().lower())
         if status:
@@ -10630,7 +10631,7 @@ def crm_leads_listar(estagio: str = "", status: str = "", teve_resposta: int = -
     return {"leads": r.data or [], "total": r.count, "limite": limite, "offset": offset}
 
 @app.get("/crm/leads/stream")
-async def crm_leads_stream(intervalo: float = 4.0, todos: int = 0, usuario: str = Depends(verificar_token)):
+async def crm_leads_stream(intervalo: float = 4.0, dono: str = "", usuario: str = Depends(verificar_token)):
     """SSE: o dashboard assina isto e recebe atualizações quase em tempo real.
 
     Declarada ANTES de `/crm/leads/{dominio}` de propósito: o FastAPI casa
@@ -10643,12 +10644,11 @@ async def crm_leads_stream(intervalo: float = 4.0, todos: int = 0, usuario: str 
     mudou desde a última rodada. Simples, sem credencial nova, ~mesma
     experiência pro operador olhando o painel.
 
-    Mesma trava de dono do /crm/leads: cada conexão só recebe atualização dos
-    leads que aquela chave pode ver.
+    Ver é de todo mundo: `dono=email` filtra a um operador, sem parâmetro vem tudo.
     """
     intervalo = max(2.0, min(float(intervalo or 4.0), 30.0))
     sb = get_supabase()
-    ve_tudo = bool(int(todos or 0) and usuario in ADMIN_EMAILS)
+    dono = (dono or "").strip().lower()
 
     async def eventos():
         desde = _dt.now(_tz.utc).isoformat()
@@ -10658,8 +10658,8 @@ async def crm_leads_stream(intervalo: float = 4.0, todos: int = 0, usuario: str 
             try:
                 q = sb.table("leads_prospeccao_dominios").select("*") \
                     .gt("atualizado_em", desde).order("atualizado_em")
-                if not ve_tudo:
-                    q = q.eq("dono_email", usuario)
+                if dono:
+                    q = q.eq("dono_email", dono)
                 r = q.execute()
                 linhas = r.data or []
             except Exception:
@@ -10677,10 +10677,9 @@ async def crm_leads_stream(intervalo: float = 4.0, todos: int = 0, usuario: str 
 
 @app.get("/crm/leads/{dominio}")
 def crm_lead_detalhe(dominio: str, usuario: str = Depends(verificar_token)):
-    """Um domínio: dados do lead + contatos prospectados + histórico de interações."""
+    """Um domínio: dados do lead + contatos prospectados + histórico de interações. Ver é de todo mundo."""
     sb = get_supabase()
     lead = _crm_lead_ou_404(sb, dominio)
-    _crm_exige_dono(lead, usuario)
     dominio_id = lead["id"]
     try:
         contatos = sb.table("leads_prospeccao_contatos").select("*") \
@@ -10697,7 +10696,7 @@ def crm_lead_registrar_contato(dominio: str, payload: CrmContatoPayload, request
     """Bot (ou humano) registra uma nova tentativa de contato ou resposta recebida."""
     sb = get_supabase()
     lead = _crm_lead_ou_404(sb, dominio)
-    _crm_exige_dono(lead, usuario)
+    _crm_exige_dono_para_editar(lead, usuario)
     dominio_id = lead["id"]
     agora = _dt.now(_tz.utc).isoformat()
     direcao = payload.direcao if payload.direcao in ("enviado", "recebido") else "enviado"
@@ -10747,7 +10746,7 @@ def crm_lead_mudar_estagio(dominio: str, payload: CrmEstagioPayload,
         raise HTTPException(status_code=400, detail=f"estagio_funil inválido. Use um de: {', '.join(_CRM_ESTAGIOS)}")
     sb = get_supabase()
     lead = _crm_lead_ou_404(sb, dominio)
-    _crm_exige_dono(lead, usuario)
+    _crm_exige_dono_para_editar(lead, usuario)
     dominio_id = lead["id"]
     atualiza = {"estagio_funil": estagio, "responsavel_bot": usuario}
     if payload.proximo_followup_em is not None:
@@ -10763,12 +10762,13 @@ def crm_lead_mudar_estagio(dominio: str, payload: CrmEstagioPayload,
     return {"ok": True, "dominio_id": dominio_id, "estagio_funil": estagio}
 
 @app.get("/crm/painel")
-def crm_painel(todos: int = 0, usuario: str = Depends(verificar_token)):
-    """Contagens agregadas pro cabeçalho do dashboard. Mesma trava de dono do /crm/leads."""
+def crm_painel(dono: str = "", usuario: str = Depends(verificar_token)):
+    """Contagens agregadas pro cabeçalho do dashboard. Ver é de todo mundo;
+    `dono=email` filtra a um operador, sem parâmetro vem tudo."""
     try:
         q = get_supabase().table("leads_prospeccao_dominios").select("estagio_funil,status")
-        if not (int(todos or 0) and usuario in ADMIN_EMAILS):
-            q = q.eq("dono_email", usuario)
+        if dono:
+            q = q.eq("dono_email", dono.strip().lower())
         linhas = q.execute().data or []
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Painel indisponível: {e}")
