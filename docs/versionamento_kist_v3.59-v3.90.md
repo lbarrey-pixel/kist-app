@@ -199,6 +199,20 @@ Versões que não têm commit próprio: **v3.69** está dentro de bcd73d0 (v3.70
 - Dados: `mercado_observacoes` 146 e 272 (Pix de OCR de 19,40 e 19,69) ficaram sem preço (backup `_bkp_20260923_mercado_observacoes`). R-1375: o Duracell ficou com custo 198,90 e venda 331,37, confirmados pelo Leonardo (backup `_bkp_20260923_itens_r1375`).
 - Propostas antigas com custo tirado de oferta divergente (vão aparecer com o aviso no card): 1050902 (terrômetro, 4.333,26), 1050903 (estilete, trena 19,27, torquês, chave ajustável 74,79), 1051007 e 1051012.
 
+## v3.91 · 24/09 · CRM de leads frios (base + API para os bots)
+- **Contexto** (Leonardo, 24/09): anos de prospecção por LinkedIn/LinkedHelper/e-mail geraram centenas de contatos que responderam mas nunca viraram cotação. Objetivo: catalogar esses leads "frios" e abrir caminho para os bots reativarem contato.
+- **Extração** (fora do deploy, roda local): `scripts/extrair_leads_email.py` varre, via Outlook local (COM/`pywin32`), as pastas de Itens Enviados de todas as contas do perfil (incluindo as aninhadas dentro da Caixa de Entrada, típico de conta IMAP) atrás dos assuntos de prospecção usados pela equipe (Leonardo, Thiago, Fábio — 5 variantes de assunto), e cruza com as Caixas de Entrada de todas as contas para achar qualquer interação (resposta direta ou outro contato do mesmo domínio). `scripts/carregar_leads_supabase.py` faz a carga (upsert) no Supabase, cruzando com `clientes_dominios` para excluir quem já é cliente.
+- **[B]** Novas rotas, escopo de API igual a qualquer outra rota do sistema (leitura lê, escrita também grava — nenhum mecanismo novo):
+  - `GET /crm/leads`: fila de leads, filtra por `estagio`, `status`, `teve_resposta`, `busca` (domínio).
+  - `GET /crm/leads/{dominio}`: lead + contatos prospectados + histórico de interações.
+  - `POST /crm/leads/{dominio}/contato`: bot (ou humano) registra uma nova tentativa de contato ou resposta recebida.
+  - `POST /crm/leads/{dominio}/estagio`: avança/muda o estágio do funil (`frio → aquecendo → respondeu → qualificado → proposta_enviada → convertido/descartado`); `convertido`/`descartado` também refletem em `status`.
+  - `GET /crm/painel`: contagens agregadas por estágio.
+  - `GET /crm/leads/stream`: SSE — o backend sonda o banco a cada poucos segundos e empurra só o que mudou; escolhido no lugar do Supabase Realtime direto no navegador para não expor chave nenhuma do Supabase nem exigir um provedor de login novo (o dashboard usa o mesmo login Google já restrito a `USUARIOS_PERMITIDOS`).
+- DB: tabelas novas `leads_prospeccao_dominios`, `leads_prospeccao_contatos`, `leads_prospeccao_interacoes` (RLS ligado, sem policy — só a service role, usada pelo backend, lê/grava). Colunas de funil em `leads_prospeccao_dominios`: `estagio_funil`, `proximo_followup_em`, `responsavel_bot`, `observacao`, `ultimo_contato_em`. Colunas de canal em `leads_prospeccao_interacoes`: `canal`, `direcao`, `origem`.
+- Dados (24/09): 534 domínios prospectados nos últimos 36 meses, 645 contatos, 6.299 interações; 220 domínios já tiveram alguma resposta; 3 já eram clientes (excluídos da fila de leads frios, permanecem com `status=convertido`).
+- ⚠ Dashboard (frontend separado, tempo real via SSE) ainda não construído — próxima etapa.
+
 ## v3.90 · 23/09 · Uma proposta por arquivo para a Construcap; matching tenta de novo
 - **Lei por cliente** (Leonardo, 23/09): para o CNPJ de ORIGEM 63.945.143/0001-96 (Consórcio Construcap Copasa OHLA, BR-040), cada ARQUIVO anexo vira UMA proposta própria, mesmo com o mesmo destino. Arquivo com dois destinos dentro continua quebrando por destino. Para todos os outros clientes continua a regra geral de DESTINO (caso Universal: 6 PDFs = uma aba).
   - [B] `CNPJS_UMA_PROPOSTA_POR_ARQUIVO` (constante — cliente novo entra ali) e `_cnpjs_no_texto`. Na extração, se o texto do e-mail traz um desses CNPJs e há mais de um arquivo anexo, entra no começo do pedido uma instrução "REGRA DESTE CLIENTE" com a lista de arquivos e o pedido de usar a identificação do documento como título. Nota nova ao operador: `uma_por_arquivo`.

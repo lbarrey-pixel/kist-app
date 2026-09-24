@@ -1,4 +1,6 @@
 import os, csv, io, re, time, base64 as _b64
+import asyncio as _asyncio
+import json as _json
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
@@ -7,7 +9,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 import anthropic
 from supabase import create_client
-from datetime import date
+from datetime import date, datetime as _dt, timezone as _tz
 import extract_msg
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
@@ -105,7 +107,8 @@ from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_
 # v3.88 — acerto de cache da pesquisa grava o motor do botão (KistBot Dwight dava 500 na R-1393).
 # v3.89 — só frontend (renovação do login para token restaurado); o número sobe para o deploy ser conferível.
 # v3.90 — lei por cliente (Construcap: uma proposta por arquivo) + matching com nova tentativa quando a resposta vem cortada.
-VERSAO_BACKEND = "3.90"
+# v3.91 — CRM de leads frios: /crm/leads e afins para os bots trabalharem a fila de prospecção que nunca virou cotação.
+VERSAO_BACKEND = "3.91"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -10514,3 +10517,187 @@ def _ds_marcar_itens(sb, itens):
                 it[campo] = ds_id                       # identidade tecnica confirmada
             else:
                 it[f"{campo}_disponivel"] = ds_id       # existe, mas o operador decide
+
+
+# ── CRM de leads frios (v3.91) ──────────────────────────────────────────────
+# Base povoada a partir do Outlook local (script fora do deploy, roda na
+# maquina do Leonardo): domínios/contatos prospectados por e-mail que nunca
+# viraram cotação. Os bots leem e trabalham essa fila por aqui; escopo
+# 'leitura' só lê, escopo 'escrita' também registra contato e muda estágio —
+# igual a qualquer outra rota do sistema, sem mecanismo novo de permissão.
+_CRM_ESTAGIOS = ("frio", "aquecendo", "respondeu", "qualificado",
+                  "proposta_enviada", "convertido", "descartado")
+
+class CrmContatoPayload(BaseModel):
+    canal: str = "email"
+    direcao: str = "enviado"          # enviado | recebido
+    email: Optional[str] = None
+    nome: Optional[str] = None
+    telefone: Optional[str] = None
+    assunto: Optional[str] = None
+    trecho: Optional[str] = None
+
+class CrmEstagioPayload(BaseModel):
+    estagio_funil: str
+    proximo_followup_em: Optional[str] = None
+    observacao: Optional[str] = None
+
+def _crm_dominio_id(sb, dominio: str) -> int:
+    dominio = (dominio or "").strip().lower()
+    r = sb.table("leads_prospeccao_dominios").select("id").eq("dominio", dominio).limit(1).execute()
+    linhas = r.data or []
+    if not linhas:
+        raise HTTPException(status_code=404, detail=f"Domínio '{dominio}' não está na base de leads.")
+    return linhas[0]["id"]
+
+@app.get("/crm/leads")
+def crm_leads_listar(estagio: str = "", status: str = "", teve_resposta: int = -1,
+                      busca: str = "", limite: int = 100, offset: int = 0,
+                      usuario: str = Depends(verificar_token)):
+    """Fila de leads frios para os bots (ou o dashboard) trabalharem.
+
+    `busca` casa por domínio. `teve_resposta=1` filtra só quem já respondeu
+    alguma vez (mais quente); `-1` não filtra.
+    """
+    limite = max(1, min(int(limite or 100), 500))
+    offset = max(0, int(offset or 0))
+    try:
+        q = get_supabase().table("leads_prospeccao_dominios").select(
+            "id,dominio,empresa,cnpj,endereco,telefone_geral,primeiro_envio,ultimo_envio,"
+            "ultimo_contato_em,teve_resposta,status,estagio_funil,proximo_followup_em,"
+            "responsavel_bot,observacao,criado_em,atualizado_em",
+            count="exact",
+        ).order("ultimo_envio", desc=True).range(offset, offset + limite - 1)
+        if estagio:
+            q = q.eq("estagio_funil", estagio.strip().lower())
+        if status:
+            q = q.eq("status", status.strip().lower())
+        if int(teve_resposta) in (0, 1):
+            q = q.eq("teve_resposta", bool(int(teve_resposta)))
+        if busca:
+            q = q.ilike("dominio", f"%{busca.strip().lower()}%")
+        r = q.execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Falha ao listar leads: {e}")
+    return {"leads": r.data or [], "total": r.count, "limite": limite, "offset": offset}
+
+@app.get("/crm/leads/stream")
+async def crm_leads_stream(intervalo: float = 4.0, usuario: str = Depends(verificar_token)):
+    """SSE: o dashboard assina isto e recebe atualizações quase em tempo real.
+
+    Declarada ANTES de `/crm/leads/{dominio}` de propósito: o FastAPI casa
+    rotas na ordem em que são declaradas, e `{dominio}` bateria com "stream"
+    primeiro se viesse antes.
+
+    Não é Supabase Realtime (isso exigiria expor uma chave do Supabase e um
+    provedor de login novo no navegador) — o backend, que já é o único ponto
+    de acesso ao banco, sondeia a cada `intervalo` segundos e empurra só o que
+    mudou desde a última rodada. Simples, sem credencial nova, ~mesma
+    experiência pro operador olhando o painel.
+    """
+    intervalo = max(2.0, min(float(intervalo or 4.0), 30.0))
+    sb = get_supabase()
+
+    async def eventos():
+        desde = _dt.now(_tz.utc).isoformat()
+        yield "event: ping\ndata: {}\n\n"
+        while True:
+            await _asyncio.sleep(intervalo)
+            try:
+                r = sb.table("leads_prospeccao_dominios").select("*") \
+                    .gt("atualizado_em", desde).order("atualizado_em").execute()
+                linhas = r.data or []
+            except Exception:
+                linhas = []
+            if linhas:
+                desde = linhas[-1]["atualizado_em"]
+                yield f"event: leads\ndata: {_json.dumps(linhas, ensure_ascii=False, default=str)}\n\n"
+            else:
+                yield "event: ping\ndata: {}\n\n"
+
+    return StreamingResponse(eventos(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    })
+
+@app.get("/crm/leads/{dominio}")
+def crm_lead_detalhe(dominio: str, usuario: str = Depends(verificar_token)):
+    """Um domínio: dados do lead + contatos prospectados + histórico de interações."""
+    sb = get_supabase()
+    dominio_id = _crm_dominio_id(sb, dominio)
+    try:
+        lead = sb.table("leads_prospeccao_dominios").select("*").eq("id", dominio_id).limit(1).execute().data[0]
+        contatos = sb.table("leads_prospeccao_contatos").select("*") \
+            .eq("dominio_id", dominio_id).order("criado_em").execute().data or []
+        interacoes = sb.table("leads_prospeccao_interacoes").select("*") \
+            .eq("dominio_id", dominio_id).order("data_interacao", desc=True).limit(200).execute().data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Falha ao ler lead: {e}")
+    return {"lead": lead, "contatos": contatos, "interacoes": interacoes}
+
+@app.post("/crm/leads/{dominio}/contato")
+def crm_lead_registrar_contato(dominio: str, payload: CrmContatoPayload, request: Request,
+                                usuario: str = Depends(verificar_token)):
+    """Bot (ou humano) registra uma nova tentativa de contato ou resposta recebida."""
+    sb = get_supabase()
+    dominio_id = _crm_dominio_id(sb, dominio)
+    agora = _dt.now(_tz.utc).isoformat()
+    direcao = payload.direcao if payload.direcao in ("enviado", "recebido") else "enviado"
+    # Chave de API (bot) manda pelo escopo; ID token do Google (humano na tela) devolve None.
+    via_chave_api = _escopo_do_request(request.headers.get("authorization") or "") is not None
+    try:
+        sb.table("leads_prospeccao_interacoes").insert({
+            "dominio_id": dominio_id,
+            "email": payload.email,
+            "nome": payload.nome,
+            "telefone": payload.telefone,
+            "data_interacao": agora,
+            "assunto": payload.assunto,
+            "trecho": payload.trecho,
+            "canal": payload.canal or "email",
+            "direcao": direcao,
+            "origem": "bot" if via_chave_api else "manual",
+        }).execute()
+        atualiza = {"ultimo_contato_em": agora, "responsavel_bot": usuario}
+        if direcao == "recebido":
+            atualiza["teve_resposta"] = True
+        sb.table("leads_prospeccao_dominios").update(atualiza).eq("id", dominio_id).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Falha ao registrar contato: {e}")
+    return {"ok": True, "dominio_id": dominio_id, "registrado_em": agora}
+
+@app.post("/crm/leads/{dominio}/estagio")
+def crm_lead_mudar_estagio(dominio: str, payload: CrmEstagioPayload,
+                            usuario: str = Depends(verificar_token)):
+    """Avança (ou volta) o lead no funil. `convertido`/`descartado` também refletem em `status`."""
+    estagio = (payload.estagio_funil or "").strip().lower()
+    if estagio not in _CRM_ESTAGIOS:
+        raise HTTPException(status_code=400, detail=f"estagio_funil inválido. Use um de: {', '.join(_CRM_ESTAGIOS)}")
+    sb = get_supabase()
+    dominio_id = _crm_dominio_id(sb, dominio)
+    atualiza = {"estagio_funil": estagio, "responsavel_bot": usuario}
+    if payload.proximo_followup_em is not None:
+        atualiza["proximo_followup_em"] = payload.proximo_followup_em or None
+    if payload.observacao is not None:
+        atualiza["observacao"] = payload.observacao
+    if estagio in ("convertido", "descartado"):
+        atualiza["status"] = estagio
+    try:
+        sb.table("leads_prospeccao_dominios").update(atualiza).eq("id", dominio_id).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Falha ao mudar estágio: {e}")
+    return {"ok": True, "dominio_id": dominio_id, "estagio_funil": estagio}
+
+@app.get("/crm/painel")
+def crm_painel(usuario: str = Depends(verificar_token)):
+    """Contagens agregadas pro cabeçalho do dashboard."""
+    try:
+        r = get_supabase().table("leads_prospeccao_dominios").select("estagio_funil,status").execute()
+        linhas = r.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Painel indisponível: {e}")
+    por_estagio: dict = {}
+    for l in linhas:
+        k = l.get("estagio_funil") or "frio"
+        por_estagio[k] = por_estagio.get(k, 0) + 1
+    return {"total": len(linhas), "por_estagio": por_estagio}

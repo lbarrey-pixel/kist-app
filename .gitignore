@@ -1,0 +1,7 @@
+scripts/.env
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+dist/
+crm-dashboard/.env

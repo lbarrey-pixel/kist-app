@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: kist-crm-dashboard
+    env: static
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_URL
+        sync: false
+      - key: VITE_GOOGLE_CLIENT_ID
+        sync: false
+      - key: VITE_USUARIOS_PERMITIDOS
+        sync: false
