@@ -111,7 +111,8 @@ from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_
 # v3.92 — CRM: dono_email restringe cada chave ao lead do próprio operador; qualificação automática por IA (real vs genérico) quando chega resposta.
 # v3.93 — CRM: correção de regra — ver lead é de todo mundo, só mudar estágio/registrar contato fica travado no dono (ou admin).
 # v3.94 — /casar-po: número da PO também reconhece "PO_12345" (underscore, comum em assunto de e-mail) e "Pedido de Compra 12345" / "Pedido de Compra Nº 12345" (sem o prefixo "PO"), além do formato antigo.
-VERSAO_BACKEND = "3.94"
+# v3.95 — só frontend (marcador de versão + auto-update forçado quando o bundle publicado muda); o número sobe para o deploy ser conferível.
+VERSAO_BACKEND = "3.95"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook

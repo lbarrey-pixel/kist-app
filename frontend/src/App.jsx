@@ -6,6 +6,7 @@ import Analista from "./Analista.jsx";
 import ChamadosAdmin from "./ChamadosAdmin.jsx";
 import Agentes from "./Agentes.jsx";
 import Suporte from "./Suporte.jsx";
+import VersaoBadge from "./Versao.jsx";
 import Catalogo, { ConhecimentoSelo, ExtratoModal, ExtratosPropostaModal } from "./Catalogo.jsx";
 import { DatasheetBotao, DatasheetLote, DatasheetBaixarTodos } from "./Datasheet.jsx";
 import {
@@ -3107,28 +3108,32 @@ export default function App() {
   // ── TELA DE LOGIN ─────────────────────────────────────────────────────────
   if (!usuario) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-paper font-sans">
-        <div className="w-full max-w-sm rounded-2xl border border-line bg-surface p-10 text-center">
-          <div className="mx-auto mb-5 flex h-12 w-12 items-center justify-center rounded-xl bg-kist">
-            <span className="font-mono text-xl font-semibold text-white">K</span>
-          </div>
-          <h1 className="text-[18px] font-semibold tracking-tight text-ink">Kist · Cabine</h1>
-          <p className="mb-8 mt-1 text-[13px] text-sub">Entre com sua conta Google para acessar.</p>
-          {authErro && (
-            <div className="mb-4 rounded-lg border border-rose/40 bg-rose/10 px-3 py-2 text-left text-[12.5px] leading-snug text-rose">
-              {authErro}
+      <>
+        <div className="flex min-h-screen items-center justify-center bg-paper font-sans">
+          <div className="w-full max-w-sm rounded-2xl border border-line bg-surface p-10 text-center">
+            <div className="mx-auto mb-5 flex h-12 w-12 items-center justify-center rounded-xl bg-kist">
+              <span className="font-mono text-xl font-semibold text-white">K</span>
             </div>
-          )}
-          <div ref={(el) => { if (el) { if (window.google) renderBotaoGoogle(el); else { const t = setInterval(() => { if (window.google) { clearInterval(t); renderBotaoGoogle(el); } }, 100); setTimeout(() => clearInterval(t), 5000); } } }}
-            className="mb-3 flex min-h-[44px] items-center justify-center"></div>
-          <p className="text-[11.5px] text-faint">Acesso restrito à equipe Kist</p>
+            <h1 className="text-[18px] font-semibold tracking-tight text-ink">Kist · Cabine</h1>
+            <p className="mb-8 mt-1 text-[13px] text-sub">Entre com sua conta Google para acessar.</p>
+            {authErro && (
+              <div className="mb-4 rounded-lg border border-rose/40 bg-rose/10 px-3 py-2 text-left text-[12.5px] leading-snug text-rose">
+                {authErro}
+              </div>
+            )}
+            <div ref={(el) => { if (el) { if (window.google) renderBotaoGoogle(el); else { const t = setInterval(() => { if (window.google) { clearInterval(t); renderBotaoGoogle(el); } }, 100); setTimeout(() => clearInterval(t), 5000); } } }}
+              className="mb-3 flex min-h-[44px] items-center justify-center"></div>
+            <p className="text-[11.5px] text-faint">Acesso restrito à equipe Kist</p>
+          </div>
         </div>
-      </div>
+        <VersaoBadge />
+      </>
     );
   }
 
   // ── APP PRINCIPAL ──────────────────────────────────────────────────────────
   return (
+    <>
     <div className="flex h-screen bg-paper font-sans text-ink antialiased">
       <Sidebar active={activeNav} onNavigate={navegar} usuario={usuario} stats={stats} onLogout={logout} isAdmin={isAdmin} alertas={alertasChamados} />
 
@@ -3983,5 +3988,7 @@ export default function App() {
       <Suporte token={token} usuario={usuario}
         onAbrirRequisicoes={() => { setPagina("requisicoes"); setShowDocs(false); }} />
     </div>
+    <VersaoBadge />
+    </>
   );
 }
