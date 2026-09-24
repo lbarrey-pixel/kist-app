@@ -110,7 +110,8 @@ from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_
 # v3.91 — CRM de leads frios: /crm/leads e afins para os bots trabalharem a fila de prospecção que nunca virou cotação.
 # v3.92 — CRM: dono_email restringe cada chave ao lead do próprio operador; qualificação automática por IA (real vs genérico) quando chega resposta.
 # v3.93 — CRM: correção de regra — ver lead é de todo mundo, só mudar estágio/registrar contato fica travado no dono (ou admin).
-VERSAO_BACKEND = "3.93"
+# v3.94 — /casar-po: número da PO também reconhece "PO_12345" (underscore, comum em assunto de e-mail) e "Pedido de Compra 12345" / "Pedido de Compra Nº 12345" (sem o prefixo "PO"), além do formato antigo.
+VERSAO_BACKEND = "3.94"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -7540,6 +7541,19 @@ async def _ler_po(arquivo):
 def _digitos(s):
     return re.sub(r"\D", "", s or "")
 
+# Reconhece "PO-12345" / "PO 12345" / "PO_12345" / "PO12345" (formato antigo)
+# e também "Pedido de Compra 12345" / "Pedido de Compra Nº 12345" (assunto de
+# e-mail e texto de PDF costumam vir assim, sem o prefixo "PO").
+_RE_NUM_PO = re.compile(
+    r"(?:PO[-_\s]?|Pedido\s+de\s+Compra\s*(?:N[º°o]\.?\s*)?)(\d{5,})",
+    re.I,
+)
+
+def _extrair_num_po(texto):
+    """Retorna só os dígitos do número da PO/Pedido de Compra achado no texto, ou ''."""
+    m = _RE_NUM_PO.search(texto or "")
+    return m.group(1) if m else ""
+
 def _toks(s):
     return set(re.findall(r"[a-z0-9]+", (s or "").lower()))
 
@@ -7842,8 +7856,7 @@ async def casar_po(
 
     cnpjs = re.findall(r"\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}", conteudo)
     cnpjs_dig = list(dict.fromkeys([_digitos(c) for c in cnpjs if len(_digitos(c)) == 14]))
-    pos = re.findall(r"PO[-\s]?\d{5,}", conteudo, re.I)
-    po_num = pos[0].strip() if pos else ""
+    po_num = _extrair_num_po(conteudo)
 
     itens_po, destino = [], ""
     avisos_extracao: list[str] = []
@@ -7907,8 +7920,7 @@ async def casar_po(
                 cnpjs_dig.append(d)
         # Número PO do raw se não encontrado antes
         if not po_num:
-            pos2 = re.findall(r"PO[-\s]?\d{5,}", raw, re.I)
-            if pos2: po_num = pos2[0].strip()
+            po_num = _extrair_num_po(raw)
 
     except Exception as _ex:
         avisos_extracao.append(f"Extração Sonnet: {_ex}")

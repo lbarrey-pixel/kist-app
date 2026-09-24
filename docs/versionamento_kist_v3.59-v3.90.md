@@ -199,6 +199,10 @@ Versões que não têm commit próprio: **v3.69** está dentro de bcd73d0 (v3.70
 - Dados: `mercado_observacoes` 146 e 272 (Pix de OCR de 19,40 e 19,69) ficaram sem preço (backup `_bkp_20260923_mercado_observacoes`). R-1375: o Duracell ficou com custo 198,90 e venda 331,37, confirmados pelo Leonardo (backup `_bkp_20260923_itens_r1375`).
 - Propostas antigas com custo tirado de oferta divergente (vão aparecer com o aviso no card): 1050902 (terrômetro, 4.333,26), 1050903 (estilete, trena 19,27, torquês, chave ajustável 74,79), 1051007 e 1051012.
 
+## v3.94 · 24/09 · /casar-po: reconhece PO com underscore e "Pedido de Compra" sem o prefixo "PO"
+- **Achado pelo Leonardo**: assunto de e-mail como `PO_215086 KIST SOLUCOES...` e texto de PDF como `Pedido de Compra Nº 215086` não batiam com o regex antigo (`PO[-\s]?\d{5,}`, só aceitava hífen ou espaço logo depois de "PO"). `po_numero` voltava vazio e a OC nascia com "PO pendente" mesmo com o número claramente no texto.
+- [B] Novo helper `_extrair_num_po(texto)`, regex ampliado: `PO[-_\s]?` **ou** `Pedido de Compra [Nº ]?`, os dois seguidos de `\d{5,}`. Usado nos dois pontos do `/casar-po` que extraem o número (texto/e-mail e resposta bruta do Sonnet). Formatos antigos (`PO-12345`, `PO 12345`, `PO12345`) continuam batendo. `po_numero` continua voltando só os dígitos, sem prefixo.
+
 ## v3.93 · 24/09 · CRM: correção — ver é de todo mundo, editar é do dono
 - **Correção da regra da v3.92** (Leonardo, mesmo dia): a trava de dono foi longe demais — bloqueava até a LEITURA. A regra certa: **ver os leads é de todo mundo** (Leonardo, Thiago e Fábio enxergam a base inteira); só **mudar estágio ou registrar contato** continua travado no dono (ou admin).
 - [B] `GET /crm/leads`, `GET /crm/leads/{dominio}`, `GET /crm/painel`, `GET /crm/leads/stream`: removida a trava de leitura. Parâmetro `todos` (antes só-admin) virou `dono=<email>` — filtra por um operador específico; sem o parâmetro, vem tudo, pra qualquer chave autenticada.
