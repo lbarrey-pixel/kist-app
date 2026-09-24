@@ -4,6 +4,7 @@
 // Importado por App.jsx, Propostas.jsx, OrdensCompra.jsx e Docs.jsx.
 // ──────────────────────────────────────────────────────────────────────────
 import { useState, useMemo, useEffect } from "react";
+import { VersaoInline } from "./Versao.jsx";
 
 // ── Léxico de confiança (alma da revisão) ─────────────────────────────────
 export const CONF = {
@@ -252,6 +253,7 @@ export function Sidebar({ active, onNavigate, usuario, stats, onLogout, isAdmin,
             <IconLogout size={16} />
           </button>
         </div>
+        <VersaoInline className="px-2 pt-1.5" />
       </div>
     </aside>
   );

@@ -7,6 +7,7 @@
 // rota /crm/leads/stream usa o MESMO Bearer token de todas as outras rotas
 // do backend, sem mecanismo de auth novo).
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import { APP_VERSION, useVersaoCheck } from "./versao.js";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
@@ -118,7 +119,7 @@ function useLeadsStream(token, onLeads, filtroDono) {
   }, [token, onLeads, filtroDono]);
 }
 
-function Login({ onLogin, erro }) {
+function Login({ onLogin, erro, versaoLabel }) {
   const btnRef = useRef(null);
 
   useEffect(() => {
@@ -151,6 +152,7 @@ function Login({ onLogin, erro }) {
         <p>Base de prospecção fria. Acesso restrito à equipe.</p>
         <div ref={btnRef} />
         {erro && <div className="erro">{erro}</div>}
+        <div className="muted" style={{ marginTop: 14 }}>{versaoLabel}</div>
       </div>
     </div>
   );
@@ -343,6 +345,8 @@ function PainelDetalhe({ dominio, token, usuario, souAdmin, onFechar, onAtualiza
 }
 
 export default function App() {
+  const atualizandoVersao = useVersaoCheck();
+  const versaoLabel = atualizandoVersao ? "atualizando…" : `v${APP_VERSION}`;
   const [token, setToken] = useState(() => { try { return localStorage.getItem("kist_crm_token"); } catch { return null; } });
   const [usuario, setUsuario] = useState(() => { try { return JSON.parse(localStorage.getItem("kist_crm_user") || "null"); } catch { return null; } });
   const [authErro, setAuthErro] = useState("");
@@ -438,7 +442,7 @@ export default function App() {
   useLeadsStream(token, onLeadsStream, filtroDono);
 
   if (!token || !usuario) {
-    return <Login onLogin={handleGoogleResponse} erro={authErro} />;
+    return <Login onLogin={handleGoogleResponse} erro={authErro} versaoLabel={versaoLabel} />;
   }
 
   const lista = Object.values(leads).filter((l) => {
@@ -475,6 +479,7 @@ export default function App() {
           {carregando && <span className="muted">atualizando…</span>}
         </div>
         <div className="topo-usuario">
+          <span className="muted" title={`build ${APP_VERSION}`}>{versaoLabel}</span>
           {usuario.foto && <img src={usuario.foto} alt="" />}
           <span>{usuario.nome}</span>
           <button onClick={logout}>Sair</button>

@@ -3133,7 +3133,6 @@ export default function App() {
 
   // ── APP PRINCIPAL ──────────────────────────────────────────────────────────
   return (
-    <>
     <div className="flex h-screen bg-paper font-sans text-ink antialiased">
       <Sidebar active={activeNav} onNavigate={navegar} usuario={usuario} stats={stats} onLogout={logout} isAdmin={isAdmin} alertas={alertasChamados} />
 
@@ -3988,7 +3987,5 @@ export default function App() {
       <Suporte token={token} usuario={usuario}
         onAbrirRequisicoes={() => { setPagina("requisicoes"); setShowDocs(false); }} />
     </div>
-    <VersaoBadge />
-    </>
   );
 }

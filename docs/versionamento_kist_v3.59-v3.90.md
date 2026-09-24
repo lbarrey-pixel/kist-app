@@ -199,6 +199,12 @@ Versões que não têm commit próprio: **v3.69** está dentro de bcd73d0 (v3.70
 - Dados: `mercado_observacoes` 146 e 272 (Pix de OCR de 19,40 e 19,69) ficaram sem preço (backup `_bkp_20260923_mercado_observacoes`). R-1375: o Duracell ficou com custo 198,90 e venda 331,37, confirmados pelo Leonardo (backup `_bkp_20260923_itens_r1375`).
 - Propostas antigas com custo tirado de oferta divergente (vão aparecer com o aviso no card): 1050902 (terrômetro, 4.333,26), 1050903 (estilete, trena 19,27, torquês, chave ajustável 74,79), 1051007 e 1051012.
 
+## v3.96 · 24/09 · Marcador de versão da v3.95 era discreto demais + levado ao CRM
+- **Achado pelo Leonardo, pelo celular**: acessou o Cabine depois do deploy da v3.95 e não notou o badge de versão. Causa: `fixed bottom-1.5 right-2`, texto 10px cinza-claro (`text-faint`), perto do balão de suporte (`fixed bottom-5 right-5`) — em mobile, `position: fixed` rente à borda também corre risco de ficar sob a barra do navegador.
+- [F] `frontend/src/Versao.jsx`: `VersaoBadge` (chip com borda/fundo, ainda `fixed`) ficou só para a tela de login, que não tem sidebar. Novo `VersaoInline`, texto no FLUXO normal da página (sem `position: fixed`) — usado no rodapé da `Sidebar` (`kist-ui.jsx`), logo abaixo do nome do usuário. Garantia de visibilidade sem depender de z-index ou viewport de mobile.
+- [F] Mesmo esquema (hash do commit + `version.json` + checagem a cada 5 min/troca de aba + atualização forçada) replicado no `crm-dashboard`, que é um app Vite separado (`crm-dashboard/vite.config.js`, `crm-dashboard/src/versao.js`): versão no rodapé do card de login e no cabeçalho (`topo-usuario`), ao lado do nome do operador. Os dois serviços deployam do mesmo commit do monorepo, então mostram sempre o mesmo hash.
+- Testado com `vite preview` nos dois apps + token forjado no `localStorage` pra ver a tela logada sem backend: badge aparece nítido nas duas telas dos dois apps.
+
 ## v3.95 · 24/09 · Frontend: marcador de versão + auto-update forçado
 - **Pedido do Leonardo, 24/09**: o operador precisa sempre saber se está na versão publicada mais recente da Cabine; se não estiver, atualizar sozinho, derrubando os cookies.
 - [F] `vite.config.js`: identifica o build pelo hash curto do commit (`git rev-parse --short HEAD`, cai para `"dev"` se não achar git) e injeta em `__APP_VERSION__`; um plugin (`writeBundle`) grava `dist/version.json` (`{version, build}`) depois de cada build, servido como arquivo estático junto com o `index.html`.
