@@ -124,7 +124,8 @@ from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_
 # v3.105 — painel de desempenho dos bots de pesquisa (pedido do Leonardo): GET /pesquisa/desempenho (dia, período ou compilado; todos os operadores, filtro opcional; JSON ou texto; liberado pra chave do KistBot) + página "Desempenho" no Cabine. Veredito da exportação/compra agora é POR MOTOR (antes o do motor que respondeu por último engolia o outro), ganha a categoria `sem_oferta` (bot não achou, operador achou) e guarda o retrato do que o bot sugeriu x o que saiu.
 # v3.106 — `_registrar_vereditos`: falha ao gravar UM veredito não derruba mais os outros itens (o try era um só, em volta do laço). Achado no recálculo da v3.105: a trava do banco recusava "sem_oferta" (ampliada por migration).
 # v3.107 — KistBot lê a base de conhecimento: GET /contexto e GET /versao liberados pra chave de escopo `pesquisa`, mas o /contexto mostra pra ela SÓ as seções de pesquisa (_SECOES_ESCOPO_PESQUISA) — clientes, markup e carteira ficam de fora. Mensagem de 403 do escopo `pesquisa` passou a listar as rotas de verdade.
-VERSAO_BACKEND = "3.107"
+# v3.108 — CRM de prospecção fria pronto pra bot trabalhar sozinho (pedido do Leonardo, 25/09): tabela `leads_prospeccao_acoes` + POST/GET `/crm/leads/{dominio}/acoes` registram o que o bot fez e quando volta a agir, sem fila pronta — `GET /crm/leads?ordenar=proximo_followup_em&crescente=1` monta a rotina. Regra de dono apertada: pela TELA (humano) continua "todo mundo vê, admin edita qualquer um"; por CHAVE DE API (bot) agora é sempre só o PRÓPRIO dono, ler e mexer, sem exceção nem pro admin.
+VERSAO_BACKEND = "3.108"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -10881,43 +10882,74 @@ def _crm_lead_ou_404(sb, dominio: str) -> dict:
         raise HTTPException(status_code=404, detail=f"Domínio '{dominio}' não está na base de leads.")
     return linhas[0]
 
-def _crm_exige_dono_para_editar(lead: dict, usuario: str):
-    """Ver é de todo mundo (regra do Leonardo, 24/09); MEXER (registrar contato,
-    mudar estágio) continua travado no dono do lead. `dono_email` vazio (lead
-    ainda sem prospecção atribuída) só é editável por ADMIN_EMAILS."""
-    if usuario in ADMIN_EMAILS:
-        return
+def _crm_via_bot(request: Request) -> bool:
+    """True se a credencial é uma chave de API (bot). None (ID token do Google,
+    humano na tela) devolve False."""
+    return _escopo_do_request(request.headers.get("authorization") or "") is not None
+
+def _crm_exige_dono_para_editar(lead: dict, usuario: str, eh_bot: bool = False):
+    """Regra do Leonardo (24/09, ajustada em 25/09): pela TELA (humano), ver é de
+    todo mundo e admin edita qualquer lead. Por CHAVE DE API (bot), a regra é
+    mais estrita — nem admin foge: cada bot só mexe no que é do PRÓPRIO dono,
+    sem exceção. `dono_email` vazio (lead ainda sem prospecção atribuída) só é
+    editável por admin pela tela."""
     dono = lead.get("dono_email")
     if dono and dono == usuario:
+        return
+    if not eh_bot and usuario in ADMIN_EMAILS:
         return
     raise HTTPException(
         status_code=403,
         detail=("Lead sem dono definido — só admin edita até ser atribuído." if not dono
-                 else f"Lead pertence a {dono}: você pode ver, mas só o dono (ou admin) edita."),
+                 else f"Lead pertence a {dono}: fora do alcance desta credencial."),
     )
 
+def _crm_dono_efetivo(request: Request, usuario: str, dono_param: str) -> str:
+    """Filtro de dono para as rotas de LEITURA. Bot (chave de API) só enxerga os
+    PRÓPRIOS leads — o parâmetro `dono` é ignorado nesse caso, sem exceção pra
+    admin. Humano pela tela continua vendo a base inteira; `dono=` ali é só
+    filtro de conveniência."""
+    if _crm_via_bot(request):
+        return usuario
+    return (dono_param or "").strip().lower()
+
+_CRM_ORDENAVEIS = {
+    "ultimo_envio": "ultimo_envio",
+    "proximo_followup_em": "proximo_followup_em",
+    "ultimo_contato_em": "ultimo_contato_em",
+    "atualizado_em": "atualizado_em",
+    "criado_em": "criado_em",
+}
+
 @app.get("/crm/leads")
-def crm_leads_listar(estagio: str = "", status: str = "", teve_resposta: int = -1,
+def crm_leads_listar(request: Request, estagio: str = "", status: str = "", teve_resposta: int = -1,
                       busca: str = "", limite: int = 100, offset: int = 0, dono: str = "",
+                      ordenar: str = "ultimo_envio", crescente: int = 0,
                       usuario: str = Depends(verificar_token)):
     """Fila de leads para os bots (ou o dashboard) trabalharem.
 
-    Ver é de todo mundo (regra do Leonardo, 24/09) — a chave de um operador lê
-    a base inteira. `dono=email` filtra só os leads de um operador específico;
-    sem o parâmetro, vem tudo. `busca` casa por domínio. `teve_resposta=1`
-    filtra só quem já respondeu alguma vez (mais quente); `-1` não filtra.
+    Pela TELA, ver é de todo mundo — `dono=email` filtra um operador, sem
+    parâmetro vem tudo. Por CHAVE DE API (bot), só vem o que é do PRÓPRIO
+    dono, sempre — o parâmetro `dono` é ignorado nesse caso.
+
+    `ordenar` (ex.: `proximo_followup_em`, com `crescente=1`) é como o bot monta
+    a própria rotina do dia — "quem eu preciso retomar contato primeiro".
+    `busca` casa por domínio. `teve_resposta=1` filtra só quem já respondeu
+    alguma vez (mais quente); `-1` não filtra.
     """
     limite = max(1, min(int(limite or 100), 500))
     offset = max(0, int(offset or 0))
+    dono_efetivo = _crm_dono_efetivo(request, usuario, dono)
+    coluna_ordem = _CRM_ORDENAVEIS.get((ordenar or "").strip().lower(), "ultimo_envio")
     try:
         q = get_supabase().table("leads_prospeccao_dominios").select(
             "id,dominio,empresa,cnpj,endereco,telefone_geral,primeiro_envio,ultimo_envio,"
             "ultimo_contato_em,teve_resposta,status,estagio_funil,proximo_followup_em,"
             "responsavel_bot,dono_email,observacao,criado_em,atualizado_em",
             count="exact",
-        ).order("ultimo_envio", desc=True).range(offset, offset + limite - 1)
-        if dono:
-            q = q.eq("dono_email", dono.strip().lower())
+        ).order(coluna_ordem, desc=not int(crescente or 0)).range(offset, offset + limite - 1)
+        if dono_efetivo:
+            q = q.eq("dono_email", dono_efetivo)
         if estagio:
             q = q.eq("estagio_funil", estagio.strip().lower())
         if status:
@@ -10932,7 +10964,8 @@ def crm_leads_listar(estagio: str = "", status: str = "", teve_resposta: int = -
     return {"leads": r.data or [], "total": r.count, "limite": limite, "offset": offset}
 
 @app.get("/crm/leads/stream")
-async def crm_leads_stream(intervalo: float = 4.0, dono: str = "", usuario: str = Depends(verificar_token)):
+async def crm_leads_stream(request: Request, intervalo: float = 4.0, dono: str = "",
+                            usuario: str = Depends(verificar_token)):
     """SSE: o dashboard assina isto e recebe atualizações quase em tempo real.
 
     Declarada ANTES de `/crm/leads/{dominio}` de propósito: o FastAPI casa
@@ -10945,11 +10978,12 @@ async def crm_leads_stream(intervalo: float = 4.0, dono: str = "", usuario: str 
     mudou desde a última rodada. Simples, sem credencial nova, ~mesma
     experiência pro operador olhando o painel.
 
-    Ver é de todo mundo: `dono=email` filtra a um operador, sem parâmetro vem tudo.
+    Mesma regra de dono do /crm/leads: pela tela, `dono=email` é filtro de
+    conveniência; por chave de API (bot), o próprio dono é forçado sempre.
     """
     intervalo = max(2.0, min(float(intervalo or 4.0), 30.0))
     sb = get_supabase()
-    dono = (dono or "").strip().lower()
+    dono = _crm_dono_efetivo(request, usuario, dono)
 
     async def eventos():
         desde = _dt.now(_tz.utc).isoformat()
@@ -10977,19 +11011,25 @@ async def crm_leads_stream(intervalo: float = 4.0, dono: str = "", usuario: str 
     })
 
 @app.get("/crm/leads/{dominio}")
-def crm_lead_detalhe(dominio: str, usuario: str = Depends(verificar_token)):
-    """Um domínio: dados do lead + contatos prospectados + histórico de interações. Ver é de todo mundo."""
+def crm_lead_detalhe(dominio: str, request: Request, usuario: str = Depends(verificar_token)):
+    """Um domínio: dados do lead + contatos + interações importadas + ações registradas.
+
+    Pela tela, ver é de todo mundo. Por chave de API (bot), só o próprio dono."""
     sb = get_supabase()
     lead = _crm_lead_ou_404(sb, dominio)
+    if _crm_via_bot(request) and lead.get("dono_email") != usuario:
+        raise HTTPException(status_code=403, detail=f"Lead pertence a {lead.get('dono_email') or '(sem dono)'}: fora do alcance desta credencial.")
     dominio_id = lead["id"]
     try:
         contatos = sb.table("leads_prospeccao_contatos").select("*") \
             .eq("dominio_id", dominio_id).order("criado_em").execute().data or []
         interacoes = sb.table("leads_prospeccao_interacoes").select("*") \
             .eq("dominio_id", dominio_id).order("data_interacao", desc=True).limit(200).execute().data or []
+        acoes = sb.table("leads_prospeccao_acoes").select("*") \
+            .eq("dominio_id", dominio_id).order("data_hora", desc=True).limit(200).execute().data or []
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Falha ao ler lead: {e}")
-    return {"lead": lead, "contatos": contatos, "interacoes": interacoes}
+    return {"lead": lead, "contatos": contatos, "interacoes": interacoes, "acoes": acoes}
 
 @app.post("/crm/leads/{dominio}/contato")
 def crm_lead_registrar_contato(dominio: str, payload: CrmContatoPayload, request: Request,
@@ -10997,12 +11037,11 @@ def crm_lead_registrar_contato(dominio: str, payload: CrmContatoPayload, request
     """Bot (ou humano) registra uma nova tentativa de contato ou resposta recebida."""
     sb = get_supabase()
     lead = _crm_lead_ou_404(sb, dominio)
-    _crm_exige_dono_para_editar(lead, usuario)
+    via_chave_api = _crm_via_bot(request)
+    _crm_exige_dono_para_editar(lead, usuario, via_chave_api)
     dominio_id = lead["id"]
     agora = _dt.now(_tz.utc).isoformat()
     direcao = payload.direcao if payload.direcao in ("enviado", "recebido") else "enviado"
-    # Chave de API (bot) manda pelo escopo; ID token do Google (humano na tela) devolve None.
-    via_chave_api = _escopo_do_request(request.headers.get("authorization") or "") is not None
     try:
         sb.table("leads_prospeccao_interacoes").insert({
             "dominio_id": dominio_id,
@@ -11039,7 +11078,7 @@ def crm_lead_registrar_contato(dominio: str, payload: CrmContatoPayload, request
             "interesse_classificado": interesse}
 
 @app.post("/crm/leads/{dominio}/estagio")
-def crm_lead_mudar_estagio(dominio: str, payload: CrmEstagioPayload,
+def crm_lead_mudar_estagio(dominio: str, payload: CrmEstagioPayload, request: Request,
                             usuario: str = Depends(verificar_token)):
     """Avança (ou volta) o lead no funil. `convertido`/`descartado` também refletem em `status`."""
     estagio = (payload.estagio_funil or "").strip().lower()
@@ -11047,7 +11086,7 @@ def crm_lead_mudar_estagio(dominio: str, payload: CrmEstagioPayload,
         raise HTTPException(status_code=400, detail=f"estagio_funil inválido. Use um de: {', '.join(_CRM_ESTAGIOS)}")
     sb = get_supabase()
     lead = _crm_lead_ou_404(sb, dominio)
-    _crm_exige_dono_para_editar(lead, usuario)
+    _crm_exige_dono_para_editar(lead, usuario, _crm_via_bot(request))
     dominio_id = lead["id"]
     atualiza = {"estagio_funil": estagio, "responsavel_bot": usuario}
     if payload.proximo_followup_em is not None:
@@ -11063,13 +11102,14 @@ def crm_lead_mudar_estagio(dominio: str, payload: CrmEstagioPayload,
     return {"ok": True, "dominio_id": dominio_id, "estagio_funil": estagio}
 
 @app.get("/crm/painel")
-def crm_painel(dono: str = "", usuario: str = Depends(verificar_token)):
-    """Contagens agregadas pro cabeçalho do dashboard. Ver é de todo mundo;
-    `dono=email` filtra a um operador, sem parâmetro vem tudo."""
+def crm_painel(request: Request, dono: str = "", usuario: str = Depends(verificar_token)):
+    """Contagens agregadas pro cabeçalho do dashboard. Mesma regra de dono do
+    /crm/leads: pela tela é filtro de conveniência, por chave de API é forçado."""
+    dono_efetivo = _crm_dono_efetivo(request, usuario, dono)
     try:
         q = get_supabase().table("leads_prospeccao_dominios").select("estagio_funil,status")
-        if dono:
-            q = q.eq("dono_email", dono.strip().lower())
+        if dono_efetivo:
+            q = q.eq("dono_email", dono_efetivo)
         linhas = q.execute().data or []
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Painel indisponível: {e}")
@@ -11078,6 +11118,64 @@ def crm_painel(dono: str = "", usuario: str = Depends(verificar_token)):
         k = l.get("estagio_funil") or "frio"
         por_estagio[k] = por_estagio.get(k, 0) + 1
     return {"total": len(linhas), "por_estagio": por_estagio}
+
+
+class CrmAcaoPayload(BaseModel):
+    tipo_acao: str
+    descricao: Optional[str] = None
+    data_hora: Optional[str] = None
+    proxima_acao_em: Optional[str] = None
+
+@app.post("/crm/leads/{dominio}/acoes")
+def crm_lead_registrar_acao(dominio: str, payload: CrmAcaoPayload, request: Request,
+                             usuario: str = Depends(verificar_token)):
+    """O bot (ou humano) registra o que fez com o lead e, se for o caso, quando
+    volta a agir — é a peça que organiza a rotina de contatos (regra do
+    Leonardo, 25/09): em vez de uma fila pronta, cada ação fica no histórico
+    com data/hora, e `GET /crm/leads?ordenar=proximo_followup_em&crescente=1`
+    devolve a ordem de quem retomar primeiro.
+
+    `tipo_acao` é livre — sugestões: tentativa_contato, mensagem_enviada,
+    ligacao, sem_resposta, reuniao_marcada, follow_up, nota.
+    """
+    sb = get_supabase()
+    lead = _crm_lead_ou_404(sb, dominio)
+    _crm_exige_dono_para_editar(lead, usuario, _crm_via_bot(request))
+    dominio_id = lead["id"]
+    agora = _dt.now(_tz.utc).isoformat()
+    data_hora = payload.data_hora or agora
+    try:
+        r = sb.table("leads_prospeccao_acoes").insert({
+            "dominio_id": dominio_id,
+            "tipo_acao": (payload.tipo_acao or "nota").strip().lower(),
+            "descricao": payload.descricao,
+            "data_hora": data_hora,
+            "proxima_acao_em": payload.proxima_acao_em,
+            "realizado_por": usuario,
+        }).execute()
+        atualiza = {"ultimo_contato_em": data_hora, "responsavel_bot": usuario}
+        if payload.proxima_acao_em is not None:
+            atualiza["proximo_followup_em"] = payload.proxima_acao_em or None
+        sb.table("leads_prospeccao_dominios").update(atualiza).eq("id", dominio_id).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Falha ao registrar ação: {e}")
+    return {"ok": True, "dominio_id": dominio_id, "acao_id": (r.data or [{}])[0].get("id")}
+
+@app.get("/crm/leads/{dominio}/acoes")
+def crm_lead_listar_acoes(dominio: str, request: Request, limite: int = 100,
+                           usuario: str = Depends(verificar_token)):
+    """Histórico de ações registradas nesse lead (mais recente primeiro)."""
+    sb = get_supabase()
+    lead = _crm_lead_ou_404(sb, dominio)
+    if _crm_via_bot(request) and lead.get("dono_email") != usuario:
+        raise HTTPException(status_code=403, detail=f"Lead pertence a {lead.get('dono_email') or '(sem dono)'}: fora do alcance desta credencial.")
+    limite = max(1, min(int(limite or 100), 500))
+    try:
+        acoes = sb.table("leads_prospeccao_acoes").select("*") \
+            .eq("dominio_id", lead["id"]).order("data_hora", desc=True).limit(limite).execute().data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Falha ao ler ações: {e}")
+    return {"acoes": acoes, "total": len(acoes)}
 
 
 # ── Monitor de e-mail de cotação (v3.97) ────────────────────────────────────
