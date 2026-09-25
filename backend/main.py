@@ -115,7 +115,8 @@ from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_
 # v3.96 — só frontend: o badge de versão da v3.95 tava discreto demais (canto da tela, baixo contraste); virou texto no rodapé da sidebar do Cabine e no cabeçalho do CRM. Mesmo marcador levado ao crm-dashboard.
 # v3.97 — monitor de e-mail de cotação (email_monitor.py): entra via IMAP nos domínios de cliente conhecido, filtra assunto de cotação (validado contra 146 assuntos reais), ignora reply de thread já vista, cria a proposta (mesmo núcleo do /extrair) e aciona o Dwight — fica em "rascunho" (criado_via=email_auto) esperando revisão do Leonardo. Desligado até KIST_IMAP_HOST/USER/PASSWORD existirem no Render.
 # v3.98 — correção do monitor de e-mail, achada em produção no primeiro e-mail real (R-1414, ControllerBMS): `_extrair_nucleo` só grava o CABEÇALHO da proposta; os itens do match ficavam só em memória. Extraído `_salvar_proposta_nucleo` (o corpo de /salvar-proposta) pra também persistir `itens_proposta` fora do HTTP — sem isto o Dwight não achava item nenhum pra pesquisar. Cabine e CRM: badge de versão -> tela "Só pra revisar" em Propostas (criado_via=email_auto).
-VERSAO_BACKEND = "3.98"
+# v3.99 — dois achados no primeiro dia em produção do monitor de e-mail: (1) um restart do Render no meio de um e-mail com várias propostas (Universal, uma por destino) duplicou tudo, porque o "já visto" só era gravado no FINAL — agora é gravado ANTES de processar; (2) regra do Leonardo: monitor nunca busca antes de hoje (KIST_EMAIL_MONITOR_DATA_MINIMA), pra não reabrir cotação antiga já tratada na mão.
+VERSAO_BACKEND = "3.99"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook

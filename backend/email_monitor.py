@@ -75,6 +75,12 @@ DONO_EMAIL = os.environ.get("KIST_EMAIL_MONITOR_DONO", "leonardobarrey@gmail.com
 INTERVALO_S = int(os.environ.get("KIST_EMAIL_MONITOR_INTERVALO_S", "300"))  # 5 min
 JANELA_DIAS = 3   # busca redundante de propósito — o message_id evita reprocessar
 
+# Regra do Leonardo, 25/09: nunca entrar no passado — só processa e-mail
+# recebido a partir de HOJE (o dia em que o monitor foi ligado de vez em
+# produção). Evita reabrir/duplicar cotação de dias atrás que ele já tratou
+# na mão. Ajustável por variável de ambiente se precisar mudar o piso depois.
+DATA_MINIMA = os.environ.get("KIST_EMAIL_MONITOR_DATA_MINIMA", "2026-09-25")
+
 # Validado em 25/09 contra 146 assuntos reais de propostas confirmadas
 # (usuario_email = Leonardo): 141 bateram (96,6%). Os 5 que não batem são
 # assunto de item/anexo sem palavra de pedido — ficam fora do automático.
@@ -209,6 +215,36 @@ def _registrar(sb, *, message_id, dominio, remetente, assunto, assunto_norm,
         log.warning("email_monitor: falhou registrar %s: %s", message_id, e)
 
 
+def _marcar_em_processamento(sb, *, message_id, dominio, remetente, assunto,
+                              assunto_norm, data_email):
+    """Grava a linha de controle ANTES de chamar `_extrair_nucleo`, não
+    depois (correção v3.99). Achado em produção, 25/09: um restart do Render
+    no meio de um e-mail grande do Universal (várias propostas, uma por
+    destino) matou o processo antes dele chegar no registro final — o
+    próximo ciclo, sem saber que aquele e-mail já tinha sido tentado,
+    reprocessou tudo de novo e duplicou. Registrando aqui, o `message_id` já
+    conta como visto mesmo se o processo morrer no meio; o pior caso vira
+    "ficou em_processamento e não terminou" (raro, só em restart), não mais
+    "duplicou a proposta inteira"."""
+    try:
+        sb.table("email_cotacoes_monitor").upsert({
+            "message_id": message_id, "dominio": dominio, "remetente": remetente,
+            "assunto": assunto, "assunto_normalizado": assunto_norm,
+            "data_email": data_email, "bateu_filtro": True, "motivo": "em_processamento",
+        }, on_conflict="message_id").execute()
+    except Exception as e:
+        log.warning("email_monitor: falhou marcar em_processamento %s: %s", message_id, e)
+
+
+def _finalizar_registro(sb, message_id: str, *, motivo: str, proposta_numero=None):
+    try:
+        sb.table("email_cotacoes_monitor").update({
+            "motivo": motivo, "proposta_numero": proposta_numero,
+        }).eq("message_id", message_id).execute()
+    except Exception as e:
+        log.warning("email_monitor: falhou finalizar registro %s: %s", message_id, e)
+
+
 def _acionar_dwight(numero: str):
     if not DWIGHT_DISPATCH_KEY:
         log.warning("email_monitor: sem KIST_EMAIL_MONITOR_DWIGHT_KEY — proposta %s "
@@ -256,6 +292,11 @@ def _processar_email(sb, msg: email.message.Message, dominio: str):
                    bateu_filtro=False, motivo="reply_de_thread_conhecida")
         return
 
+    # Marca ANTES de processar (ver _marcar_em_processamento) — um restart
+    # daqui pra baixo não reprocessa nem duplica este e-mail.
+    _marcar_em_processamento(sb, message_id=message_id, dominio=dominio, remetente=remetente,
+                              assunto=assunto, assunto_norm=assunto_norm, data_email=data_email)
+
     corpo, anexos = _corpo_e_anexos(msg)
     texto_fonte = f"Assunto: {assunto}\nDe: {remetente}\nData: {data_email or ''}\n\n{corpo}"
 
@@ -295,14 +336,10 @@ def _processar_email(sb, msg: email.message.Message, dominio: str):
                 _acionar_dwight(num)
     except Exception as e:
         log.error("email_monitor: falhou processar %s (%s): %s", message_id, assunto, e)
-        _registrar(sb, message_id=message_id, dominio=dominio, remetente=remetente,
-                   assunto=assunto, assunto_norm=assunto_norm, data_email=data_email,
-                   bateu_filtro=True, motivo=f"erro_extracao: {type(e).__name__}: {e}"[:500])
+        _finalizar_registro(sb, message_id, motivo=f"erro_extracao: {type(e).__name__}: {e}"[:500])
         return
 
-    _registrar(sb, message_id=message_id, dominio=dominio, remetente=remetente,
-               assunto=assunto, assunto_norm=assunto_norm, data_email=data_email,
-               bateu_filtro=True, motivo="processado", proposta_numero=numero_criado)
+    _finalizar_registro(sb, message_id, motivo="processado", proposta_numero=numero_criado)
     log.info("email_monitor: %s -> proposta(s) %s (revisão pendente)", assunto, numero_criado)
 
 
@@ -316,7 +353,13 @@ def _rodar_ciclo(sb):
     try:
         m.login(IMAP_USER, IMAP_PASSWORD)
         m.select("INBOX", readonly=True)
-        desde = (datetime.now() - timedelta(days=JANELA_DIAS)).strftime("%d-%b-%Y")
+        # Nunca busca antes de DATA_MINIMA (regra do Leonardo, 25/09) — a janela
+        # rolante de JANELA_DIAS só existe pra aguentar o monitor ficar fora do
+        # ar por um tempo sem perder e-mail; ela não pode empurrar a busca pra
+        # antes do piso.
+        piso = datetime.strptime(DATA_MINIMA, "%Y-%m-%d")
+        desde_dt = max(datetime.now() - timedelta(days=JANELA_DIAS), piso)
+        desde = desde_dt.strftime("%d-%b-%Y")
         for dominio in dominios:
             typ, dados = m.search(None, f'(SINCE {desde} FROM "{dominio}")')
             if typ != "OK":
