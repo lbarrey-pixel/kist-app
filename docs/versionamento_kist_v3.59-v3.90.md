@@ -199,6 +199,11 @@ Versões que não têm commit próprio: **v3.69** está dentro de bcd73d0 (v3.70
 - Dados: `mercado_observacoes` 146 e 272 (Pix de OCR de 19,40 e 19,69) ficaram sem preço (backup `_bkp_20260923_mercado_observacoes`). R-1375: o Duracell ficou com custo 198,90 e venda 331,37, confirmados pelo Leonardo (backup `_bkp_20260923_itens_r1375`).
 - Propostas antigas com custo tirado de oferta divergente (vão aparecer com o aviso no card): 1050902 (terrômetro, 4.333,26), 1050903 (estilete, trena 19,27, torquês, chave ajustável 74,79), 1051007 e 1051012.
 
+## v3.103 · 25/09 · Badge "Revisar" presa depois do Tiny + assunto retroativo
+- **Achado pelo Leonardo**: exportou a R-1433 pro Tiny (virou 1051041) e a badge "✉ Revisar" continuou aparecendo. Causa: a badge e o filtro "Só pra revisar" checavam `status === "rascunho"` — mas exportar pro Tiny **não muda o `status`** da proposta (confirmado: 1051041 está com `tiny_numero` preenchido e `status` ainda "rascunho"). Quem sinaliza "já foi exportada" é `tiny_numero`, não `status`.
+- **[F]** `Propostas.jsx`: badge e filtro agora checam `criado_via === 'email_auto' && !tiny_numero`.
+- **Achado junto**: `assunto_email` não aparecia nas 4 propostas de hoje porque elas foram criadas ANTES desse campo existir no código (v3.100 saiu depois). Preenchido retroativamente pelo texto já guardado em `email_cotacoes_monitor` — daqui pra frente toda proposta nova do monitor já nasce com o campo certo.
+
 ## v3.102 · 25/09 · Motor Dwight "normal" desativado em toda a Cabine
 - **Regra do Leonardo, 25/09**: desativar o motor Dwight "normal" na Cabine inteira — não só na automação, em qualquer lugar que alguém possa disparar pesquisa. Sem apagar nada: reversível por variável de ambiente, o dia que precisar voltar.
 - **[B]** `DWIGHT_MOTOR_ATIVO` (env, default `0`/desativado): `_motores()` só devolve `url`/`key` de verdade pro motor `dwight` quando essa variável está ligada; desativado, ele fica com a MESMA cara de "não configurado" que a tela e o `/pesquisa-dwight` já sabiam tratar antes de o túnel do KistBot existir — nenhum estado novo, nenhuma rota nova.

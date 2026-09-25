@@ -126,7 +126,10 @@ export default function Propostas({ token, usuario, onCriarOC, onAbrirProposta }
   const itensAbertos = expandida != null ? (itensProp[expandida] || []) : [];
   const idsSelecionados = Object.keys(selecionados).filter((k) => selecionados[k]);
   const itensSelecionados = itensAbertos.filter((i) => selecionados[i.id]);
-  const pendentesRevisao = lista.filter((p) => p.criado_via === "email_auto" && p.status === "rascunho");
+  // v3.103 — "revisado" é ter exportado pro Tiny (tiny_numero preenchido), não
+  // o status: uma proposta de e-mail exportada continua com status "rascunho"
+  // (o export não muda esse campo), então checar status deixava a badge presa.
+  const pendentesRevisao = lista.filter((p) => p.criado_via === "email_auto" && !p.tiny_numero);
   const listaExibida = soRevisao ? pendentesRevisao : lista;
   const propAberta = listaExibida.find((p) => (p.id ?? p.numero_proposta) === expandida);
 
@@ -211,7 +214,7 @@ export default function Propostas({ token, usuario, onCriarOC, onAbrirProposta }
                             Rascunho
                           </span>
                         )}
-                        {p.criado_via === "email_auto" && (
+                        {p.criado_via === "email_auto" && !p.tiny_numero && (
                           <span title="Criada sozinha a partir de e-mail de cotação — confira antes de exportar pro Tiny"
                             className="inline-block rounded-md bg-kist/10 px-1.5 py-0.5 text-[10px] font-semibold text-kist">
                             ✉ Revisar
