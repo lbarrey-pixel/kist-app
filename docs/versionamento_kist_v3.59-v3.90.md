@@ -208,6 +208,7 @@ Versões que não têm commit próprio: **v3.69** está dentro de bcd73d0 (v3.70
 - **[F]** Tela Desempenho: tile "Custo por busca usada" (mostra "sem custo informado pelo bot" enquanto não vier), tempo/custo/tokens/cache embaixo de cada item, nota explicando a conta.
 - **Docs**: `docs/benchmark_kistbot_dwight.md` (pro Fábio) seção 7 atualizada: a Cabine está pronta, o pedido pro bot é mandar os campos.
 - Testado local com telemetria completa, parcial, vazia e vinda do cache: o cache é excluído do total, o "por usada" só conta itens com custo, tokens em "800,0" e custo em "0,0123" (vírgula) são aceitos.
+- **Bases (depois do deploy confirmado, 25/09)**: seção `desempenho_bots` (v3) ganhou o bloco CUSTO com os campos e a regra do cache; núcleo do Analista/Suporte na v3.110 (seção 40). Backups antes: `_bkp_20260925c_conhecimento` e `capacidades_nucleo_bkp_20260925c`.
 
 ## v3.109 · 25/09 · Desempenho diz exatamente o que mudou, com os links
 - **Pedido do Leonardo, 25/09**: o bot precisa saber exatamente o que foi alterado em cada busca dele — qual link sugeriu, com qual link a proposta saiu, quanto mudou o preço.
