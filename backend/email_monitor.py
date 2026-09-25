@@ -259,14 +259,34 @@ def _processar_email(sb, msg: email.message.Message, dominio: str):
     corpo, anexos = _corpo_e_anexos(msg)
     texto_fonte = f"Assunto: {assunto}\nDe: {remetente}\nData: {data_email or ''}\n\n{corpo}"
 
-    from main import _extrair_nucleo  # import tardio: evita ciclo (main importa este módulo)
+    # Import tardio: evita ciclo (main importa este módulo, no fim do arquivo).
+    from main import _extrair_nucleo, _salvar_proposta_nucleo
 
     numero_criado = None
     try:
         resultado = _extrair_nucleo(
             sb, DONO_EMAIL, "", "0", "0", texto_fonte, anexos, [], criar_rascunhos=True,
         )
-        numeros = [p.get("proposta") for p in (resultado.get("propostas") or []) if p.get("proposta")]
+        # `_extrair_nucleo` só grava o CABEÇALHO da proposta (via `_criar_rascunho`)
+        # — os itens do match ficam só na resposta, em memória. É `/salvar-proposta`
+        # (aqui chamado direto, mesma função) que persiste `itens_proposta` de
+        # verdade; sem isto a proposta nascia vazia e o Dwight não achava item
+        # nenhum pra pesquisar (achado testando contra a caixa real, 25/09).
+        numeros = []
+        for p in (resultado.get("propostas") or []):
+            numero = p.get("proposta")
+            if not numero:
+                continue
+            _salvar_proposta_nucleo(sb, DONO_EMAIL, {
+                "proposta": numero,
+                "cliente": p.get("cliente") or "",
+                "cnpj": p.get("cnpj"),
+                "itens": p.get("itens") or [],
+                "status": "rascunho",
+                "usuario_nome": "Monitor de e-mail",
+                "fonte_texto": p.get("fonte_texto") or texto_fonte,
+            })
+            numeros.append(numero)
         if numeros:
             numero_criado = ", ".join(numeros)
             sb.table("propostas").update({"criado_via": "email_auto"}) \

@@ -114,7 +114,8 @@ from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_
 # v3.95 — só frontend (marcador de versão + auto-update forçado quando o bundle publicado muda); o número sobe para o deploy ser conferível.
 # v3.96 — só frontend: o badge de versão da v3.95 tava discreto demais (canto da tela, baixo contraste); virou texto no rodapé da sidebar do Cabine e no cabeçalho do CRM. Mesmo marcador levado ao crm-dashboard.
 # v3.97 — monitor de e-mail de cotação (email_monitor.py): entra via IMAP nos domínios de cliente conhecido, filtra assunto de cotação (validado contra 146 assuntos reais), ignora reply de thread já vista, cria a proposta (mesmo núcleo do /extrair) e aciona o Dwight — fica em "rascunho" (criado_via=email_auto) esperando revisão do Leonardo. Desligado até KIST_IMAP_HOST/USER/PASSWORD existirem no Render.
-VERSAO_BACKEND = "3.97"
+# v3.98 — correção do monitor de e-mail, achada em produção no primeiro e-mail real (R-1414, ControllerBMS): `_extrair_nucleo` só grava o CABEÇALHO da proposta; os itens do match ficavam só em memória. Extraído `_salvar_proposta_nucleo` (o corpo de /salvar-proposta) pra também persistir `itens_proposta` fora do HTTP — sem isto o Dwight não achava item nenhum pra pesquisar. Cabine e CRM: badge de versão -> tela "Só pra revisar" em Propostas (criado_via=email_auto).
+VERSAO_BACKEND = "3.98"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -5846,7 +5847,15 @@ async def salvar_proposta(payload: dict, usuario: str = Depends(verificar_token)
     Identifica pelo numero_proposta — cria se não existir, atualiza se existir.
     Itens antigos são substituídos pelos novos (delete + insert).
     """
-    sb = get_supabase()
+    return _salvar_proposta_nucleo(get_supabase(), usuario, payload)
+
+
+def _salvar_proposta_nucleo(sb, usuario: str, payload: dict) -> dict:
+    """Corpo de /salvar-proposta, extraído (v3.98) pra poder ser chamado sem
+    HTTP — quem cria uma proposta automaticamente (email_monitor) precisa
+    desta MESMA função pra persistir os itens do match, não só o cabeçalho:
+    `_extrair_nucleo`/`_criar_rascunho` só gravam a linha de `propostas`; é
+    aqui que `itens_proposta` é escrito de verdade."""
     itens = _itens_payload(payload)
     valor_total = sum(
         _num_br(i.get("preco_un")) * _num_br(i.get("quantidade"), 1)

@@ -62,6 +62,10 @@ export default function Propostas({ token, usuario, onCriarOC, onAbrirProposta }
   const [dataInicio, setDataInicio] = useState("");
   const [dataFim, setDataFim] = useState("");
   const [equipeToda, setEquipeToda] = useState(false);
+  // v3.98 — propostas que o monitor de e-mail criou sozinho (criado_via
+  // 'email_auto') ficam em rascunho esperando o operador revisar antes de
+  // exportar pro Tiny. Filtro só some da lista, não muda nada no backend.
+  const [soRevisao, setSoRevisao] = useState(false);
 
   const [expandida, setExpandida] = useState(null);     // proposta_id aberta
   const [itensProp, setItensProp] = useState({});       // { [proposta_id]: itens[] }
@@ -122,7 +126,9 @@ export default function Propostas({ token, usuario, onCriarOC, onAbrirProposta }
   const itensAbertos = expandida != null ? (itensProp[expandida] || []) : [];
   const idsSelecionados = Object.keys(selecionados).filter((k) => selecionados[k]);
   const itensSelecionados = itensAbertos.filter((i) => selecionados[i.id]);
-  const propAberta = lista.find((p) => (p.id ?? p.numero_proposta) === expandida);
+  const pendentesRevisao = lista.filter((p) => p.criado_via === "email_auto" && p.status === "rascunho");
+  const listaExibida = soRevisao ? pendentesRevisao : lista;
+  const propAberta = listaExibida.find((p) => (p.id ?? p.numero_proposta) === expandida);
 
   return (
     <div className="mx-auto max-w-6xl px-8 py-9 rise">
@@ -136,6 +142,16 @@ export default function Propostas({ token, usuario, onCriarOC, onAbrirProposta }
             <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-line2 bg-surface px-3 py-2 text-[12.5px] text-sub">
               <input type="checkbox" checked={equipeToda} onChange={(e) => setEquipeToda(e.target.checked)} className="accent-kist" />
               Ver equipe toda
+            </label>
+            <label className={`flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-[12.5px] transition-colors ${
+              soRevisao ? "border-kist/40 bg-kist/[0.06] text-kist" : "border-line2 bg-surface text-sub"}`}>
+              <input type="checkbox" checked={soRevisao} onChange={(e) => setSoRevisao(e.target.checked)} className="accent-kist" />
+              Só pra revisar
+              {pendentesRevisao.length > 0 && (
+                <span className="flex h-5 min-w-[20px] items-center justify-center rounded-full bg-kist px-1.5 text-[10.5px] font-semibold text-white">
+                  {pendentesRevisao.length}
+                </span>
+              )}
             </label>
           </div>
         } />
@@ -176,9 +192,11 @@ export default function Propostas({ token, usuario, onCriarOC, onAbrirProposta }
           <tbody>
             {loading ? (
               <tr><td colSpan={7} className="px-4 py-10 text-center text-[13px] text-faint">Carregando…</td></tr>
-            ) : lista.length === 0 ? (
-              <tr><td colSpan={7} className="px-4 py-10 text-center text-[13px] text-faint">Nenhuma proposta encontrada.</td></tr>
-            ) : lista.map((p) => {
+            ) : listaExibida.length === 0 ? (
+              <tr><td colSpan={7} className="px-4 py-10 text-center text-[13px] text-faint">
+                {soRevisao ? "Nada esperando revisão." : "Nenhuma proposta encontrada."}
+              </td></tr>
+            ) : listaExibida.map((p) => {
               const id = p.id ?? p.numero_proposta;
               const aberta = expandida === id;
               return (
@@ -187,11 +205,19 @@ export default function Propostas({ token, usuario, onCriarOC, onAbrirProposta }
                     className={`group cursor-pointer border-b border-line/70 transition-colors ${aberta ? "bg-kist/[0.03]" : "hover:bg-paper/60"}`}>
                     <td className="w-px whitespace-nowrap px-4 py-3">
                       <div className="font-mono text-[13px] font-medium text-kist">{p.numero_proposta}</div>
-                      {p.status === "rascunho" && (
-                        <span className="mt-0.5 inline-block rounded-md bg-amber/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber">
-                          Rascunho
-                        </span>
-                      )}
+                      <div className="mt-0.5 flex flex-wrap gap-1">
+                        {p.status === "rascunho" && (
+                          <span className="inline-block rounded-md bg-amber/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber">
+                            Rascunho
+                          </span>
+                        )}
+                        {p.criado_via === "email_auto" && (
+                          <span title="Criada sozinha a partir de e-mail de cotação — confira antes de exportar pro Tiny"
+                            className="inline-block rounded-md bg-kist/10 px-1.5 py-0.5 text-[10px] font-semibold text-kist">
+                            ✉ Revisar
+                          </span>
+                        )}
+                      </div>
                     </td>
                     <td className="w-full max-w-0 px-4 py-3">
                       <div className="truncate text-[13px] font-medium text-ink" title={p.cliente}>{p.cliente}</div>
