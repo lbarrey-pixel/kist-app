@@ -179,7 +179,7 @@ export function ExtratosPropostaModal({ token, apiUrl, numero, onClose }) {
   );
 }
 
-const ROTULO_VEREDITO = { acertou: "acertou", escolheu_outra: "escolheu outra", nao_achou: "não achou", custo_divergente: "custo divergente" };
+const ROTULO_VEREDITO = { acertou: "acertou", escolheu_outra: "escolheu outra", nao_achou: "não achou", custo_divergente: "custo divergente", sem_oferta: "sem oferta" };
 
 function Boletim({ token, apiUrl }) {
   const [b, setB] = useState(null);

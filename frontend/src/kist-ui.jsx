@@ -52,6 +52,7 @@ export const IconLogout   = (p) => <Ic {...p} d={<><path d="M14 8V6a2 2 0 0 0-2-
 export const IconBell     = (p) => <Ic {...p} d={<><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" /><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" /></>} />;
 export const IconChat     = (p) => <Ic {...p} d={<><path d="M21 12a8 8 0 0 1-11.5 7.2L4 20l.8-5.5A8 8 0 1 1 21 12Z" /><path d="M8.5 11h7M8.5 14h4" /></>} />;
 export const IconAgentes  = (p) => <Ic {...p} d={<><circle cx="12" cy="7" r="3" /><circle cx="5.5" cy="17" r="2.5" /><circle cx="18.5" cy="17" r="2.5" /><path d="M12 10v2.5M12 12.5 7.5 15M12 12.5 16.5 15" /></>} />;
+export const IconChart    = (p) => <Ic {...p} d={<><path d="M3 20h18" /><path d="M6 20v-6" /><path d="M11 20V8" /><path d="M16 20v-9" /><path d="M21 20V5" /></>} />;
 export const IconInbox    = (p) => <Ic {...p} d={<><path d="M4 13h4l1.5 2.5h5L16 13h4" /><path d="M4 13 6 5h12l2 8v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2Z" /></>} />;
 // Google "G" colorido — não usa o sistema Ic (tem fill próprio)
 export const IconGoogle = ({ size = 16, className = "", ...p }) => (
@@ -181,6 +182,8 @@ export function Sidebar({ active, onNavigate, usuario, stats, onLogout, isAdmin,
     { k: "ordens",      label: "Ordens de compra",  Icon: IconBoard },
     // v3.82: conhecimento de pesquisa da Kist inteira (fichas, mercado, extratos, boletim dos bots)
     { k: "catalogo",    label: "Catálogo",          Icon: IconSearch },
+    // v3.105: quanto das buscas do KistBot foi usado e quanto foi corrigido.
+    { k: "desempenho",  label: "Desempenho",        Icon: IconChart },
     { k: "requisicoes", label: "Requisições",       Icon: IconChat },
     // Agentes é de TODOS: quem conserta o agente parado é o dono dele, não o
     // admin. O backend já filtra por dono — sem `todos=1`, cada um vê só os

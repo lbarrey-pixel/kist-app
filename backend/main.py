@@ -121,7 +121,8 @@ from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_
 # v3.102 — regra do Leonardo: motor Dwight "normal" desativado em toda a Cabine (não removido — DWIGHT_MOTOR_ATIVO=1 no Render liga de volta sem mexer em código). `_motores()` reporta url/key vazios pra ele, então a tela já desativa o botão sozinha (mesmo mecanismo do KistBot antes do túnel) e qualquer disparo direto na API cai no 503 de "não configurada". Frontend: botão "Dwight" cinza, pesquisa por item individual e o padrão da função passaram a usar KistBot.
 # v3.103 — só frontend: badge "✉ Revisar" (Propostas) ficava presa depois de exportar pro Tiny, porque checava `status === "rascunho"` — exportar não muda o status, quem muda é `tiny_numero`. Badge e filtro "Só pra revisar" passaram a checar `!tiny_numero`. `assunto_email` das 4 propostas de hoje (criadas antes desse campo existir) preenchido retroativamente a partir do log do monitor.
 # v3.104 — chamado #21 (Leonardo): dois bugs. (1) Pix ≈ cheio (diferença < 1 centavo, caso real 860/860 com obs "[preço: ocr]") ainda entrava como "Pix e cheio divergentes" e travava o auto-load de custo — `precoDivergente`/`_preco_divergente` (espelho) agora checam a igualdade ANTES da flag/regra de 35%/OCR-outlier. (2) `sku_fornecedor` (pode ser MLB*/SKU de marketplace, ex. prévia 1051038 -> codigo=MLB25347515) ia pro `item.codigo` da proposta Tiny, visível no PDF/portal do cliente — `_sku_tiny` agora usa `codigo_cliente` (código do item no ERP do cliente) ou a descrição; `sku_fornecedor` fica só interno da Cabine, nunca mais vai ao Tiny.
-VERSAO_BACKEND = "3.104"
+# v3.105 — painel de desempenho dos bots de pesquisa (pedido do Leonardo): GET /pesquisa/desempenho (dia, período ou compilado; todos os operadores, filtro opcional; JSON ou texto; liberado pra chave do KistBot) + página "Desempenho" no Cabine. Veredito da exportação/compra agora é POR MOTOR (antes o do motor que respondeu por último engolia o outro), ganha a categoria `sem_oferta` (bot não achou, operador achou) e guarda o retrato do que o bot sugeriu x o que saiu.
+VERSAO_BACKEND = "3.105"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -424,6 +425,9 @@ _ROTAS_ESCOPO_PESQUISA = (
     ("GET",  re.compile(r"^/api/whoami/?$")),
     ("GET",  re.compile(r"^/api/guia/[a-z-]+/?$")),
     ("GET",  re.compile(r"^/catalogo/itens(/[^/]+)?/?$")),
+    # v3.105 — o bot lê o próprio desempenho: os itens que ele pesquisou e o que
+    # o operador fez com cada um (usou, trocou de loja, corrigiu o preço). Só leitura.
+    ("GET",  re.compile(r"^/pesquisa/desempenho/?$")),
 )
 
 # Escopo `dwight_dispatch` (v3.70): um agente PRÓPRIO do Leonardo pode pedir a
@@ -6745,9 +6749,52 @@ def _gravar_conhecimento_item(sb, prop, uid, pesquisa_id, r, ofertas, escolha, m
         pass
 
 
+def _veredito_item(row: dict, it: dict):
+    """Veredito de UM resultado de pesquisa contra o item final, já com o retrato
+    do momento (o que o bot sugeriu x o que saiu) — é o que o painel de
+    desempenho mostra, sem depender de o item continuar igual depois.
+
+    `sem_oferta` (v3.105): o bot não trouxe nenhuma oferta e o item saiu com
+    origem mesmo assim — o operador achou sozinho. Antes esse caso não virava
+    veredito nenhum e sumia da conta do bot."""
+    res = row.get("resultado") or {}
+    ofertas = [o for o in (res.get("ofertas") or []) if isinstance(o, dict)]
+    forn = it.get("fornecedor") or it.get("nome_fornecedor")
+    forn = str(forn).strip() if forn else ""
+    tem_origem = bool(it.get("link_fornecedor") or forn)
+    usada = forn or _con._host_path(it.get("link_fornecedor"))
+    custo = _con.num(it.get("preco_custo"))
+    if not ofertas:
+        if not tem_origem:
+            return None
+        return {"veredito": "sem_oferta", "usada": usada, "custo_final": custo,
+                "link_final": it.get("link_fornecedor") or None}
+    v = _con.veredito(ofertas, res.get("escolha") or 0, it)
+    if not v:
+        return None
+    try:
+        esc = int(res.get("escolha") or 0)
+    except (TypeError, ValueError):
+        esc = 0
+    rec = ofertas[esc] if 0 <= esc < len(ofertas) else ofertas[0]
+    v.setdefault("loja_bot", rec.get("loja"))
+    v.setdefault("preco_bot", _con.num(rec.get("preco_pix")) or _con.num(rec.get("preco_cheio")))
+    v.setdefault("link_bot", rec.get("link"))
+    v["usada"] = v.get("usada") or usada or rec.get("loja")
+    v.setdefault("custo_final", custo)
+    v.setdefault("link_final", it.get("link_fornecedor") or None)
+    return v
+
+
 def _registrar_vereditos(sb, proposta_id, itens_finais: list, momento: str) -> int:
-    """Veredito automático por item: a escolha do bot bateu com o que saiu
-    (momento='exportacao') ou com o que foi comprado (momento='compra')?"""
+    """Veredito automático por item E POR MOTOR: a escolha de cada bot bateu com
+    o que saiu (momento='exportacao') ou com o que foi comprado ('compra')?
+
+    v3.105 — antes pegava só o resultado MAIS RECENTE do item, de qualquer
+    motor: item pesquisado pelo KistBot e pelo Dwight ficava com um veredito só,
+    do que respondeu por último, e o outro bot sumia da conta (25/09, 17 itens
+    nessa situação). Agora cada motor tem o seu. Reexportar substitui o
+    veredito do mesmo item/motor/momento, inclusive se a pesquisa foi refeita."""
     if not _CON_OK:
         return 0
     n = 0
@@ -6755,30 +6802,32 @@ def _registrar_vereditos(sb, proposta_id, itens_finais: list, momento: str) -> i
         uids = [str(i.get("item_uid") or "").lower() for i in itens_finais if i.get("item_uid")]
         if not uids:
             return 0
-        rows = (sb.table("pesquisa_resultados").select("id,item_uid,motor,resultado,respondido_em")
-                  .eq("proposta_id", proposta_id).eq("status", "concluido").in_("item_uid", uids)
-                  .order("respondido_em", desc=True).limit(500).execute().data or [])
+        rows = (sb.table("pesquisa_resultados").select("id,item_uid,motor,status,resultado,respondido_em")
+                  .eq("proposta_id", proposta_id).in_("status", ["concluido", "nao_encontrado"])
+                  .in_("item_uid", uids).order("respondido_em", desc=True).limit(1000).execute().data or [])
         ultima = {}
         for row in rows:
-            ultima.setdefault(str(row["item_uid"]).lower(), row)
+            ultima.setdefault((str(row["item_uid"]).lower(), row.get("motor") or "dwight"), row)
+        por_uid = {}
+        for (u, motor), row in ultima.items():
+            por_uid.setdefault(u, []).append((motor, row))
         for it in itens_finais:
-            row = ultima.get(str(it.get("item_uid") or "").lower())
-            if not row:
-                continue
-            res = row.get("resultado") or {}
-            v = _con.veredito(res.get("ofertas") or [], res.get("escolha") or 0, it)
-            if not v:
-                continue
-            linha = {"pesquisa_id": row["id"], "item_uid": row["item_uid"], "proposta_id": proposta_id,
-                     "motor": row.get("motor") or "dwight", "momento": momento,
-                     "veredito": v["veredito"], "detalhe": v}
-            ja = (sb.table("pesquisa_vereditos").select("id").eq("pesquisa_id", row["id"])
-                    .eq("momento", momento).limit(1).execute().data or [])
-            if ja:
-                sb.table("pesquisa_vereditos").update(linha).eq("id", ja[0]["id"]).execute()
-            else:
-                sb.table("pesquisa_vereditos").insert(linha).execute()
-            n += 1
+            for motor, row in por_uid.get(str(it.get("item_uid") or "").lower(), []):
+                v = _veredito_item(row, it)
+                if not v:
+                    continue
+                linha = {"pesquisa_id": row["id"], "item_uid": row["item_uid"], "proposta_id": proposta_id,
+                         "motor": motor, "momento": momento, "veredito": v["veredito"], "detalhe": v}
+                (sb.table("pesquisa_vereditos").delete().eq("proposta_id", proposta_id)
+                   .eq("item_uid", row["item_uid"]).eq("motor", motor).eq("momento", momento)
+                   .neq("pesquisa_id", row["id"]).execute())
+                ja = (sb.table("pesquisa_vereditos").select("id").eq("pesquisa_id", row["id"])
+                        .eq("momento", momento).limit(1).execute().data or [])
+                if ja:
+                    sb.table("pesquisa_vereditos").update(linha).eq("id", ja[0]["id"]).execute()
+                else:
+                    sb.table("pesquisa_vereditos").insert(linha).execute()
+                n += 1
     except Exception:
         pass
     return n
@@ -6934,9 +6983,10 @@ async def pesquisa_boletim(dias: int = 30, usuario: str = Depends(verificar_toke
     for v in ver:
         k = (v.get("motor") or "dwight", v["momento"])
         d = por.setdefault(k, {"motor": k[0], "momento": k[1], "total": 0, "acertou": 0,
-                               "escolheu_outra": 0, "nao_achou": 0, "custo_divergente": 0})
+                               "escolheu_outra": 0, "nao_achou": 0, "custo_divergente": 0,
+                               "sem_oferta": 0})
         d["total"] += 1
-        d[v["veredito"]] += 1
+        d[v["veredito"]] = d.get(v["veredito"], 0) + 1
     for d in por.values():
         d["taxa_acerto"] = round(100 * d["acertou"] / d["total"], 1) if d["total"] else None
     ext = (sb.table("pesquisa_extratos").select("motor,saude,passos").gte("criado_em", desde)
@@ -6954,6 +7004,165 @@ async def pesquisa_boletim(dias: int = 30, usuario: str = Depends(verificar_toke
                                         key=lambda x: -x["vezes"])[:10],
             "tempo_medio_s": {m: round(sum(t) / len(t) / 1000, 1) for m, t in tempos.items()},
             "extratos": len(ext)}
+
+
+# ── Desempenho dos bots de pesquisa (v3.105) ────────────────────────────────
+# Pedido do Leonardo, 25/09: quantificar o KistBot — quantas buscas dele saíram
+# como vieram e quantas o operador corrigiu, por dia ou no compilado, de todos
+# os operadores. A fonte é `pesquisa_vereditos`, que nasce na exportação pro
+# Tiny (e na compra): o painel anda sozinho a cada exportação, sem job nenhum.
+_CATEGORIA_VEREDITO = {"acertou": "usada", "escolheu_outra": "corrigida", "nao_achou": "corrigida",
+                       "custo_divergente": "corrigida", "sem_oferta": "sem_oferta"}
+_BRT = _tz_ext(_td_ext(hours=-3))
+
+
+def _pct(a, b):
+    return round(100 * a / b, 1) if b else None
+
+
+def _agrega_desempenho(lista: list) -> dict:
+    t = len(lista)
+    c = {}
+    for x in lista:
+        c[x["veredito"]] = c.get(x["veredito"], 0) + 1
+    usadas = c.get("acertou", 0)
+    troca = c.get("escolheu_outra", 0) + c.get("nao_achou", 0)
+    preco = c.get("custo_divergente", 0)
+    sem = c.get("sem_oferta", 0)
+    return {"total": t, "usadas": usadas, "corrigidas": troca + preco,
+            "corrigidas_troca": troca, "corrigidas_preco": preco, "sem_oferta": sem,
+            "taxa_uso": _pct(usadas, t), "taxa_correcao": _pct(troca + preco, t),
+            "taxa_sem_oferta": _pct(sem, t), "taxa_uso_com_oferta": _pct(usadas, t - sem),
+            "propostas": len({x["proposta_id"] for x in lista})}
+
+
+def _dia_brt(iso) -> str:
+    try:
+        return _dt_ext.fromisoformat(str(iso).replace("Z", "+00:00")).astimezone(_BRT).date().isoformat()
+    except Exception:
+        return ""
+
+
+@app.get("/pesquisa/desempenho")
+async def pesquisa_desempenho(motor: str = "kistbot", de: str = "", ate: str = "", dias: int = 0,
+                              operador: str = "", momento: str = "exportacao", formato: str = "json",
+                              usuario: str = Depends(verificar_token)):
+    """Desempenho dos bots de pesquisa: das buscas que viraram proposta exportada
+    (ou compra), quantas saíram como o bot trouxe e quantas foram corrigidas.
+
+    Filtros (todos opcionais): `de`/`ate` (AAAA-MM-DD, horário de Brasília),
+    `dias` (últimos N dias, hoje incluso), `operador` (e-mail ou parte dele),
+    `motor` ('kistbot' padrão, 'dwight' ou 'todos'), `momento` ('exportacao'
+    padrão, ou 'compra'). Sem período = compilado completo. Todos os operadores.
+    `formato=texto` devolve texto curto, pra bot ler gastando pouco.
+
+    Categorias: usada = acertou; corrigida = trocou de loja (escolheu_outra /
+    nao_achou) ou manteve a loja com custo >15% longe do bot (custo_divergente);
+    sem_oferta = o bot não trouxe nada e o item saiu com origem mesmo assim.
+    """
+    try:
+        d_ini = _dt_ext.strptime(de, "%Y-%m-%d").date() if de else None
+        d_fim = _dt_ext.strptime(ate, "%Y-%m-%d").date() if ate else None
+    except ValueError:
+        raise HTTPException(422, "Use datas no formato AAAA-MM-DD (ex.: de=2026-09-25).")
+    hoje = _dt_ext.now(_BRT).date()
+    if dias and not d_ini:
+        d_ini = hoje - _td_ext(days=max(1, int(dias)) - 1)
+        d_fim = d_fim or hoje
+    motor = (motor or "kistbot").strip().lower()
+
+    sb = get_supabase()
+    q = (sb.table("pesquisa_vereditos")
+           .select("id,pesquisa_id,item_uid,proposta_id,motor,momento,veredito,detalhe,criado_em")
+           .eq("momento", momento))
+    if motor != "todos":
+        q = q.eq("motor", motor)
+    if d_ini:
+        q = q.gte("criado_em", _dt_ext(d_ini.year, d_ini.month, d_ini.day, tzinfo=_BRT).isoformat())
+    if d_fim:
+        f = d_fim + _td_ext(days=1)
+        q = q.lt("criado_em", _dt_ext(f.year, f.month, f.day, tzinfo=_BRT).isoformat())
+    ver = q.order("criado_em", desc=True).limit(10000).execute().data or []
+
+    def _lote(tabela, campos, ids):
+        out, ids = {}, [i for i in ids if i is not None]
+        for k in range(0, len(ids), 200):
+            for r in (sb.table(tabela).select(campos).in_("id", ids[k:k + 200]).execute().data or []):
+                out[r["id"]] = r
+        return out
+
+    props = _lote("propostas", "id,numero_proposta,numero_rascunho,cliente,usuario_email,usuario_nome,criado_via",
+                  list({v["proposta_id"] for v in ver}))
+    op = (operador or "").strip().lower()
+    if op:
+        ver = [v for v in ver if op in str((props.get(v["proposta_id"]) or {}).get("usuario_email") or "").lower()]
+    pesq = _lote("pesquisa_resultados", "id,descricao,resultado", list({v["pesquisa_id"] for v in ver}))
+
+    itens = []
+    for v in ver:
+        d = v.get("detalhe") or {}
+        p = props.get(v["proposta_id"]) or {}
+        pr = pesq.get(v["pesquisa_id"]) or {}
+        loja_bot, preco_bot = d.get("loja_bot") or d.get("recomendada"), d.get("preco_bot")
+        if not loja_bot and v["veredito"] != "sem_oferta":
+            # veredito anterior à v3.105, sem o retrato: lê a recomendação do resultado
+            res = pr.get("resultado") or {}
+            ofs = [o for o in (res.get("ofertas") or []) if isinstance(o, dict)]
+            if ofs:
+                try:
+                    e = int(res.get("escolha") or 0)
+                except (TypeError, ValueError):
+                    e = 0
+                rec = ofs[e] if 0 <= e < len(ofs) else ofs[0]
+                loja_bot = rec.get("loja")
+                preco_bot = preco_bot or _num_br(rec.get("preco_pix")) or _num_br(rec.get("preco_cheio")) or None
+        itens.append({
+            "data": _dia_brt(v["criado_em"]), "exportado_em": v["criado_em"], "motor": v["motor"],
+            "proposta": p.get("numero_proposta"), "rascunho": p.get("numero_rascunho"),
+            "cliente": p.get("cliente"), "operador": (p.get("usuario_email") or "").split("@")[0],
+            "origem_proposta": "email" if p.get("criado_via") == "email_auto" else "tela",
+            "proposta_id": v["proposta_id"], "item_uid": v["item_uid"], "item": pr.get("descricao") or "",
+            "veredito": v["veredito"], "categoria": _CATEGORIA_VEREDITO.get(v["veredito"], "outra"),
+            "loja_bot": loja_bot, "preco_bot": preco_bot,
+            "usada": d.get("usada") or (loja_bot if v["veredito"] == "acertou" else None),
+            "custo_final": d.get("custo_final")})
+
+    def _grupos(chave):
+        g = {}
+        for x in itens:
+            g.setdefault(x[chave] or "—", []).append(x)
+        return g
+
+    por_dia = [{"data": k, **_agrega_desempenho(l)} for k, l in sorted(_grupos("data").items(), reverse=True)]
+    por_operador = [{"operador": k, **_agrega_desempenho(l)}
+                    for k, l in sorted(_grupos("operador").items(), key=lambda kv: -len(kv[1]))]
+    periodo = {"de": d_ini.isoformat() if d_ini else None, "ate": d_fim.isoformat() if d_fim else None,
+               "compilado": not d_ini and not d_fim}
+    saida = {"motor": motor, "momento": momento, "periodo": periodo, "operador": op or None,
+             "resumo": _agrega_desempenho(itens), "por_dia": por_dia, "por_operador": por_operador,
+             "itens": itens}
+    if (formato or "").lower() != "texto":
+        return saida
+
+    def _br(x):
+        return f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if isinstance(x, (int, float)) else "—"
+    r = saida["resumo"]
+    quando = ("compilado completo" if periodo["compilado"]
+              else f"{periodo['de'] or 'início'} a {periodo['ate'] or 'hoje'}")
+    linhas = [f"Desempenho {motor} ({momento}) — {quando}" + (f" — operador {op}" if op else ""),
+              f"{r['total']} itens em {r['propostas']} propostas · usadas {r['usadas']} ({r['taxa_uso']}%) · "
+              f"corrigidas {r['corrigidas']} (troca de loja {r['corrigidas_troca']}, preço {r['corrigidas_preco']}) · "
+              f"sem oferta {r['sem_oferta']} · uso quando trouxe oferta {r['taxa_uso_com_oferta']}%"]
+    if len(por_dia) > 1:
+        linhas.append("Por dia: " + " | ".join(
+            f"{d['data']} {d['total']} itens, {d['usadas']} usadas, {d['corrigidas']} corrigidas, {d['sem_oferta']} sem oferta"
+            for d in por_dia))
+    linhas.append("Itens:")
+    for x in itens:
+        linhas.append(f"{x['data']} {x['proposta']} {str(x['cliente'] or '')[:25]} · {str(x['item'])[:50]} · "
+                      f"{x['categoria']}/{x['veredito']} · bot {x['loja_bot'] or '—'} {_br(x['preco_bot'])} "
+                      f"→ saiu {x['usada'] or '—'} {_br(x['custo_final'])}")
+    return PlainTextResponse("\n".join(linhas))
 
 
 @app.get("/api/guia/pesquisa-retorno")

@@ -7,6 +7,7 @@ import ChamadosAdmin from "./ChamadosAdmin.jsx";
 import Agentes from "./Agentes.jsx";
 import Suporte from "./Suporte.jsx";
 import VersaoBadge from "./Versao.jsx";
+import Desempenho from "./Desempenho.jsx";
 import Catalogo, { ConhecimentoSelo, ExtratoModal, ExtratosPropostaModal } from "./Catalogo.jsx";
 import { DatasheetBotao, DatasheetLote, DatasheetBaixarTodos } from "./Datasheet.jsx";
 import {
@@ -3183,6 +3184,8 @@ export default function App() {
             onNovaOCProcessada={() => setNovaOCPayload(null)} />
         ) : pagina === "catalogo" ? (
           <Catalogo token={token} apiUrl={API} fichaInicial={catalogoFicha} />
+        ) : pagina === "desempenho" ? (
+          <Desempenho token={token} apiUrl={API} />
         ) : pagina === "requisicoes" ? (
           <Analista token={token} usuario={usuario} onAlertasChange={carregarAlertas} />
         ) : pagina === "agentes" ? (
