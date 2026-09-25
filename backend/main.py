@@ -118,7 +118,8 @@ from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_
 # v3.99 — dois achados no primeiro dia em produção do monitor de e-mail: (1) um restart do Render no meio de um e-mail com várias propostas (Universal, uma por destino) duplicou tudo, porque o "já visto" só era gravado no FINAL — agora é gravado ANTES de processar; (2) regra do Leonardo: monitor nunca busca antes de hoje (KIST_EMAIL_MONITOR_DATA_MINIMA), pra não reabrir cotação antiga já tratada na mão.
 # v3.100 — campo novo `propostas.assunto_email` (opcional, só o monitor de e-mail preenche): mostra o assunto do e-mail de origem na tela de Propostas, pra localizar rápido de qual e-mail é cada cotação automática. `_criar_rascunho`: se a renomeação TMP-＜uuid＞ -> R-＜id＞ falhar, apaga a linha órfã em vez de deixar lixo (achado em produção: um rascunho "TMP-..." sem dono, sem itens, ficou preso na lista).
 # v3.101 — dois achados testando o disparo do Dwight de verdade: (1) a chave de API que o monitor de e-mail usava tinha o prefixo errado ("kist_" em vez de "kist_sk_", exigido por API_KEY_PREFIXO) — todo disparo falhava 401 em silêncio, nenhuma das propostas automáticas tinha pesquisa rodando; corrigido o hash da chave. (2) regra do Leonardo: automação sempre usa o motor KistBot Dwight (/pesquisa-kistbot-dwight), não o Dwight "normal" (/pesquisa-dwight) — email_monitor.py corrigido pro motor certo.
-VERSAO_BACKEND = "3.101"
+# v3.102 — regra do Leonardo: motor Dwight "normal" desativado em toda a Cabine (não removido — DWIGHT_MOTOR_ATIVO=1 no Render liga de volta sem mexer em código). `_motores()` reporta url/key vazios pra ele, então a tela já desativa o botão sozinha (mesmo mecanismo do KistBot antes do túnel) e qualquer disparo direto na API cai no 503 de "não configurada". Frontend: botão "Dwight" cinza, pesquisa por item individual e o padrão da função passaram a usar KistBot.
+VERSAO_BACKEND = "3.102"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -6057,9 +6058,21 @@ KISTBOTS_DWIGHT_WEBHOOK_KEY = os.environ.get("KISTBOTS_DWIGHT_WEBHOOK_KEY", "")
 # Motores de pesquisa (v3.78). Mesmas regras para todos: fila em lotes, cache
 # compartilhado, curral do bot, retorno pela gaveta (/pesquisa-resultado).
 # Cada motor tem a SUA fila e o seu limite de lotes em voo.
+#
+# Regra do Leonardo, 25/09: desativar o motor Dwight "normal" — não apagar,
+# só parar de mandar requisição pra ele. Só o KistBot Dwight fica ativo.
+# Reversível sem mexer em código: DWIGHT_MOTOR_ATIVO=1 no Render liga de
+# volta. Desativado, `url`/`key` ficam vazios pra este motor — a MESMA
+# aparência de "não configurado" que a tela e o /pesquisa-dwight já sabem
+# tratar (botão desativado na tela, 503 se alguém tentar disparar mesmo
+# assim), sem precisar de um estado novo.
+DWIGHT_MOTOR_ATIVO = os.environ.get("DWIGHT_MOTOR_ATIVO", "0").strip().lower() in ("1", "true", "on", "sim")
+
 def _motores() -> dict:
     return {
-        "dwight":  {"nome": "Dwight", "url": DWIGHT_WEBHOOK_URL, "key": DWIGHT_WEBHOOK_KEY,
+        "dwight":  {"nome": "Dwight",
+                    "url": DWIGHT_WEBHOOK_URL if DWIGHT_MOTOR_ATIVO else "",
+                    "key": DWIGHT_WEBHOOK_KEY if DWIGHT_MOTOR_ATIVO else "",
                     "env": "DWIGHT_WEBHOOK_URL / DWIGHT_WEBHOOK_KEY"},
         "kistbot": {"nome": "KistBot Dwight", "url": KISTBOTS_DWIGHT_WEBHOOK_URL,
                     "key": KISTBOTS_DWIGHT_WEBHOOK_KEY,

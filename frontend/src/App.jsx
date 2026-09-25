@@ -2858,7 +2858,9 @@ export default function App() {
     carregarDwightComVenda(novos, true);
   }, [pesq.itens, pesqAuto, propostaIdx]);
 
-  async function pesquisarComDwight(forcar = false, itemUids = null, motor = "dwight") {
+  // Padrão "kistbot": o motor Dwight normal está desativado (25/09) — quem
+  // não escolher motor explicitamente cai no que está ativo.
+  async function pesquisarComDwight(forcar = false, itemUids = null, motor = "kistbot") {
     if (!numeroAtual || pesqEnviando) return;
     setPesqEnviando(true); setPesqMsg("");
     try {
@@ -3655,9 +3657,17 @@ export default function App() {
                 <div className="mt-3 flex flex-wrap items-center justify-between gap-x-6 gap-y-2 rounded-xl border border-line bg-surface px-3 py-2.5 text-[12px]">
                   <div className="flex min-w-0 flex-wrap items-center gap-2">
                     <span className="eyebrow mr-1 text-[9.5px] font-semibold uppercase text-faint">Pesquisa de preço</span>
-                    <button onClick={() => pesquisarComDwight(false)} disabled={pesqEnviando || !numeroAtual}
+                    {/* Motor "Dwight" normal desativado por decisão do Leonardo, 25/09 — só
+                        o KistBot Dwight fica ativo na Cabine. Não removido: some sozinho
+                        quando DWIGHT_MOTOR_ATIVO=1 voltar a configurar url/key no Render
+                        (mesmo padrão do botão do KistBot logo abaixo). */}
+                    <button onClick={() => pesquisarComDwight(false)}
+                      disabled={pesqEnviando || !numeroAtual || motores.dwight === false}
+                      title={motores.dwight === false
+                        ? "Motor Dwight desativado por enquanto — use o KistBot Dwight"
+                        : "Pesquisar com o Dwight"}
                       className={btnToolKist}>
-                      {pesqEnviando ? "Enviando…" : "🔎 Dwight"}
+                      {pesqEnviando ? "Enviando…" : "🔎 Dwight"}{motores.dwight === false ? " (desativado)" : ""}
                     </button>
                     {/* v3.78: segundo motor, mesmas regras (fila, cache, retorno na gaveta). */}
                     <button onClick={() => pesquisarComDwight(false, null, "kistbot")}
@@ -3815,7 +3825,9 @@ export default function App() {
                         <ItemRow key={i} item={item} index={i} onChange={atualizarItem} onRemove={removerItem} token={token} apiUrl={API} fonteTexto={prop.fonte_texto} cnpj={prop.cnpj} propostaId={propostaId} onSalvar={salvarRascunho}
                           dwight={item?.item_uid ? pesq.itens[String(item.item_uid).toLowerCase()] : null}
                           onPesquisarItem={item?.item_uid
-                            ? () => pesquisarComDwight(true, [String(item.item_uid).toLowerCase()])
+                            // Motor Dwight normal desativado (25/09) — pesquisa por item
+                            // individual usa o KistBot Dwight, igual ao botão da barra.
+                            ? () => pesquisarComDwight(true, [String(item.item_uid).toLowerCase()], "kistbot")
                             : null}
                           conhecimento={conhecimentoItens[String(item?.item_uid || i)]}
                           onAbrirFicha={(fid) => { setCatalogoFicha(fid); setPagina("catalogo"); }} />
