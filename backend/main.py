@@ -122,7 +122,8 @@ from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_
 # v3.103 — só frontend: badge "✉ Revisar" (Propostas) ficava presa depois de exportar pro Tiny, porque checava `status === "rascunho"` — exportar não muda o status, quem muda é `tiny_numero`. Badge e filtro "Só pra revisar" passaram a checar `!tiny_numero`. `assunto_email` das 4 propostas de hoje (criadas antes desse campo existir) preenchido retroativamente a partir do log do monitor.
 # v3.104 — chamado #21 (Leonardo): dois bugs. (1) Pix ≈ cheio (diferença < 1 centavo, caso real 860/860 com obs "[preço: ocr]") ainda entrava como "Pix e cheio divergentes" e travava o auto-load de custo — `precoDivergente`/`_preco_divergente` (espelho) agora checam a igualdade ANTES da flag/regra de 35%/OCR-outlier. (2) `sku_fornecedor` (pode ser MLB*/SKU de marketplace, ex. prévia 1051038 -> codigo=MLB25347515) ia pro `item.codigo` da proposta Tiny, visível no PDF/portal do cliente — `_sku_tiny` agora usa `codigo_cliente` (código do item no ERP do cliente) ou a descrição; `sku_fornecedor` fica só interno da Cabine, nunca mais vai ao Tiny.
 # v3.105 — painel de desempenho dos bots de pesquisa (pedido do Leonardo): GET /pesquisa/desempenho (dia, período ou compilado; todos os operadores, filtro opcional; JSON ou texto; liberado pra chave do KistBot) + página "Desempenho" no Cabine. Veredito da exportação/compra agora é POR MOTOR (antes o do motor que respondeu por último engolia o outro), ganha a categoria `sem_oferta` (bot não achou, operador achou) e guarda o retrato do que o bot sugeriu x o que saiu.
-VERSAO_BACKEND = "3.105"
+# v3.106 — `_registrar_vereditos`: falha ao gravar UM veredito não derruba mais os outros itens (o try era um só, em volta do laço). Achado no recálculo da v3.105: a trava do banco recusava "sem_oferta" (ampliada por migration).
+VERSAO_BACKEND = "3.106"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -6818,16 +6819,22 @@ def _registrar_vereditos(sb, proposta_id, itens_finais: list, momento: str) -> i
                     continue
                 linha = {"pesquisa_id": row["id"], "item_uid": row["item_uid"], "proposta_id": proposta_id,
                          "motor": motor, "momento": momento, "veredito": v["veredito"], "detalhe": v}
-                (sb.table("pesquisa_vereditos").delete().eq("proposta_id", proposta_id)
-                   .eq("item_uid", row["item_uid"]).eq("motor", motor).eq("momento", momento)
-                   .neq("pesquisa_id", row["id"]).execute())
-                ja = (sb.table("pesquisa_vereditos").select("id").eq("pesquisa_id", row["id"])
-                        .eq("momento", momento).limit(1).execute().data or [])
-                if ja:
-                    sb.table("pesquisa_vereditos").update(linha).eq("id", ja[0]["id"]).execute()
-                else:
-                    sb.table("pesquisa_vereditos").insert(linha).execute()
-                n += 1
+                # v3.106 — falha de UM veredito não derruba os outros itens: antes o
+                # try era um só, em volta do laço inteiro (25/09: a trava do banco
+                # recusou "sem_oferta" e todo item seguinte ficaria sem veredito).
+                try:
+                    (sb.table("pesquisa_vereditos").delete().eq("proposta_id", proposta_id)
+                       .eq("item_uid", row["item_uid"]).eq("motor", motor).eq("momento", momento)
+                       .neq("pesquisa_id", row["id"]).execute())
+                    ja = (sb.table("pesquisa_vereditos").select("id").eq("pesquisa_id", row["id"])
+                            .eq("momento", momento).limit(1).execute().data or [])
+                    if ja:
+                        sb.table("pesquisa_vereditos").update(linha).eq("id", ja[0]["id"]).execute()
+                    else:
+                        sb.table("pesquisa_vereditos").insert(linha).execute()
+                    n += 1
+                except Exception:
+                    continue
     except Exception:
         pass
     return n
