@@ -1,6 +1,6 @@
 import {
   Eyebrow, PageHeader,
-  IconNova, IconList, IconBoard, IconChat, IconBolt, IconLink,
+  IconNova, IconList, IconBoard, IconChat, IconBolt, IconLink, IconChart,
 } from "./kist-ui.jsx";
 
 // Documentação interna — gerada a partir do núcleo de capacidades (v3.11).
@@ -25,6 +25,7 @@ const SECOES = [
       ["Buscar e filtrar", "Por número, cliente, CNPJ ou item, com intervalo de datas. Marque “ver equipe toda” pra sair só das suas."],
       ["Abrir e editar", "Reabra qualquer proposta pra ajustar itens e preços."],
       ["Aprovar → OC", "Selecione os itens aprovados, informe a PO do cliente e vire ordem de compra."],
+      ["Só pra revisar", "Cotação de cliente conhecido que chega no e-mail do Leonardo vira proposta sozinha: itens, match e pesquisa do KistBot Dwight. Ela aparece com o selo “✉ Revisar” e o assunto do e-mail embaixo do cliente. Revisar, exportar pro Tiny e mandar ao cliente continua sendo com você — o selo some quando a proposta é exportada."],
     ],
   },
   {
@@ -64,6 +65,16 @@ const SECOES = [
       ["Conversar", "Fale com o analista do sistema do jeito que vier. Ele entende a dor, checa se já dá pra fazer, e monta uma ficha com a solicitação, a dor e como o sistema deve se comportar depois."],
       ["Confirmar", "O chamado só é aberto depois que você confirma a ficha. Aí você recebe o número."],
       ["Meus chamados", "Acompanhe o andamento. Quando algo é resolvido e sobe pra produção, aparece aqui como “no ar”."],
+    ],
+  },
+  {
+    n: "07", Icon: IconChart, titulo: "Desempenho",
+    desc: "Quanto das buscas do KistBot Dwight foi usado e quanto foi corrigido.",
+    itens: [
+      ["Os números", "Das buscas que viraram proposta exportada pro Tiny: usadas (saiu como o bot trouxe), corrigidas (trocou de loja, ou manteve a loja com custo mais de 15% diferente) e bot não achou (você achou sozinho). Todos os operadores."],
+      ["Período", "Hoje, 7 dias, 30 dias, Compilado ou datas livres. Filtre por operador. Tabelas por dia e por operador."],
+      ["Item a item", "O que o bot sugeriu e com o que a proposta saiu, com os links e a frase do que mudou."],
+      ["Quando atualiza", "A cada exportação pro Tiny. A tela relê sozinha a cada minuto. O próprio KistBot lê os mesmos números pela API, pra aprender com as correções."],
     ],
   },
 ];

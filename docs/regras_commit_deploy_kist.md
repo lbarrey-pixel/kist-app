@@ -1,6 +1,6 @@
 # Regras de commit e deploy — kist-app
 
-Vale para toda conversa deste projeto. Atualizado em 23/09/2026.
+Vale para toda conversa deste projeto. Atualizado em 25/09/2026.
 
 ## 1. Onde está o código
 - Repositório: `lbarrey-pixel/kist-app`, branch `main`.
@@ -25,19 +25,21 @@ Vale para toda conversa deste projeto. Atualizado em 23/09/2026.
 - Toda entrega de backend sobe `VERSAO_BACKEND` em `backend/main.py` (ex.: 3.82 → 3.83).
 - Comentário no código com a tag da versão e o porquê (`# v3.83 — regra do Leonardo, caso R-1375`).
 - O versionamento em `.md` ganha a entrada da versão no mesmo dia.
+- **Sessões em paralelo (25/09):** mais de uma conversa do Claude pode estar mexendo no MESMO clone ao mesmo tempo. Logo antes de subir a versão, `git fetch` + conferir o `VERSAO_BACKEND` atual e o topo do versionamento — se outra sessão já usou o número, pegue o próximo. Nunca reaproveitar um número que outra sessão marcou no código, mesmo que ela ainda não tenha commitado.
 
 ## 5. Commit
 - Só os arquivos alterados. Nunca `__pycache__`, `.pyc`, `node_modules` ou arquivo de teste.
 - Mensagem: `vX.YY — o que mudou em uma linha`. Exemplo: `v3.83 — venda automática do Dwight + Pix suspeito usa preço cheio`.
 - **Pelo GitHub Desktop:** 1) `git pull` (Fetch/Pull) antes de tudo; 2) conferir a lista de arquivos alterados; 3) Commit to main; 4) Push origin.
 - **Pelo Claude na nuvem:** a conversa precisa começar com o repositório `lbarrey-pixel/kist-app` selecionado no seletor de repositório. O app Claude já está instalado no GitHub com acesso a todos os repositórios. Uma conversa aberta sem o repositório não consegue fazer push (erro 403) e não dá para incluir depois: abra outra.
+- **Antes de commitar, `git diff` arquivo por arquivo.** Trecho que você não escreveu é de outra sessão em andamento: não entra no seu commit. Comite só os seus trechos (`git apply --cached` com um patch só deles) e avise a outra sessão que o HEAD andou.
 - Se o Claude gravar arquivos direto na pasta local, o commit e o push **são do próprio Claude** (`git commit` + `git push origin main`), sem esperar o Leonardo passar pelo GitHub Desktop. Regra do Leonardo, 24/09: "sempre você sobe, não há mais commits pela minha parte".
 
 ## 6. Depois do push
 1. Conferir que o `main` no GitHub tem o commit (`git fetch` e `git log origin/main`).
 2. Conferir que o Render publicou os DOIS serviços: o backend pela versão em `/openapi.json` (`info.version`, rota aberta); o frontend pelo nome do pacote `assets/index-*.js` servido na página. Em 23/09 o auto-deploy do **kist-frontend não disparou** com o push e foi preciso publicar à mão pelo painel.
 3. **Só depois do deploy confirmado** atualizar as bases de conhecimento:
-   - `config_kist['capacidades_nucleo']` (Analista): backup antes em `capacidades_nucleo_bkp_AAAAMMDD`, texto com dollar-quoting `$nucleo$…$nucleo$`, cabeçalho "Versão do núcleo" atualizado.
+   - `config_kist['capacidades_nucleo']` (Analista **e o balão de Suporte**, que usa o mesmo núcleo): backup antes em `capacidades_nucleo_bkp_AAAAMMDD`, texto com dollar-quoting `$nucleo$…$nucleo$`, cabeçalho "Versão do núcleo" atualizado. Se a versão escrita no núcleo for diferente do `VERSAO_BACKEND` em produção, os dois agentes recebem o aviso "seu conhecimento pode estar atrasado" — em 25/09 o núcleo estava na v3.90 com produção na v3.107. Prefira trocar trechos (`replace`) e acrescentar seção nova no fim a reescrever o texto inteiro.
    - tabela `conhecimento` (bots, servida por `/contexto`): backup `_bkp_AAAAMMDD_conhecimento`; a coluna `versao` sobe sozinha.
    - guias servidos pela API (`/api/guia/*`) mudam no código, então vão no mesmo commit.
 4. Validar o caso real que motivou a mudança (ex.: abrir a R-1375 e ver o custo certo).
@@ -46,6 +48,7 @@ Vale para toda conversa deste projeto. Atualizado em 23/09/2026.
 - Mudança de banco é deploy: testar contra o banco real.
 - Backup nomeado (`_bkp_AAAAMMDD_tabela`) antes de qualquer UPDATE ou DELETE em lote.
 - Campo novo = coluna + persistência na rota que grava + leitura na rota que lê + tela.
+- Valor novo numa coluna com `CHECK` (ex.: `pesquisa_vereditos.veredito`) exige migration ampliando a trava **antes** do deploy do código que grava o valor. Em 25/09 a categoria `sem_oferta` foi recusada pelo banco e só apareceu no recálculo — o código engolia o erro.
 
 ## 8. Nunca
 - Push no `main` com regra de negócio pendente de decisão.

@@ -125,7 +125,8 @@ from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_
 # v3.106 — `_registrar_vereditos`: falha ao gravar UM veredito não derruba mais os outros itens (o try era um só, em volta do laço). Achado no recálculo da v3.105: a trava do banco recusava "sem_oferta" (ampliada por migration).
 # v3.107 — KistBot lê a base de conhecimento: GET /contexto e GET /versao liberados pra chave de escopo `pesquisa`, mas o /contexto mostra pra ela SÓ as seções de pesquisa (_SECOES_ESCOPO_PESQUISA) — clientes, markup e carteira ficam de fora. Mensagem de 403 do escopo `pesquisa` passou a listar as rotas de verdade.
 # v3.108 — CRM de prospecção fria pronto pra bot trabalhar sozinho (pedido do Leonardo, 25/09): tabela `leads_prospeccao_acoes` + POST/GET `/crm/leads/{dominio}/acoes` registram o que o bot fez e quando volta a agir, sem fila pronta — `GET /crm/leads?ordenar=proximo_followup_em&crescente=1` monta a rotina. Regra de dono apertada: pela TELA (humano) continua "todo mundo vê, admin edita qualquer um"; por CHAVE DE API (bot) agora é sempre só o PRÓPRIO dono, ler e mexer, sem exceção nem pro admin.
-VERSAO_BACKEND = "3.108"
+# v3.109 — /pesquisa/desempenho diz EXATAMENTE o que mudou em cada item (pedido do Leonardo): `link_bot`, `link_final`, `diferenca_pct` e uma frase em `mudanca` ("trocou X (R$) por Y (R$) — loja que o bot não trouxe"). Veredito antigo sem retrato busca o link no resultado e no item. Formato texto traz a frase e os links. Página Desempenho: lojas viram link (só http/https).
+VERSAO_BACKEND = "3.109"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -7120,13 +7121,25 @@ async def pesquisa_desempenho(motor: str = "kistbot", de: str = "", ate: str = "
         ver = [v for v in ver if op in str((props.get(v["proposta_id"]) or {}).get("usuario_email") or "").lower()]
     pesq = _lote("pesquisa_resultados", "id,descricao,resultado", list({v["pesquisa_id"] for v in ver}))
 
+    # Link com que o item saiu, pra veredito antigo que não guardou o retrato:
+    # lê o item atual (v3.109). Veredito novo já traz `link_final` do momento.
+    links_itens = {}
+    faltam = list({v["proposta_id"] for v in ver if not (v.get("detalhe") or {}).get("link_final")})
+    for k in range(0, len(faltam), 100):
+        for r in (sb.table("itens_proposta").select("proposta_id,item_uid,link_fornecedor")
+                    .in_("proposta_id", faltam[k:k + 100]).execute().data or []):
+            links_itens[(r["proposta_id"], str(r.get("item_uid") or "").lower())] = r.get("link_fornecedor")
+
+    def _rs(x):
+        return "R$ " + f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if x else "sem preço"
+
     itens = []
     for v in ver:
         d = v.get("detalhe") or {}
         p = props.get(v["proposta_id"]) or {}
         pr = pesq.get(v["pesquisa_id"]) or {}
-        loja_bot, preco_bot = d.get("loja_bot") or d.get("recomendada"), d.get("preco_bot")
-        if not loja_bot and v["veredito"] != "sem_oferta":
+        loja_bot, preco_bot, link_bot = d.get("loja_bot") or d.get("recomendada"), d.get("preco_bot"), d.get("link_bot")
+        if (not loja_bot or not link_bot) and v["veredito"] != "sem_oferta":
             # veredito anterior à v3.105, sem o retrato: lê a recomendação do resultado
             res = pr.get("resultado") or {}
             ofs = [o for o in (res.get("ofertas") or []) if isinstance(o, dict)]
@@ -7136,18 +7149,42 @@ async def pesquisa_desempenho(motor: str = "kistbot", de: str = "", ate: str = "
                 except (TypeError, ValueError):
                     e = 0
                 rec = ofs[e] if 0 <= e < len(ofs) else ofs[0]
-                loja_bot = rec.get("loja")
+                loja_bot = loja_bot or rec.get("loja")
+                link_bot = link_bot or rec.get("link")
                 preco_bot = preco_bot or _num_br(rec.get("preco_pix")) or _num_br(rec.get("preco_cheio")) or None
+        preco_bot = _num_br(preco_bot) or None
+        custo = _num_br(d.get("custo_final")) or None
+        usada = d.get("usada") or (loja_bot if v["veredito"] == "acertou" else None)
+        link_final = d.get("link_final") or links_itens.get((v["proposta_id"], str(v["item_uid"] or "").lower()))
+        dif = round(100 * (custo - preco_bot) / preco_bot, 1) if (custo and preco_bot) else None
+        # v3.109 — o que exatamente mudou, em uma frase (pedido do Leonardo: o bot
+        # precisa saber o que foi alterado, com os links, pra aprender com isso).
+        vd = v["veredito"]
+        if vd == "acertou":
+            mudanca = f"nada: saiu com a oferta do bot ({loja_bot}, {_rs(preco_bot)}"
+            mudanca += f"; custo final {_rs(custo)})" if custo and preco_bot and abs(custo - preco_bot) >= 0.01 else ")"
+        elif vd == "custo_divergente":
+            mudanca = f"mesma loja ({loja_bot}), custo corrigido de {_rs(preco_bot)} para {_rs(custo)} ({dif:+}%)"
+        elif vd == "nao_achou":
+            mudanca = (f"trocou {loja_bot} ({_rs(preco_bot)}) por {usada or 'outra origem'} ({_rs(custo)})"
+                       f" — loja que o bot não trouxe")
+        elif vd == "escolheu_outra":
+            mudanca = (f"usou outra oferta que o bot trouxe: {usada} ({_rs(custo)}) em vez da recomendada "
+                       f"{loja_bot} ({_rs(preco_bot)})")
+        elif vd == "sem_oferta":
+            mudanca = f"bot não trouxe oferta; o operador achou em {usada or 'outra origem'} ({_rs(custo)})"
+        else:
+            mudanca = vd
         itens.append({
             "data": _dia_brt(v["criado_em"]), "exportado_em": v["criado_em"], "motor": v["motor"],
             "proposta": p.get("numero_proposta"), "rascunho": p.get("numero_rascunho"),
             "cliente": p.get("cliente"), "operador": (p.get("usuario_email") or "").split("@")[0],
             "origem_proposta": "email" if p.get("criado_via") == "email_auto" else "tela",
             "proposta_id": v["proposta_id"], "item_uid": v["item_uid"], "item": pr.get("descricao") or "",
-            "veredito": v["veredito"], "categoria": _CATEGORIA_VEREDITO.get(v["veredito"], "outra"),
-            "loja_bot": loja_bot, "preco_bot": preco_bot,
-            "usada": d.get("usada") or (loja_bot if v["veredito"] == "acertou" else None),
-            "custo_final": d.get("custo_final")})
+            "veredito": vd, "categoria": _CATEGORIA_VEREDITO.get(vd, "outra"),
+            "loja_bot": loja_bot, "preco_bot": preco_bot, "link_bot": link_bot,
+            "usada": usada, "custo_final": custo, "link_final": link_final,
+            "diferenca_pct": dif, "mudanca": mudanca})
 
     def _grupos(chave):
         g = {}
@@ -7166,8 +7203,6 @@ async def pesquisa_desempenho(motor: str = "kistbot", de: str = "", ate: str = "
     if (formato or "").lower() != "texto":
         return saida
 
-    def _br(x):
-        return f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if isinstance(x, (int, float)) else "—"
     r = saida["resumo"]
     quando = ("compilado completo" if periodo["compilado"]
               else f"{periodo['de'] or 'início'} a {periodo['ate'] or 'hoje'}")
@@ -7179,11 +7214,15 @@ async def pesquisa_desempenho(motor: str = "kistbot", de: str = "", ate: str = "
         linhas.append("Por dia: " + " | ".join(
             f"{d['data']} {d['total']} itens, {d['usadas']} usadas, {d['corrigidas']} corrigidas, {d['sem_oferta']} sem oferta"
             for d in por_dia))
-    linhas.append("Itens:")
+    linhas.append("Itens (o que mudou e os links):")
     for x in itens:
-        linhas.append(f"{x['data']} {x['proposta']} {str(x['cliente'] or '')[:25]} · {str(x['item'])[:50]} · "
-                      f"{x['categoria']}/{x['veredito']} · bot {x['loja_bot'] or '—'} {_br(x['preco_bot'])} "
-                      f"→ saiu {x['usada'] or '—'} {_br(x['custo_final'])}")
+        linhas.append(f"- {x['data']} {x['proposta']} {str(x['cliente'] or '')[:25]} · {str(x['item'])[:60]} "
+                      f"· {x['categoria']}/{x['veredito']}")
+        linhas.append(f"  {x['mudanca']}")
+        if x.get("link_bot"):
+            linhas.append(f"  link do bot: {x['link_bot']}")
+        if x.get("link_final") and x.get("link_final") != x.get("link_bot"):
+            linhas.append(f"  link que saiu: {x['link_final']}")
     return PlainTextResponse("\n".join(linhas))
 
 

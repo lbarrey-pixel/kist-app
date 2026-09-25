@@ -37,6 +37,18 @@ const diaBR = (iso) => (iso ? iso.split("-").reverse().slice(0, 2).join("/") : "
 const pct = (v) => (v == null ? "—" : `${String(v).replace(".", ",")}%`);
 const reais = (v) => (v ? `R$ ${brl(v)}` : "—");
 
+function Loja({ nome, link }) {
+  if (!nome && !link) return <div className="text-ink">—</div>;
+  // Link vem de dado gravado por bot: só http(s) vira clicável (nada de javascript:).
+  if (!link || !/^https?:\/\//i.test(String(link).trim())) return <div className="text-ink">{nome || "—"}</div>;
+  return (
+    <a href={link} target="_blank" rel="noopener noreferrer" title={link}
+      className="text-kist underline decoration-kist/30 underline-offset-2 hover:decoration-kist">
+      {nome || "link"}
+    </a>
+  );
+}
+
 function Tile({ rotulo, valor, detalhe, tom = "text-ink" }) {
   return (
     <div className="rounded-xl border border-line bg-surface px-4 py-3">
@@ -251,16 +263,21 @@ export default function Desempenho({ token, apiUrl }) {
                           </td>
                           <td className="min-w-[200px] max-w-[280px] px-3 py-2 text-ink">{x.item}</td>
                           <td className="px-3 py-2">
-                            <div className="text-ink">{x.loja_bot || "—"}</div>
+                            <Loja nome={x.loja_bot} link={x.link_bot} />
                             <div className="font-mono text-[11px] text-sub">{reais(x.preco_bot)}</div>
                           </td>
                           <td className="px-3 py-2">
-                            <div className="text-ink">{x.usada || "—"}</div>
-                            <div className="font-mono text-[11px] text-sub">{reais(x.custo_final)}</div>
+                            <Loja nome={x.usada} link={x.link_final} />
+                            <div className="font-mono text-[11px] text-sub">
+                              {reais(x.custo_final)}
+                              {x.diferenca_pct != null && x.veredito !== "acertou" && (
+                                <span className="ml-1 text-faint">({x.diferenca_pct > 0 ? "+" : ""}{String(x.diferenca_pct).replace(".", ",")}%)</span>
+                              )}
+                            </div>
                           </td>
-                          <td className="px-3 py-2">
+                          <td className="max-w-[240px] px-3 py-2">
                             <span className={`inline-block whitespace-nowrap rounded-md px-1.5 py-0.5 text-[10.5px] font-semibold ${c.cls}`}>{c.r}</span>
-                            <div className="mt-0.5 text-[10.5px] text-faint">{VEREDITO_TXT[x.veredito] || x.veredito}</div>
+                            <div className="mt-0.5 text-[10.5px] text-faint">{x.mudanca || VEREDITO_TXT[x.veredito] || x.veredito}</div>
                           </td>
                         </tr>
                       );

@@ -1,6 +1,6 @@
-# Kist Cabine: versionamento v3.59 a v3.90
+# Kist Cabine: versionamento a partir da v3.59
 
-Atualizado em 23/09/2026. Continua o histórico até a v3.58 que está no núcleo do Analista (`config_kist['capacidades_nucleo']`).
+Atualizado em 25/09/2026 (até a v3.109). Continua o histórico até a v3.58 que está no núcleo do Analista (`config_kist['capacidades_nucleo']`). O nome do arquivo ainda diz "v3.59-v3.90" porque o CLAUDE.md e as regras apontam para ele; o conteúdo segue daí em diante. Ordem: v3.59 a v3.84 em ordem crescente; a partir daí, da mais nova (v3.109) para a mais antiga (v3.85). As tabelas-resumo no fim cobrem tudo.
 
 Reconstruído dos diffs do git (`git diff <versão anterior> <versão> -- backend frontend`, sem `__pycache__`) e dos comentários do código marcados com "v3.NN". As mensagens de commit não trazem informação útil. Datas: data do commit (2026). Quando o comentário do código dá outra data para a decisão, ela aparece entre parênteses.
 
@@ -199,6 +199,13 @@ Versões que não têm commit próprio: **v3.69** está dentro de bcd73d0 (v3.70
 - Dados: `mercado_observacoes` 146 e 272 (Pix de OCR de 19,40 e 19,69) ficaram sem preço (backup `_bkp_20260923_mercado_observacoes`). R-1375: o Duracell ficou com custo 198,90 e venda 331,37, confirmados pelo Leonardo (backup `_bkp_20260923_itens_r1375`).
 - Propostas antigas com custo tirado de oferta divergente (vão aparecer com o aviso no card): 1050902 (terrômetro, 4.333,26), 1050903 (estilete, trena 19,27, torquês, chave ajustável 74,79), 1051007 e 1051012.
 
+## v3.109 · 25/09 · Desempenho diz exatamente o que mudou, com os links
+- **Pedido do Leonardo, 25/09**: o bot precisa saber exatamente o que foi alterado em cada busca dele — qual link sugeriu, com qual link a proposta saiu, quanto mudou o preço.
+- **[B]** `GET /pesquisa/desempenho`, por item: `link_bot` (a oferta recomendada), `link_final` (com o que saiu), `diferenca_pct` (custo final x preço do bot) e `mudanca` — uma frase: "trocou Dimensional (R$ 279,89) por Loja Elétrica (R$ 32,61) — loja que o bot não trouxe", "mesma loja (Eletrolico), custo corrigido de R$ 109,78 para R$ 35,45 (-67.7%)", "bot não trouxe oferta; o operador achou em …". Veredito antigo, sem o retrato da v3.105, busca o link do bot no resultado da pesquisa e o link final no item atual.
+- **[B]** `formato=texto`: cada item vem com a frase e os dois links (o link que saiu só aparece quando é diferente do link do bot).
+- **[F]** Página Desempenho: a loja sugerida e a loja com que saiu viram link (só `http`/`https` — o link vem de dado gravado por bot, nada de `javascript:`); a coluna Resultado mostra a frase; custo final mostra a diferença em %.
+- **Base de conhecimento** (depois do deploy): `desempenho_bots` explica os campos novos; núcleo do Analista/Suporte sobe pra v3.109.
+
 ## v3.108 · 25/09 · CRM: bot organiza a própria rotina de contatos + acesso do bot travado no próprio dono
 - **Pedido do Leonardo, 25/09**: os bots não vão cadastrar lead novo, só trabalhar a base que já existe. Em vez de uma fila pronta e priorizada, cada bot registra o que fez e quando volta a agir, e se organiza sozinho por essa data. E cada bot só pode ver e mexer nos leads do próprio dono — nem o bot do admin foge disso.
 - **[B]** Tabela nova `leads_prospeccao_acoes` (`dominio_id`, `tipo_acao`, `descricao`, `data_hora`, `proxima_acao_em`, `realizado_por`). `POST /crm/leads/{dominio}/acoes` registra a ação (tipo livre — sugestões: `tentativa_contato`, `mensagem_enviada`, `ligacao`, `sem_resposta`, `reuniao_marcada`, `follow_up`, `nota`) e, se vier `proxima_acao_em`, também atualiza `proximo_followup_em` do lead. `GET /crm/leads/{dominio}/acoes` devolve o histórico, mais recente primeiro. `GET /crm/leads/{dominio}` agora também devolve `acoes`.
@@ -227,17 +234,18 @@ Versões que não têm commit próprio: **v3.69** está dentro de bcd73d0 (v3.70
 - **[F]** Página **Desempenho** na barra lateral: Hoje / 7 dias / 30 dias / Compilado ou datas livres, filtro de operador e de bot, 4 números (usadas, corrigidas, bot não achou, uso quando trouxe oferta), barra, tabela por dia e por operador, itens com "bot sugeriu x saiu com". Relê a cada minuto com a aba visível. Boletim do Catálogo ganhou a coluna "sem oferta".
 - **Dados (recálculo, 25/09)**: vereditos de exportação das 8 propostas exportadas que tiveram pesquisa do KistBot (desde 22/09) apagados e regravados pela regra nova, com `criado_em` = data da exportação (`tiny_exportado_em`) pra cair no dia certo do painel. Backup de todas as 78 linhas antes em `_bkp_20260925_pesquisa_vereditos`. Resultado: 39 vereditos (27 KistBot, 12 Dwight). Dos 23 que já existiam, 21 bateram; os 2 que mudaram (1051026, carregador e impressora 3D) foram restaurados pro veredito original — o item foi salvo 9 s DEPOIS da exportação com o preço do bot, mas o que foi pro Tiny tinha outro custo. Ressalva: os vereditos que não existiam antes foram calculados pelo estado atual do item.
 - **DB**: a trava `pesquisa_vereditos_veredito_check` só aceitava as 4 categorias antigas e recusou `sem_oferta` — ampliada por migration (`pesquisa_vereditos_aceita_sem_oferta`). Nenhuma exportação caiu na janela entre o deploy e a migration.
-## v3.103 · 25/09 · Badge "Revisar" presa depois do Tiny + assunto retroativo
-- **Achado pelo Leonardo**: exportou a R-1433 pro Tiny (virou 1051041) e a badge "✉ Revisar" continuou aparecendo. Causa: a badge e o filtro "Só pra revisar" checavam `status === "rascunho"` — mas exportar pro Tiny **não muda o `status`** da proposta (confirmado: 1051041 está com `tiny_numero` preenchido e `status` ainda "rascunho"). Quem sinaliza "já foi exportada" é `tiny_numero`, não `status`.
-- **[F]** `Propostas.jsx`: badge e filtro agora checam `criado_via === 'email_auto' && !tiny_numero`.
-- **Achado junto**: `assunto_email` não aparecia nas 4 propostas de hoje porque elas foram criadas ANTES desse campo existir no código (v3.100 saiu depois). Preenchido retroativamente pelo texto já guardado em `email_cotacoes_monitor` — daqui pra frente toda proposta nova do monitor já nasce com o campo certo.
-- **Complemento (25/09, só frontend, sem subir `VERSAO_BACKEND` — o número 3.104 estava sendo usado por outra sessão trabalhando em paralelo):** o resultado do envio ao Tiny (caixa verde + botão "No Tiny: N") era um estado único da tela, limpo só no "Recomeçar". Ao exportar a R-1434 (virou 1051042) e depois abrir a R-1437 pela lista, a R-1437 aparecia como exportada com o número da outra. O banco nunca esteve errado. Agora o resultado guarda os números da proposta enviada (o R- e o do Tiny) e só aparece quando a proposta aberta é uma delas.
 
 ## v3.104 · 25/09 · Pix ≈ cheio não é mais "divergente" + Código Tiny nunca sai MLB/SKU de loja
 - **Pedido do Leonardo (chamado #21)**: dois bugs achados pelo KistBot (que já mitigava no bot; faltava corrigir na Cabine).
 - **[F][B] Pix ≈ cheio marcado como divergente.** Caso real (`pesquisa_resultados` 437, R-1435): Pix 860 e cheio 860, `obs` com `"[preço: ocr]"` — a oferta saía com `preco_divergente: true` e a tela mostrava "Pix e cheio divergentes", travando o auto-load do custo mesmo com o dinheiro igual. Causa: a checagem de OCR/outlier (regra da v3.84) rodava mesmo quando os dois preços eram o mesmo valor. `precoDivergente` (frontend, `App.jsx`) e `_preco_divergente` (backend, espelho — mudou um, mude o outro) agora testam `abs(pix − cheio) < 0,01` **antes** de olhar a flag salva ou a `obs`: diferença menor que 1 centavo nunca é divergência, mesmo com estado antigo gravado. Validado contra os dados reais: 437 (860/860) e 436 (R-1424, 4249/4249, também "ocr") passam a não divergir; os casos históricos de divergência real (Duracell R-1375 19,69×198,90, trena 19,27×716,90) continuam divergindo.
 - **[B] Código MLB indo pro Tiny.** Caso real: prévia da proposta 1051038 (item 59301, fragmentadora) exportou com `codigo="MLB25347515"` — o `sku_fornecedor` (código interno do anúncio no Mercado Livre) foi parar direto no `item.codigo` do orçamento Tiny, que aparece no PDF/portal que o cliente vê. Varredura no banco: 64 itens historicamente com `sku_fornecedor` começando em MLB, 62 deles sem `codigo_cliente`. `_sku_tiny` agora usa `codigo_cliente` (o código do item no ERP do cliente, já existia e já era preenchido na extração) quando houver; sem ele, gera da descrição (como antes). `sku_fornecedor` fica só interno da Cabine — nunca mais entra no código do Tiny. `_CAMPOS_TINY` (guia servido aos bots) atualizado para refletir `codigo_cliente` como a fonte certa.
 - Teste: `python -m py_compile`, hash AST de `fmt_preco`/`gerar_csv` inalterado, build do frontend a partir de `main.jsx` sem erro, e os dois casos validados contra dado real do Supabase (acima).
+
+## v3.103 · 25/09 · Badge "Revisar" presa depois do Tiny + assunto retroativo
+- **Achado pelo Leonardo**: exportou a R-1433 pro Tiny (virou 1051041) e a badge "✉ Revisar" continuou aparecendo. Causa: a badge e o filtro "Só pra revisar" checavam `status === "rascunho"` — mas exportar pro Tiny **não muda o `status`** da proposta (confirmado: 1051041 está com `tiny_numero` preenchido e `status` ainda "rascunho"). Quem sinaliza "já foi exportada" é `tiny_numero`, não `status`.
+- **[F]** `Propostas.jsx`: badge e filtro agora checam `criado_via === 'email_auto' && !tiny_numero`.
+- **Achado junto**: `assunto_email` não aparecia nas 4 propostas de hoje porque elas foram criadas ANTES desse campo existir no código (v3.100 saiu depois). Preenchido retroativamente pelo texto já guardado em `email_cotacoes_monitor` — daqui pra frente toda proposta nova do monitor já nasce com o campo certo.
+- **Complemento (25/09, só frontend, sem subir `VERSAO_BACKEND` — o número 3.104 estava sendo usado por outra sessão trabalhando em paralelo):** o resultado do envio ao Tiny (caixa verde + botão "No Tiny: N") era um estado único da tela, limpo só no "Recomeçar". Ao exportar a R-1434 (virou 1051042) e depois abrir a R-1437 pela lista, a R-1437 aparecia como exportada com o número da outra. O banco nunca esteve errado. Agora o resultado guarda os números da proposta enviada (o R- e o do Tiny) e só aparece quando a proposta aberta é uma delas.
 
 ## v3.102 · 25/09 · Motor Dwight "normal" desativado em toda a Cabine
 - **Regra do Leonardo, 25/09**: desativar o motor Dwight "normal" na Cabine inteira — não só na automação, em qualquer lugar que alguém possa disparar pesquisa. Sem apagar nada: reversível por variável de ambiente, o dia que precisar voltar.
@@ -278,9 +286,9 @@ Versões que não têm commit próprio: **v3.69** está dentro de bcd73d0 (v3.70
   - `pedido de compra` (sem "solicitação"/"cotação" na frente) batia em CONFIRMAÇÃO de PO já emitida ("RE: CONFIRMAÇÃO PEDIDO DE COMPRA || OC 115452"), não em cotação nova — e testado contra os 146 assuntos confirmados, essa palavra nunca é o único motivo de um acerto. Removida.
   - "Resposta automática: Cotação SC ..." (auto-reply/fora do escritório) não era reconhecida como resposta porque o prefixo "RE:"/"ENC:" não cobria esse caso — acrescentado ao normalizador de assunto.
 - **[B]** Reply/continuação de thread já vista é ignorada de propósito (regra explícita do Leonardo, não só heurística de conveniência): `(dominio, assunto_normalizado)` já registrado com `bateu_filtro=true` → e-mail novo da mesma thread não cria proposta nem aciona Dwight de novo.
-- **[B]** Reaproveita `_extrair_nucleo` (o mesmo núcleo do `/extrair` da tela, chamado direto, sem HTTP) pra criar o rascunho com matching; marca `propostas.criado_via='email_auto'`; aciona `/propostas/{numero}/pesquisa-dwight` (`somente_sem_match: true`) com uma chave de escopo `dwight_dispatch` nova — a MESMA trava de "cotação real" e teto de disparo que vale pra qualquer agente que não seja o Leonardo na tela (v3.70), sem nenhum código novo de segurança.
-- **Pendente do Leonardo** (o Claude não tem permissão de escrever em `api_chaves` — bloqueado pelo modo automático): rodar o INSERT da chave `dwight_dispatch` (SQL fornecido) e cadastrar `KIST_IMAP_HOST`, `KIST_IMAP_USER`, `KIST_IMAP_PASSWORD`, `KIST_EMAIL_MONITOR_DWIGHT_KEY` no Render. Sem essas variáveis o monitor fica desligado (loga e sai, não derruba o backend).
-- **Próximo passo, ainda não feito**: tela "para revisar" no Cabine (filtrar propostas por `criado_via='email_auto'`) — hoje dá pra achar pela lista normal de propostas, mas sem destaque próprio.
+- **[B]** Reaproveita `_extrair_nucleo` (o mesmo núcleo do `/extrair` da tela, chamado direto, sem HTTP) pra criar o rascunho com matching; marca `propostas.criado_via='email_auto'`; aciona ~~`/propostas/{numero}/pesquisa-dwight`~~ (motor errado — desde a v3.101 é `/pesquisa-kistbot-dwight`) (`somente_sem_match: true`) com uma chave de escopo `dwight_dispatch` nova — a MESMA trava de "cotação real" e teto de disparo que vale pra qualquer agente que não seja o Leonardo na tela (v3.70), sem nenhum código novo de segurança.
+- ✔ **Feito pelo Leonardo em 25/09** (estava pendente: o Claude não tem permissão de escrever em `api_chaves` — bloqueado pelo modo automático): rodar o INSERT da chave `dwight_dispatch` (SQL fornecido) e cadastrar `KIST_IMAP_HOST`, `KIST_IMAP_USER`, `KIST_IMAP_PASSWORD`, `KIST_EMAIL_MONITOR_DWIGHT_KEY` no Render. Sem essas variáveis o monitor fica desligado (loga e sai, não derruba o backend).
+- ✔ **Feito na v3.98** (era o próximo passo): tela "para revisar" no Cabine (filtrar propostas por `criado_via='email_auto'`) — hoje dá pra achar pela lista normal de propostas, mas sem destaque próprio.
 - DB: `email_cotacoes_monitor` (nova). `propostas.criado_via` (coluna já existia, sem uso; primeira vez preenchida).
 
 ## v3.96 · 24/09 · Marcador de versão da v3.95 era discreto demais + levado ao CRM
@@ -335,7 +343,7 @@ Versões que não têm commit próprio: **v3.69** está dentro de bcd73d0 (v3.70
   - `GET /crm/leads/stream`: SSE — o backend sonda o banco a cada poucos segundos e empurra só o que mudou; escolhido no lugar do Supabase Realtime direto no navegador para não expor chave nenhuma do Supabase nem exigir um provedor de login novo (o dashboard usa o mesmo login Google já restrito a `USUARIOS_PERMITIDOS`).
 - DB: tabelas novas `leads_prospeccao_dominios`, `leads_prospeccao_contatos`, `leads_prospeccao_interacoes` (RLS ligado, sem policy — só a service role, usada pelo backend, lê/grava). Colunas de funil em `leads_prospeccao_dominios`: `estagio_funil`, `proximo_followup_em`, `responsavel_bot`, `observacao`, `ultimo_contato_em`. Colunas de canal em `leads_prospeccao_interacoes`: `canal`, `direcao`, `origem`.
 - Dados (24/09): 534 domínios prospectados nos últimos 36 meses, 645 contatos, 6.299 interações; 220 domínios já tiveram alguma resposta; 3 já eram clientes (excluídos da fila de leads frios, permanecem com `status=convertido`).
-- ⚠ Dashboard (frontend separado, tempo real via SSE) ainda não construído — próxima etapa.
+- ✔ Dashboard (frontend separado, tempo real via SSE): construído — é o `crm-dashboard/` (serviço `kist-crm-dashboard` no Render).
 
 ## v3.90 · 23/09 · Uma proposta por arquivo para a Construcap; matching tenta de novo
 - **Lei por cliente** (Leonardo, 23/09): para o CNPJ de ORIGEM 63.945.143/0001-96 (Consórcio Construcap Copasa OHLA, BR-040), cada ARQUIVO anexo vira UMA proposta própria, mesmo com o mesmo destino. Arquivo com dois destinos dentro continua quebrando por destino. Para todos os outros clientes continua a regra geral de DESTINO (caso Universal: 6 PDFs = uma aba).
@@ -380,7 +388,7 @@ Decisão de layout delegada pelo Leonardo (23/09: "decida como um designer profi
 
 ---
 
-## ROTAS NOVAS OU ALTERADAS v3.59–v3.90
+## ROTAS NOVAS OU ALTERADAS (v3.59 em diante)
 
 | Método e rota | Para que serve | Versão |
 |---|---|---|
@@ -437,6 +445,25 @@ Decisão de layout delegada pelo Leonardo (23/09: "decida como um designer profi
 | POST /propostas/{ref}/pesquisa-resultado | marca `preco_divergente` e guarda os dois preços | v3.84 |
 | POST /extrair | PDF digitalizado vai como documento para leitura visual | v3.87 |
 | POST /propostas/{ref}/pesquisa-dwight e /pesquisa-kistbot-dwight | linha copiada do cache grava o motor do botão (antes: NULL → 500) | v3.88 |
+| GET /crm/leads · GET /crm/leads/{dominio} · GET /crm/painel · GET /crm/leads/stream (SSE) | CRM de leads frios: fila, detalhe, contagens, tempo real | v3.91 |
+| POST /crm/leads/{dominio}/contato · POST /crm/leads/{dominio}/estagio | registrar contato; mudar estágio do funil | v3.91 |
+| POST /crm/leads/{dominio}/contato | `direcao=recebido` avança o estágio e qualifica com IA (real x genérico) | v3.92 |
+| GET /crm/leads e afins | ver é de todo mundo (`dono=` filtra); editar é do dono ou admin | v3.93 |
+| POST /casar-po | número da PO reconhece `PO_12345` e "Pedido de Compra (Nº) 12345"; devolve só dígitos | v3.94 |
+| /version.json (estático, frontend e crm-dashboard) | hash do commit do build; a tela compara e se atualiza sozinha | v3.95 |
+| POST /salvar-proposta | corpo extraído em `_salvar_proposta_nucleo` (mesma função, chamada também pelo monitor de e-mail) | v3.98 |
+| POST /salvar-proposta | aceita `assunto_email` (opcional; só grava quando vem) | v3.100 |
+| POST /propostas/{ref}/pesquisa-dwight | 503 "não configurada" por padrão: motor desativado (`DWIGHT_MOTOR_ATIVO`) | v3.102 |
+| GET /pesquisa/motores | `dwight` aparece como não configurado enquanto desativado | v3.102 |
+| POST /propostas/exportar-tiny e /previa | código do item no Tiny = `codigo_cliente` (ou descrição); `sku_fornecedor` nunca mais | v3.104 |
+| GET /api/guia/exportacao-tiny | campo de código aponta para `codigo_cliente` | v3.104 |
+| GET /pesquisa/desempenho | usadas x corrigidas x bot não achou, por dia/período/compilado, todos os operadores; JSON ou texto; liberada pra chave `pesquisa` | v3.105 |
+| POST /propostas/exportar-tiny · POST /ordens-compra | veredito por motor, com `sem_oferta` e retrato do momento | v3.105 |
+| GET /pesquisa/boletim | conhece `sem_oferta` | v3.105 |
+| GET /contexto · GET /versao | liberadas pra chave `pesquisa`; o /contexto mostra pra ela só as seções de pesquisa | v3.107 |
+| GET /pesquisa/desempenho | por item: `link_bot`, `link_final`, `diferenca_pct`, `mudanca` (frase do que mudou); texto traz frase e links | v3.109 |
+| POST /crm/leads/{dominio}/acoes · GET /crm/leads/{dominio}/acoes | o bot registra o que fez e quando volta a agir | v3.108 |
+| GET /crm/leads | `ordenar` e `crescente` (rotina do dia do bot); por chave de API, sempre só o próprio dono | v3.108 |
 
 ## REGRAS DE NEGÓCIO NOVAS
 
@@ -481,8 +508,25 @@ Decisão de layout delegada pelo Leonardo (23/09: "decida como um designer profi
 | O login da Cabine vale em todas as abas do navegador (localStorage) | v3.85 |
 | PDF digitalizado (sem texto) é lido pela imagem das páginas e o operador é avisado para conferir | v3.87 |
 | Construcap BR-040 (CNPJ 63.945.143/0001-96): uma proposta por arquivo anexo, mesmo com o mesmo destino; demais clientes seguem a regra de destino | v3.90 |
+| Lead frio = domínio prospectado que nunca virou cotação; quem já tem proposta (`clientes_dominios`) não entra no CRM | v3.91 |
+| "Qualificado" é interesse real (reunião, pergunta específica), não resposta educada; a IA classifica, estágio de decisão explícita nunca é mexido | v3.92 |
+| ~~Cada bot só vê os leads do próprio dono, inclusive na leitura~~ (corrigida no mesmo dia) | v3.92 |
+| CRM pela tela: ver é de todo mundo; mudar estágio e registrar contato é do dono (ou admin) | v3.93 |
+| CRM por chave de API: o bot só vê e só mexe nos leads do próprio dono — nem o bot do admin foge disso | v3.108 |
+| Bots não cadastram lead novo: trabalham a base existente e se organizam pela data de próxima ação | v3.108 |
+| O operador sempre sabe a versão que está usando; versão velha se atualiza sozinha (derruba cookies, mantém o login) | v3.95 |
+| Cotação de cliente conhecido que chega por e-mail vira proposta sozinha (matching + KistBot + mediana) e espera revisão; exportar pro Tiny e mandar ao cliente continua sendo do operador | v3.97 |
+| Monitor de e-mail: só assunto de pedido de cotação; resposta/continuação de assunto já visto é ignorada | v3.97 |
+| Monitor de e-mail nunca busca e-mail de antes do dia em que foi ligado (25/09) | v3.99 |
+| Proposta automática mostra o assunto do e-mail de origem; "revisar" some quando a proposta é exportada (tem `tiny_numero`) | v3.100 / v3.103 |
+| Automação sempre usa o KistBot Dwight; o Dwight "normal" está desativado (não apagado) em toda a Cabine | v3.101 / v3.102 |
+| Pix e cheio iguais (diferença < 1 centavo) nunca são "divergentes", mesmo com obs de OCR | v3.104 |
+| O código do item que vai pro Tiny (e aparece pro cliente) é o código do ERP do cliente ou a descrição — nunca SKU/MLB de loja | v3.104 |
+| Desempenho do bot: usada = saiu como ele trouxe; corrigida = trocou de loja ou custo >15% longe; bot não achou = operador achou sozinho. Conta só proposta exportada, todos os operadores | v3.105 |
+| Veredito é um por motor; reexportar substitui o anterior | v3.105 |
+| Chave de pesquisa lê só as seções de pesquisa da base de conhecimento (clientes, markup e carteira ficam de fora) | v3.107 |
 
-## Objetos de banco usados pela primeira vez neste intervalo (todos existem no Supabase, conferido em 23/09)
+## Objetos de banco usados pela primeira vez neste intervalo (todos existem no Supabase — até a v3.90 conferido em 23/09, os novos em 25/09)
 
 | Objeto | Versão |
 |---|---|
@@ -499,5 +543,15 @@ Decisão de layout delegada pelo Leonardo (23/09: "decida como um designer profi
 | `propostas.frete_ida` e `ordens_compra.frete_ida` | v3.80 |
 | tabelas `itens_ficha`, `itens_equivalencias`, `mercado_observacoes`, `pesquisa_extratos`, `pesquisa_vereditos` | v3.82 |
 | `pesquisa_resultados.julgamento` e `pesquisa_resultados.extrato_id` | v3.82 |
+| tabelas `leads_prospeccao_dominios`, `leads_prospeccao_contatos`, `leads_prospeccao_interacoes` | v3.91 |
+| `leads_prospeccao_dominios.dono_email` | v3.92 |
+| tabela `email_cotacoes_monitor` | v3.97 |
+| `propostas.criado_via` (existia sem uso; valor `email_auto`) | v3.97 |
+| linha nova em `api_chaves`: `monitor-email-cotacoes` (escopo `dwight_dispatch`; hash corrigido na v3.101) | v3.97 / v3.101 |
+| `propostas.assunto_email` | v3.100 |
+| `pesquisa_vereditos`: veredito `sem_oferta` (trava `pesquisa_vereditos_veredito_check` ampliada) | v3.105 |
+| seção `desempenho_bots` na tabela `conhecimento` | v3.107 |
+| tabela `leads_prospeccao_acoes` | v3.108 |
+| backups de 25/09: `_bkp_20260925_pesquisa_vereditos`, `_bkp_20260925_conhecimento` | v3.105 / v3.107 |
 
-Nenhuma chave de `config_kist` foi adicionada ou lida pela primeira vez neste intervalo. Variáveis de ambiente novas: `DWIGHT_WEBHOOK_URL`, `DWIGHT_WEBHOOK_KEY` e `CABINE_PUBLIC_URL` (v3.61); `KISTBOTS_DWIGHT_WEBHOOK_URL` e `KISTBOTS_DWIGHT_WEBHOOK_KEY` (v3.78).
+Nenhuma chave de `config_kist` foi adicionada ou lida pela primeira vez neste intervalo (o núcleo `capacidades_nucleo` só ganhou backups novos). Variáveis de ambiente novas: `DWIGHT_WEBHOOK_URL`, `DWIGHT_WEBHOOK_KEY` e `CABINE_PUBLIC_URL` (v3.61); `KISTBOTS_DWIGHT_WEBHOOK_URL` e `KISTBOTS_DWIGHT_WEBHOOK_KEY` (v3.78); `KIST_IMAP_HOST`, `KIST_IMAP_USER`, `KIST_IMAP_PASSWORD`, `KIST_EMAIL_MONITOR_DWIGHT_KEY` e, opcionais, `KIST_EMAIL_MONITOR_DONO` e `KIST_EMAIL_MONITOR_INTERVALO_S` (v3.97); `KIST_EMAIL_MONITOR_DATA_MINIMA` (v3.99, opcional); `DWIGHT_MOTOR_ATIVO` (v3.102, desligado por padrão); no `crm-dashboard`: `VITE_API_URL`, `VITE_GOOGLE_CLIENT_ID`, `VITE_USUARIOS_PERMITIDOS` (v3.91).
