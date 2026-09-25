@@ -2264,7 +2264,10 @@ export default function App() {
   // Resumo da última propagação de lastro entre abas (gerou CSV de uma, as outras
   // herdaram). Some ao reiniciar.
   const [propagacao, setPropagacao] = useState(null);
-  const [tinyEnvio, setTinyEnvio] = useState(null);
+  // Resultado do último envio ao Tiny. Leva `refs` (números da proposta enviada,
+  // antes e depois de virar número do Tiny) e só aparece quando bate com a
+  // proposta aberta — ver `tinyEnvio` derivado mais abaixo.
+  const [tinyEnvioBruto, setTinyEnvio] = useState(null);
   const [guiaTiny, setGuiaTiny] = useState(null);   // regras de campo do Tiny (v3.75)
   const [motores, setMotores] = useState({});       // motores de pesquisa prontos (v3.79)
   const [conhecimentoItens, setConhecimentoItens] = useState({});   // v3.82: o que a Kist já sabe de cada item
@@ -2682,6 +2685,12 @@ export default function App() {
   }
   const autoAplicadosRef = useRef(new Set());         // uid já aplicado automaticamente
   const numeroAtual = String(propostas[propostaIdx]?.proposta || numeroProposta || "").trim();
+  // 25/09 (complemento da v3.103) — o resultado do Tiny só vale para a proposta que foi enviada. Antes
+  // ficava na tela ao abrir OUTRA proposta pela lista (25/09: a R-1437 mostrou
+  // "No Tiny: 1051042", que era da R-1434). Sem `refs` (reconexão do Tiny),
+  // continua aparecendo como antes.
+  const tinyEnvio = tinyEnvioBruto && (!tinyEnvioBruto.refs || tinyEnvioBruto.refs.includes(numeroAtual))
+    ? tinyEnvioBruto : null;
 
   // v3.82: consulta o catálogo para os itens da proposta aberta (uma chamada só).
   const _chaveItensCtx = ((propostas[propostaIdx]?.itens) || [])
@@ -3044,13 +3053,14 @@ export default function App() {
     if (!prop) return;
     const corpo = JSON.stringify({ ...prop, usuario_nome: usuario.nome });
     const cab = { "Content-Type": "application/json", ...authHeaders() };
-    setTinyEnvio({ estado: "enviando" });
+    const refs = [String(prop.proposta || "").trim()];
+    setTinyEnvio({ estado: "enviando", refs });
     try {
       const rp = await fetch(`${API}/propostas/exportar-tiny/previa`, { method: "POST", headers: cab, body: corpo });
       const pv = await rp.json().catch(() => ({}));
       if (!rp.ok) throw new Error(pv.detail || `erro ${rp.status} na prévia`);
       if (!pv.pronto) {
-        setTinyEnvio({ estado: "erro", msg: "Não enviei ao Tiny: " + (pv.erros || []).join(" · ") });
+        setTinyEnvio({ estado: "erro", refs, msg: "Não enviei ao Tiny: " + (pv.erros || []).join(" · ") });
         return;
       }
       if (!window.confirm(mensagemPreviaTiny(pv))) { setTinyEnvio(null); return; }
@@ -3063,9 +3073,9 @@ export default function App() {
         setPropostas((prev) => prev.map((p, pi) => pi === idx ? { ...p, proposta: d.numero_final } : p));
         if (idx === propostaIdx) setNumeroProposta(String(d.numero_final));
       }
-      setTinyEnvio({ estado: "ok", ...d });
+      setTinyEnvio({ estado: "ok", ...d, refs: [...refs, String(d.numero_final || "").trim()].filter(Boolean) });
     } catch (e) {
-      setTinyEnvio({ estado: "erro", msg: String(e.message || e) });
+      setTinyEnvio({ estado: "erro", refs, msg: String(e.message || e) });
     }
   }
 
