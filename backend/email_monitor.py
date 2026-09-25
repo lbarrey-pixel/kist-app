@@ -246,22 +246,26 @@ def _finalizar_registro(sb, message_id: str, *, motivo: str, proposta_numero=Non
 
 
 def _acionar_dwight(numero: str):
+    """Aciona o motor KISTBOT DWIGHT (`/pesquisa-kistbot-dwight`), não o Dwight
+    "normal" (`/pesquisa-dwight`) — são dois motores distintos (`_motores()`
+    em main.py), com webhook e chave próprios (`KISTBOTS_DWIGHT_WEBHOOK_*`).
+    Regra do Leonardo, 25/09."""
     if not DWIGHT_DISPATCH_KEY:
         log.warning("email_monitor: sem KIST_EMAIL_MONITOR_DWIGHT_KEY — proposta %s "
-                    "criada, mas Dwight NÃO foi acionado.", numero)
+                    "criada, mas KistBot Dwight NÃO foi acionado.", numero)
         return
     try:
         r = requests.post(
-            f"{CABINE_PUBLIC_URL}/propostas/{numero}/pesquisa-dwight",
+            f"{CABINE_PUBLIC_URL}/propostas/{numero}/pesquisa-kistbot-dwight",
             json={"somente_sem_match": True},
             headers={"Authorization": f"Bearer {DWIGHT_DISPATCH_KEY}"},
             timeout=20,
         )
         if r.status_code >= 300:
-            log.warning("email_monitor: pesquisa-dwight recusou %s: %s %s",
+            log.warning("email_monitor: pesquisa-kistbot-dwight recusou %s: %s %s",
                         numero, r.status_code, r.text[:300])
     except Exception as e:
-        log.warning("email_monitor: falhou acionar Dwight pra %s: %s", numero, e)
+        log.warning("email_monitor: falhou acionar KistBot Dwight pra %s: %s", numero, e)
 
 
 def _processar_email(sb, msg: email.message.Message, dominio: str):
