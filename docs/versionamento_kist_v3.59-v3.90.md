@@ -199,6 +199,13 @@ Versões que não têm commit próprio: **v3.69** está dentro de bcd73d0 (v3.70
 - Dados: `mercado_observacoes` 146 e 272 (Pix de OCR de 19,40 e 19,69) ficaram sem preço (backup `_bkp_20260923_mercado_observacoes`). R-1375: o Duracell ficou com custo 198,90 e venda 331,37, confirmados pelo Leonardo (backup `_bkp_20260923_itens_r1375`).
 - Propostas antigas com custo tirado de oferta divergente (vão aparecer com o aviso no card): 1050902 (terrômetro, 4.333,26), 1050903 (estilete, trena 19,27, torquês, chave ajustável 74,79), 1051007 e 1051012.
 
+## v3.107 · 25/09 · KistBot lê a base de conhecimento (só as seções de pesquisa)
+- **Pedido do Leonardo, 25/09**: pôr o painel de desempenho na base de conhecimento do bot e deixar acessível via API, pra ele ter os benchmarks do que está sendo produzido.
+- **Achado**: a chave do KistBot ("KistBot Dwight — retorno de pesquisa", escopo `pesquisa`) nunca conseguiu ler `/contexto` — a rota não estava na lista fechada do escopo. A base inteira tem lista de clientes e markup por operador; liberar tudo pra uma chave de pesquisa aumentaria o estrago de um vazamento.
+- **[B]** `GET /contexto` e `GET /versao` entram na lista do escopo `pesquisa`. No `/contexto`, essa chave enxerga só `_SECOES_ESCOPO_PESQUISA` (`pesquisa_preco`, `desempenho_bots`, `fontes_preco`, `custo_tokens`, `glossario`), inclusive no `indice=1`; pedir outra seção dá 404. A tela e as outras chaves continuam vendo tudo.
+- **[B]** A mensagem de 403 do escopo `pesquisa` dizia que só existiam 2 rotas; agora lista as de verdade.
+- **Base de conhecimento** (depois do deploy, backup `_bkp_20260925_conhecimento`): seção nova `desempenho_bots`; `pesquisa_preco` atualizada (Dwight normal desativado, automação só KistBot, veredito por motor e `sem_oferta`); `api_acesso` com as rotas novas da chave `pesquisa`; `glossario` com "veredito".
+
 ## v3.106 · 25/09 · Veredito: falha de um item não derruba os outros
 - **[B]** `_registrar_vereditos` tinha um `try` só em volta do laço de itens: se a gravação de um veredito falhasse, todos os itens seguintes da proposta ficavam sem veredito, em silêncio. Achado no recálculo da v3.105 (a trava do banco recusava `sem_oferta`). Agora cada gravação tem o seu `try`.
 

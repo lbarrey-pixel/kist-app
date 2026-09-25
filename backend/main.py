@@ -123,7 +123,8 @@ from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_
 # v3.104 — chamado #21 (Leonardo): dois bugs. (1) Pix ≈ cheio (diferença < 1 centavo, caso real 860/860 com obs "[preço: ocr]") ainda entrava como "Pix e cheio divergentes" e travava o auto-load de custo — `precoDivergente`/`_preco_divergente` (espelho) agora checam a igualdade ANTES da flag/regra de 35%/OCR-outlier. (2) `sku_fornecedor` (pode ser MLB*/SKU de marketplace, ex. prévia 1051038 -> codigo=MLB25347515) ia pro `item.codigo` da proposta Tiny, visível no PDF/portal do cliente — `_sku_tiny` agora usa `codigo_cliente` (código do item no ERP do cliente) ou a descrição; `sku_fornecedor` fica só interno da Cabine, nunca mais vai ao Tiny.
 # v3.105 — painel de desempenho dos bots de pesquisa (pedido do Leonardo): GET /pesquisa/desempenho (dia, período ou compilado; todos os operadores, filtro opcional; JSON ou texto; liberado pra chave do KistBot) + página "Desempenho" no Cabine. Veredito da exportação/compra agora é POR MOTOR (antes o do motor que respondeu por último engolia o outro), ganha a categoria `sem_oferta` (bot não achou, operador achou) e guarda o retrato do que o bot sugeriu x o que saiu.
 # v3.106 — `_registrar_vereditos`: falha ao gravar UM veredito não derruba mais os outros itens (o try era um só, em volta do laço). Achado no recálculo da v3.105: a trava do banco recusava "sem_oferta" (ampliada por migration).
-VERSAO_BACKEND = "3.106"
+# v3.107 — KistBot lê a base de conhecimento: GET /contexto e GET /versao liberados pra chave de escopo `pesquisa`, mas o /contexto mostra pra ela SÓ as seções de pesquisa (_SECOES_ESCOPO_PESQUISA) — clientes, markup e carteira ficam de fora. Mensagem de 403 do escopo `pesquisa` passou a listar as rotas de verdade.
+VERSAO_BACKEND = "3.107"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -352,8 +353,9 @@ async def _guarda_escopo_api(request: Request, call_next):
     # Escopo `pesquisa`: lista fechada de rotas, antes de qualquer outra regra.
     if escopo == "pesquisa":
         if not _rota_permitida_pesquisa(metodo, request.url.path):
-            motivo = ("Chave de escopo 'pesquisa' só pode chamar "
-                      "POST /propostas/{numero}/pesquisa-resultado e GET /api/whoami.")
+            motivo = ("Chave de escopo 'pesquisa' só pode chamar: POST /propostas/{numero}/pesquisa-resultado, "
+                      "GET /propostas/{ref}/fonte, GET /api/guia/*, GET /catalogo/itens*, "
+                      "GET /pesquisa/desempenho, GET /contexto (seções de pesquisa), GET /versao, GET /api/whoami.")
             _logar(403, bloqueado=True, motivo=motivo)
             return _nega_escopo(motivo)
 
@@ -429,7 +431,16 @@ _ROTAS_ESCOPO_PESQUISA = (
     # v3.105 — o bot lê o próprio desempenho: os itens que ele pesquisou e o que
     # o operador fez com cada um (usou, trocou de loja, corrigiu o preço). Só leitura.
     ("GET",  re.compile(r"^/pesquisa/desempenho/?$")),
+    # v3.107 — base de conhecimento, mas SÓ as seções de pesquisa (ver
+    # _SECOES_ESCOPO_PESQUISA): clientes, markup e carteira ficam de fora.
+    ("GET",  re.compile(r"^/contexto/?$")),
+    ("GET",  re.compile(r"^/versao/?$")),
 )
+
+# Seções da base (`conhecimento`) que uma chave de escopo `pesquisa` enxerga no
+# /contexto (v3.107). A base inteira tem lista de clientes e markup por operador;
+# uma chave de pesquisa que vaza não pode levar isso junto.
+_SECOES_ESCOPO_PESQUISA = {"pesquisa_preco", "desempenho_bots", "fontes_preco", "custo_tokens", "glossario"}
 
 # Escopo `dwight_dispatch` (v3.70): um agente PRÓPRIO do Leonardo pode pedir a
 # busca — mas só essa rota, e o próprio disparo tem um curral por dentro (ver
@@ -1448,7 +1459,7 @@ def versao_sistema(usuario: str = Depends(verificar_token)):
 
 
 @app.get("/contexto", response_class=PlainTextResponse)
-def contexto_agentes(secoes: str = "", indice: int = 0, agente: str = "",
+def contexto_agentes(request: Request, secoes: str = "", indice: int = 0, agente: str = "",
                      usuario: str = Depends(verificar_token)):
     """A base de conhecimento da Kist, em texto puro e seccionada.
 
@@ -1466,6 +1477,9 @@ def contexto_agentes(secoes: str = "", indice: int = 0, agente: str = "",
         raise HTTPException(status_code=500, detail=str(e)[:120])
     if not linhas:
         return "base de conhecimento vazia"
+    # v3.107 — chave de pesquisa lê só as seções de pesquisa (índice incluso).
+    if _credencial_do_request(request.headers.get("authorization") or "")[0] == "pesquisa":
+        linhas = [l for l in linhas if l["secao"] in _SECOES_ESCOPO_PESQUISA]
 
     if int(indice or 0):
         out = ["secao v tamanho titulo"]
