@@ -326,6 +326,7 @@ def _processar_email(sb, msg: email.message.Message, dominio: str):
                 "status": "rascunho",
                 "usuario_nome": "Monitor de e-mail",
                 "fonte_texto": p.get("fonte_texto") or texto_fonte,
+                "assunto_email": assunto,
             })
             numeros.append(numero)
         if numeros:

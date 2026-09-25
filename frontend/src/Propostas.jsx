@@ -222,6 +222,11 @@ export default function Propostas({ token, usuario, onCriarOC, onAbrirProposta }
                     <td className="w-full max-w-0 px-4 py-3">
                       <div className="truncate text-[13px] font-medium text-ink" title={p.cliente}>{p.cliente}</div>
                       {p.cnpj && <div className="truncate font-mono text-[11px] text-faint">{p.cnpj}</div>}
+                      {p.assunto_email && (
+                        <div className="truncate text-[11px] text-faint" title={`Assunto do e-mail: ${p.assunto_email}`}>
+                          ✉ {p.assunto_email}
+                        </div>
+                      )}
                     </td>
                     <td className="whitespace-nowrap px-4 py-3 text-right font-mono text-[13px] text-sub">{p.total_itens}</td>
                     <td className="whitespace-nowrap px-4 py-3 text-right font-mono text-[13px] font-medium text-ink">R$ {brl(p.valor_total_estimado)}</td>

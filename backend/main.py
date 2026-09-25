@@ -116,7 +116,8 @@ from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_
 # v3.97 — monitor de e-mail de cotação (email_monitor.py): entra via IMAP nos domínios de cliente conhecido, filtra assunto de cotação (validado contra 146 assuntos reais), ignora reply de thread já vista, cria a proposta (mesmo núcleo do /extrair) e aciona o Dwight — fica em "rascunho" (criado_via=email_auto) esperando revisão do Leonardo. Desligado até KIST_IMAP_HOST/USER/PASSWORD existirem no Render.
 # v3.98 — correção do monitor de e-mail, achada em produção no primeiro e-mail real (R-1414, ControllerBMS): `_extrair_nucleo` só grava o CABEÇALHO da proposta; os itens do match ficavam só em memória. Extraído `_salvar_proposta_nucleo` (o corpo de /salvar-proposta) pra também persistir `itens_proposta` fora do HTTP — sem isto o Dwight não achava item nenhum pra pesquisar. Cabine e CRM: badge de versão -> tela "Só pra revisar" em Propostas (criado_via=email_auto).
 # v3.99 — dois achados no primeiro dia em produção do monitor de e-mail: (1) um restart do Render no meio de um e-mail com várias propostas (Universal, uma por destino) duplicou tudo, porque o "já visto" só era gravado no FINAL — agora é gravado ANTES de processar; (2) regra do Leonardo: monitor nunca busca antes de hoje (KIST_EMAIL_MONITOR_DATA_MINIMA), pra não reabrir cotação antiga já tratada na mão.
-VERSAO_BACKEND = "3.99"
+# v3.100 — campo novo `propostas.assunto_email` (opcional, só o monitor de e-mail preenche): mostra o assunto do e-mail de origem na tela de Propostas, pra localizar rápido de qual e-mail é cada cotação automática. `_criar_rascunho`: se a renomeação TMP-＜uuid＞ -> R-＜id＞ falhar, apaga a linha órfã em vez de deixar lixo (achado em produção: um rascunho "TMP-..." sem dono, sem itens, ficou preso na lista).
+VERSAO_BACKEND = "3.100"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -3255,7 +3256,20 @@ def _criar_rascunho(sb, usuario: str, cliente: str = "", cnpj=None, total_itens:
     }).execute()
     pid = ins.data[0]["id"]
     numero = f"R-{pid}"
-    sb.table("propostas").update({"numero_proposta": numero, "numero_rascunho": numero}).eq("id", pid).execute()
+    try:
+        sb.table("propostas").update({"numero_proposta": numero, "numero_rascunho": numero}).eq("id", pid).execute()
+    except Exception:
+        # A linha já existe com o nome provisório "TMP-..." — sem isto ela
+        # fica órfã pra sempre (achado em produção, 25/09: o monitor de
+        # e-mail cria vários rascunhos em sequência rápida, e uma falha
+        # transiente aqui deixava lixo "TMP-" na lista de propostas, sem
+        # criado_via nem itens, sem ninguém dono). Desfaz o insert e propaga
+        # o erro — quem chama já trata (`_extrair_nucleo` cai no fallback).
+        try:
+            sb.table("propostas").delete().eq("id", pid).execute()
+        except Exception:
+            pass
+        raise
     return numero
 
 
@@ -5897,6 +5911,13 @@ def _salvar_proposta_nucleo(sb, usuario: str, payload: dict) -> dict:
         # e salvar de novo não pode apagar a fonte com string vazia.
         **({"fonte_texto": str(payload["fonte_texto"])[:60000]}
            if (payload.get("fonte_texto") or "").strip() else {}),
+        # Assunto do e-mail de origem (v3.100) — opcional, só o monitor de
+        # e-mail preenche hoje. Serve só pra localizar: o operador compara
+        # com a própria caixa de entrada. Mesma regra do fonte_texto: só
+        # grava quando vier, pra um resave sem o campo não apagar o que já
+        # estava lá.
+        **({"assunto_email": str(payload["assunto_email"])[:500]}
+           if (payload.get("assunto_email") or "").strip() else {}),
     }
 
     # Upsert pelo número — o atual ou o de rascunho (a proposta muda de nome ao
