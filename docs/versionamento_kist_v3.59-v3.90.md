@@ -1,6 +1,6 @@
 # Kist Cabine: versionamento a partir da v3.59
 
-Atualizado em 25/09/2026 (até a v3.109). Continua o histórico até a v3.58 que está no núcleo do Analista (`config_kist['capacidades_nucleo']`). O nome do arquivo ainda diz "v3.59-v3.90" porque o CLAUDE.md e as regras apontam para ele; o conteúdo segue daí em diante. Ordem: v3.59 a v3.84 em ordem crescente; a partir daí, da mais nova (v3.109) para a mais antiga (v3.85). As tabelas-resumo no fim cobrem tudo.
+Atualizado em 25/09/2026 (até a v3.110). Continua o histórico até a v3.58 que está no núcleo do Analista (`config_kist['capacidades_nucleo']`). O nome do arquivo ainda diz "v3.59-v3.90" porque o CLAUDE.md e as regras apontam para ele; o conteúdo segue daí em diante. Ordem: v3.59 a v3.84 em ordem crescente; a partir daí, da mais nova (v3.110) para a mais antiga (v3.85). As tabelas-resumo no fim cobrem tudo.
 
 Reconstruído dos diffs do git (`git diff <versão anterior> <versão> -- backend frontend`, sem `__pycache__`) e dos comentários do código marcados com "v3.NN". As mensagens de commit não trazem informação útil. Datas: data do commit (2026). Quando o comentário do código dá outra data para a decisão, ela aparece entre parênteses.
 
@@ -198,6 +198,16 @@ Versões que não têm commit próprio: **v3.69** está dentro de bcd73d0 (v3.70
 - **"Desfazer" do Dwight** passa a guardar também os itens que só ganharam venda. Antes voltava só os que tiveram custo reescrito.
 - Dados: `mercado_observacoes` 146 e 272 (Pix de OCR de 19,40 e 19,69) ficaram sem preço (backup `_bkp_20260923_mercado_observacoes`). R-1375: o Duracell ficou com custo 198,90 e venda 331,37, confirmados pelo Leonardo (backup `_bkp_20260923_itens_r1375`).
 - Propostas antigas com custo tirado de oferta divergente (vão aparecer com o aviso no card): 1050902 (terrômetro, 4.333,26), 1050903 (estilete, trena 19,27, torquês, chave ajustável 74,79), 1051007 e 1051012.
+
+## v3.110 · 25/09 · Custo por busca usada (a Cabine pronta; falta o bot mandar)
+- **Pedido do Leonardo, 25/09**: saber quanto custa cada chamada do KistBot. A Cabine não tem como medir — o bot roda fora dela, o gasto com modelo e busca é do lado do Fábio. O que dá pra fazer é **receber** o custo que o bot informar e transformar em custo por busca **usada** (custo total ÷ buscas que saíram como vieram), que é o número que diz se o bot se paga.
+- **Achado**: `_norm_telemetria` só guardava `tempo_ms`, `buscas`, `paginas` e `modelo` — se o bot já mandasse tokens ou custo, a Cabine jogava fora sem aviso.
+- **[B]** `_norm_telemetria` aceita `tokens_entrada`, `tokens_saida`, `tokens` (total), `custo_usd`, `custo_brl`, `modelo`. Bot que não manda continua igual.
+- **[B]** `GET /pesquisa/desempenho`: `resumo`, `por_dia` e `por_operador` ganham `itens_com_custo`, `custo_usd_total`, `custo_por_item_usd`, `custo_por_usada_usd`, `tokens_total`, `tempo_medio_s`; cada item traz `tempo_s`, `tokens`, `custo_usd`, `modelo`, `do_cache`. Item copiado do cache do bot carrega a telemetria da pesquisa original, então é marcado (`do_cache`) e **não conta** no custo nem no tempo — senão contava duas vezes. `formato=texto` traz a linha de custo, ou "sem custo informado" com a instrução de onde ver o contrato.
+- **[B]** `GUIA_RETORNO` (`GET /api/guia/pesquisa-retorno`, o contrato que o bot lê) e a docstring da rota de retorno documentam a `telemetria` completa e a regra "item do seu cache: custo_usd 0".
+- **[F]** Tela Desempenho: tile "Custo por busca usada" (mostra "sem custo informado pelo bot" enquanto não vier), tempo/custo/tokens/cache embaixo de cada item, nota explicando a conta.
+- **Docs**: `docs/benchmark_kistbot_dwight.md` (pro Fábio) seção 7 atualizada: a Cabine está pronta, o pedido pro bot é mandar os campos.
+- Testado local com telemetria completa, parcial, vazia e vinda do cache: o cache é excluído do total, o "por usada" só conta itens com custo, tokens em "800,0" e custo em "0,0123" (vírgula) são aceitos.
 
 ## v3.109 · 25/09 · Desempenho diz exatamente o que mudou, com os links
 - **Pedido do Leonardo, 25/09**: o bot precisa saber exatamente o que foi alterado em cada busca dele — qual link sugeriu, com qual link a proposta saiu, quanto mudou o preço.
@@ -462,6 +472,9 @@ Decisão de layout delegada pelo Leonardo (23/09: "decida como um designer profi
 | GET /pesquisa/boletim | conhece `sem_oferta` | v3.105 |
 | GET /contexto · GET /versao | liberadas pra chave `pesquisa`; o /contexto mostra pra ela só as seções de pesquisa | v3.107 |
 | GET /pesquisa/desempenho | por item: `link_bot`, `link_final`, `diferenca_pct`, `mudanca` (frase do que mudou); texto traz frase e links | v3.109 |
+| POST /propostas/{ref}/pesquisa-resultado | `telemetria` aceita `tokens_entrada`, `tokens_saida`, `tokens`, `custo_usd`, `custo_brl`, `modelo` | v3.110 |
+| GET /pesquisa/desempenho | custo por item e por busca usada, tokens, tempo médio (item do cache do bot não conta) | v3.110 |
+| GET /api/guia/pesquisa-retorno | documenta a telemetria de custo | v3.110 |
 | POST /crm/leads/{dominio}/acoes · GET /crm/leads/{dominio}/acoes | o bot registra o que fez e quando volta a agir | v3.108 |
 | GET /crm/leads | `ordenar` e `crescente` (rotina do dia do bot); por chave de API, sempre só o próprio dono | v3.108 |
 

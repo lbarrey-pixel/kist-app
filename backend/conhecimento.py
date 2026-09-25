@@ -374,6 +374,13 @@ POR ITEM (dentro de cada resultado):
       -> toda oferta VISTA, inclusive as descartadas. Evidência de mercado; não é banco de preços.
          Sem 'observadas', a Cabine usa as próprias 'ofertas'.
 
+  telemetria: {tempo_ms, buscas, paginas, tokens_entrada, tokens_saida, custo_usd, modelo}
+      -> (v3.110) é o que permite calcular CUSTO POR BUSCA USADA no seu painel de desempenho
+         (GET /pesquisa/desempenho). Some entrada e saída de TODAS as chamadas de modelo feitas
+         para aquele item; custo_usd = o que você pagou por elas. Item que veio do SEU cache:
+         custo_usd 0. A Cabine não estima nada — sem esses campos, o painel diz "sem custo
+         informado".
+
 POR PESQUISA (no topo do corpo, junto de external_key):
   extrato: {resumo, passos[<=40 {item_id, etapa, fonte, consulta, resultado, decisao, ms}],
             limitacoes[], sugestoes[], saude[]}

@@ -126,7 +126,8 @@ from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_
 # v3.107 — KistBot lê a base de conhecimento: GET /contexto e GET /versao liberados pra chave de escopo `pesquisa`, mas o /contexto mostra pra ela SÓ as seções de pesquisa (_SECOES_ESCOPO_PESQUISA) — clientes, markup e carteira ficam de fora. Mensagem de 403 do escopo `pesquisa` passou a listar as rotas de verdade.
 # v3.108 — CRM de prospecção fria pronto pra bot trabalhar sozinho (pedido do Leonardo, 25/09): tabela `leads_prospeccao_acoes` + POST/GET `/crm/leads/{dominio}/acoes` registram o que o bot fez e quando volta a agir, sem fila pronta — `GET /crm/leads?ordenar=proximo_followup_em&crescente=1` monta a rotina. Regra de dono apertada: pela TELA (humano) continua "todo mundo vê, admin edita qualquer um"; por CHAVE DE API (bot) agora é sempre só o PRÓPRIO dono, ler e mexer, sem exceção nem pro admin.
 # v3.109 — /pesquisa/desempenho diz EXATAMENTE o que mudou em cada item (pedido do Leonardo): `link_bot`, `link_final`, `diferenca_pct` e uma frase em `mudanca` ("trocou X (R$) por Y (R$) — loja que o bot não trouxe"). Veredito antigo sem retrato busca o link no resultado e no item. Formato texto traz a frase e os links. Página Desempenho: lojas viram link (só http/https).
-VERSAO_BACKEND = "3.109"
+# v3.110 — custo por busca usada (pedido do Leonardo): `_norm_telemetria` passa a guardar tokens_entrada/tokens_saida/tokens/custo_usd/custo_brl/modelo (antes descartava sem aviso); /pesquisa/desempenho soma custo e tokens (sem item vindo do cache do bot) e devolve custo_usd_total, custo_por_item_usd, custo_por_usada_usd, tokens_total, tempo_medio_s; guia do retorno documenta os campos. Tela Desempenho: tile "Custo por busca usada" e tempo/custo por item. Fica "sem custo informado" até o KistBot mandar.
+VERSAO_BACKEND = "3.110"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -6204,12 +6205,23 @@ def _norm_oferta(o: dict) -> dict:
 
 
 def _norm_telemetria(t) -> dict:
+    """Só o que a Cabine sabe usar; o resto do que o bot mandar é descartado.
+
+    v3.110 — tokens e custo (pedido do Leonardo, 25/09): é o que permite calcular
+    quanto custa cada busca USADA no painel de desempenho. Antes, mesmo que o bot
+    mandasse, caía aqui e sumia. Bot que não manda continua funcionando igual."""
     t = t if isinstance(t, dict) else {}
     out = {}
-    for k in ("tempo_ms", "buscas", "paginas"):
+    for k in ("tempo_ms", "buscas", "paginas", "tokens", "tokens_entrada", "tokens_saida"):
         try:
             if t.get(k) not in (None, ""):
                 out[k] = int(float(str(t.get(k)).replace(",", ".")))
+        except (TypeError, ValueError):
+            pass
+    for k in ("custo_usd", "custo_brl"):
+        try:
+            if t.get(k) not in (None, ""):
+                out[k] = round(float(str(t.get(k)).replace(",", ".")), 6)
         except (TypeError, ValueError):
             pass
     if t.get("modelo"):
@@ -7052,11 +7064,24 @@ def _agrega_desempenho(lista: list) -> dict:
     troca = c.get("escolheu_outra", 0) + c.get("nao_achou", 0)
     preco = c.get("custo_divergente", 0)
     sem = c.get("sem_oferta", 0)
+    # v3.110 — custo: só o que o bot informou, e nunca item vindo do cache dele
+    # (o custo daquele já contou na pesquisa original). Por busca USADA é o
+    # número que diz se o bot se paga.
+    com_custo = [x for x in lista if x.get("custo_usd") is not None and not x.get("do_cache")]
+    custo_total = round(sum(x["custo_usd"] for x in com_custo), 4) if com_custo else None
+    usadas_com_custo = sum(1 for x in com_custo if x["veredito"] == "acertou")
+    tempos = [x["tempo_s"] for x in lista if x.get("tempo_s") is not None and not x.get("do_cache")]
+    tokens = [x["tokens"] for x in com_custo if x.get("tokens")]
     return {"total": t, "usadas": usadas, "corrigidas": troca + preco,
             "corrigidas_troca": troca, "corrigidas_preco": preco, "sem_oferta": sem,
             "taxa_uso": _pct(usadas, t), "taxa_correcao": _pct(troca + preco, t),
             "taxa_sem_oferta": _pct(sem, t), "taxa_uso_com_oferta": _pct(usadas, t - sem),
-            "propostas": len({x["proposta_id"] for x in lista})}
+            "propostas": len({x["proposta_id"] for x in lista}),
+            "itens_com_custo": len(com_custo), "custo_usd_total": custo_total,
+            "custo_por_item_usd": round(custo_total / len(com_custo), 4) if com_custo else None,
+            "custo_por_usada_usd": round(custo_total / usadas_com_custo, 4) if usadas_com_custo else None,
+            "tokens_total": sum(tokens) if tokens else None,
+            "tempo_medio_s": round(sum(tempos) / len(tempos), 1) if tempos else None}
 
 
 def _dia_brt(iso) -> str:
@@ -7119,7 +7144,7 @@ async def pesquisa_desempenho(motor: str = "kistbot", de: str = "", ate: str = "
     op = (operador or "").strip().lower()
     if op:
         ver = [v for v in ver if op in str((props.get(v["proposta_id"]) or {}).get("usuario_email") or "").lower()]
-    pesq = _lote("pesquisa_resultados", "id,descricao,resultado", list({v["pesquisa_id"] for v in ver}))
+    pesq = _lote("pesquisa_resultados", "id,descricao,resultado,telemetria", list({v["pesquisa_id"] for v in ver}))
 
     # Link com que o item saiu, pra veredito antigo que não guardou o retrato:
     # lê o item atual (v3.109). Veredito novo já traz `link_final` do momento.
@@ -7175,6 +7200,14 @@ async def pesquisa_desempenho(motor: str = "kistbot", de: str = "", ate: str = "
             mudanca = f"bot não trouxe oferta; o operador achou em {usada or 'outra origem'} ({_rs(custo)})"
         else:
             mudanca = vd
+        # v3.110 — telemetria do bot: tempo, tokens e custo. Item copiado do
+        # cache dele carrega a telemetria da pesquisa original — marcado, pra
+        # não contar o custo duas vezes.
+        tel = pr.get("telemetria") if isinstance(pr.get("telemetria"), dict) else {}
+        do_cache = bool(tel.get("cache_de"))
+        tokens = tel.get("tokens") or ((tel.get("tokens_entrada") or 0) + (tel.get("tokens_saida") or 0)) or None
+        custo_usd = tel.get("custo_usd")
+        tempo_s = round(tel["tempo_ms"] / 1000, 1) if tel.get("tempo_ms") else None
         itens.append({
             "data": _dia_brt(v["criado_em"]), "exportado_em": v["criado_em"], "motor": v["motor"],
             "proposta": p.get("numero_proposta"), "rascunho": p.get("numero_rascunho"),
@@ -7184,7 +7217,9 @@ async def pesquisa_desempenho(motor: str = "kistbot", de: str = "", ate: str = "
             "veredito": vd, "categoria": _CATEGORIA_VEREDITO.get(vd, "outra"),
             "loja_bot": loja_bot, "preco_bot": preco_bot, "link_bot": link_bot,
             "usada": usada, "custo_final": custo, "link_final": link_final,
-            "diferenca_pct": dif, "mudanca": mudanca})
+            "diferenca_pct": dif, "mudanca": mudanca,
+            "tempo_s": tempo_s, "tokens": tokens, "custo_usd": custo_usd,
+            "modelo": tel.get("modelo"), "do_cache": do_cache})
 
     def _grupos(chave):
         g = {}
@@ -7210,6 +7245,16 @@ async def pesquisa_desempenho(motor: str = "kistbot", de: str = "", ate: str = "
               f"{r['total']} itens em {r['propostas']} propostas · usadas {r['usadas']} ({r['taxa_uso']}%) · "
               f"corrigidas {r['corrigidas']} (troca de loja {r['corrigidas_troca']}, preço {r['corrigidas_preco']}) · "
               f"sem oferta {r['sem_oferta']} · uso quando trouxe oferta {r['taxa_uso_com_oferta']}%"]
+    if r.get("custo_usd_total") is not None:
+        linhas.append(f"Custo (só itens que informaram, sem cache): US$ {r['custo_usd_total']} em "
+                      f"{r['itens_com_custo']} itens · US$ {r['custo_por_item_usd']} por item · "
+                      f"US$ {r['custo_por_usada_usd'] if r['custo_por_usada_usd'] is not None else '—'} por busca USADA"
+                      + (f" · {r['tokens_total']} tokens" if r.get("tokens_total") else "")
+                      + (f" · tempo médio {r['tempo_medio_s']} s" if r.get("tempo_medio_s") is not None else ""))
+    else:
+        linhas.append("Custo: sem custo informado — mande tokens_entrada/tokens_saida/custo_usd na "
+                      "telemetria de cada item (GET /api/guia/pesquisa-retorno)."
+                      + (f" Tempo médio {r['tempo_medio_s']} s." if r.get("tempo_medio_s") is not None else ""))
     if len(por_dia) > 1:
         linhas.append("Por dia: " + " | ".join(
             f"{d['data']} {d['total']} itens, {d['usadas']} usadas, {d['corrigidas']} corrigidas, {d['sem_oferta']} sem oferta"
@@ -7245,8 +7290,11 @@ async def pesquisa_resultado_receber(ref: str, payload: dict,
         "ofertas": [{"loja","link","preco_pix","preco_cheio","estoque","pn",
                      "fabricante","sku","frete","prazo","obs"}],
         "escolha": 0,
-        "telemetria": {"tempo_ms", "buscas", "paginas"}}]}
+        "telemetria": {"tempo_ms", "buscas", "paginas",
+                       "tokens_entrada", "tokens_saida", "custo_usd", "modelo"}}]}
     A primeira oferta (ou a indicada em `escolha`) é a recomendada.
+    `telemetria` é opcional; tokens e custo_usd alimentam o custo por busca
+    usada em GET /pesquisa/desempenho (item do seu próprio cache: custo_usd 0).
     Um item só, sem lista `ofertas`, também é aceito (campos no próprio item).
     """
     if not isinstance(payload, dict):

@@ -36,6 +36,7 @@ const hojeBRT = () => new Date().toLocaleDateString("en-CA", { timeZone: "Americ
 const diaBR = (iso) => (iso ? iso.split("-").reverse().slice(0, 2).join("/") : "—");
 const pct = (v) => (v == null ? "—" : `${String(v).replace(".", ",")}%`);
 const reais = (v) => (v ? `R$ ${brl(v)}` : "—");
+const usd = (v) => (v == null ? "—" : `US$ ${Number(v).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 4 })}`);
 
 function Loja({ nome, link }) {
   if (!nome && !link) return <div className="text-ink">—</div>;
@@ -220,6 +221,14 @@ export default function Desempenho({ token, apiUrl }) {
                   detalhe={`${pct(r.taxa_sem_oferta)} · você achou sozinho`} />
                 <Tile rotulo="Uso quando trouxe oferta" valor={pct(r.taxa_uso_com_oferta)}
                   detalhe={`${r.total - r.sem_oferta} itens com oferta`} />
+                {/* v3.110 — só aparece quando o bot informa custo na telemetria. */}
+                {r.custo_usd_total != null ? (
+                  <Tile rotulo="Custo por busca usada" valor={usd(r.custo_por_usada_usd)}
+                    detalhe={`${usd(r.custo_usd_total)} em ${r.itens_com_custo} itens · ${usd(r.custo_por_item_usd)} por item${r.tempo_medio_s != null ? ` · ${String(r.tempo_medio_s).replace(".", ",")} s` : ""}`} />
+                ) : (
+                  <Tile rotulo="Custo por busca usada" valor="—" tom="text-faint"
+                    detalhe={`sem custo informado pelo bot${r.tempo_medio_s != null ? ` · tempo médio ${String(r.tempo_medio_s).replace(".", ",")} s` : ""}`} />
+                )}
               </div>
               <div className="mt-3"><Barra r={r} /></div>
 
@@ -261,7 +270,17 @@ export default function Desempenho({ token, apiUrl }) {
                             <div className="max-w-[160px] truncate text-[11px] text-faint" title={x.cliente}>{x.cliente}</div>
                             <div className="text-[10.5px] text-faint">{OPERADORES.find((o) => o.v === x.operador)?.r || x.operador}{x.origem_proposta === "email" ? " · e-mail" : ""}</div>
                           </td>
-                          <td className="min-w-[200px] max-w-[280px] px-3 py-2 text-ink">{x.item}</td>
+                          <td className="min-w-[200px] max-w-[280px] px-3 py-2 text-ink">
+                            {x.item}
+                            {(x.tempo_s != null || x.custo_usd != null) && (
+                              <div className="mt-0.5 font-mono text-[10.5px] text-faint">
+                                {x.tempo_s != null ? `${String(x.tempo_s).replace(".", ",")} s` : ""}
+                                {x.custo_usd != null ? ` · ${usd(x.custo_usd)}` : ""}
+                                {x.tokens ? ` · ${x.tokens.toLocaleString("pt-BR")} tk` : ""}
+                                {x.do_cache ? " · cache" : ""}
+                              </div>
+                            )}
+                          </td>
                           <td className="px-3 py-2">
                             <Loja nome={x.loja_bot} link={x.link_bot} />
                             <div className="font-mono text-[11px] text-sub">{reais(x.preco_bot)}</div>
@@ -294,6 +313,7 @@ export default function Desempenho({ token, apiUrl }) {
           <div className="mt-6 space-y-1 text-[11.5px] leading-relaxed text-faint">
             <p><b className="text-sub">Como conta:</b> o veredito nasce quando a proposta é exportada pro Tiny, comparando o que o bot recomendou com o que saiu. Reexportar substitui o veredito anterior. Preços unitários, de custo.</p>
             <p><b className="text-sub">Corrigida</b> = trocou de loja, ou manteve a loja com custo mais de 15% longe do preço do bot. <b className="text-sub">Bot não achou</b> = o bot não trouxe oferta e o item saiu com origem mesmo assim.</p>
+            <p><b className="text-sub">Custo:</b> só entra se o bot mandar tokens e <span className="font-mono">custo_usd</span> na telemetria de cada item; item vindo do cache dele não conta. "Por busca usada" é o custo total dividido pelas buscas que saíram como vieram.</p>
             <p><b className="text-sub">Pros bots:</b> <span className="font-mono">GET /pesquisa/desempenho?de=AAAA-MM-DD&ate=AAAA-MM-DD</span> (ou <span className="font-mono">dias=7</span>, ou nada = compilado). <span className="font-mono">formato=texto</span> devolve texto curto.</p>
           </div>
         </>

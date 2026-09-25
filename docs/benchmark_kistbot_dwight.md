@@ -139,7 +139,7 @@ O operador trocou por **preço menor** em 5 dos 6 casos (Painel LED: 37,90 → 2
 
 ## 7. O que a Cabine não mede (ainda)
 
-- **Custo por busca.** O bot manda tempo, número de buscas e páginas abertas (mediana de 70 s por item, 1,2 buscas, 1,6 páginas), mas **não manda tokens nem custo em dólar**. Sem isso não dá pra calcular custo por busca usada, que é o número que diz se o bot se paga. Pedido: incluir `tokens_entrada`, `tokens_saida`, `custo_usd` e `modelo` na `telemetria` de cada retorno — a Cabine será ajustada para guardar e mostrar.
+- **Custo por busca — a Cabine já está pronta, falta o bot mandar.** Hoje o bot manda tempo, número de buscas e páginas abertas (mediana de 70 s por item, 1,2 buscas, 1,6 páginas), mas **não manda tokens nem custo em dólar**. Desde a v3.110 a Cabine aceita, na `telemetria` de cada item do retorno, `tokens_entrada`, `tokens_saida`, `custo_usd` e `modelo`, e calcula **custo por busca usada** (custo total ÷ buscas que saíram como vieram) — o número que diz se o bot se paga. Aparece na tela Desempenho e no `resumo` da API (`custo_usd_total`, `custo_por_item_usd`, `custo_por_usada_usd`, `tokens_total`, `tempo_medio_s`). Regras: some entrada e saída de todas as chamadas de modelo daquele item; item que veio do seu próprio cache → `custo_usd: 0`; a Cabine não estima nada — sem os campos, mostra "sem custo informado". Contrato completo: `GET /api/guia/pesquisa-retorno`.
 - **Compra.** Existe um segundo momento de veredito, na criação da ordem de compra (`momento=compra`) — sinal mais forte que a proposta, porque é dinheiro saindo. Ainda tem poucos dados.
 - **Vereditos anteriores a 25/09** foram recalculados pelo estado atual do item; os novos guardam o retrato do momento da exportação.
 
