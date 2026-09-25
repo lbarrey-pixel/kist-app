@@ -1981,8 +1981,11 @@ export function pixDaOferta(of) {
 }
 export function precoDivergente(of) {
   if (!of) return false;
-  if (of.preco_divergente || of.preco_pix_descartado != null) return true;
+  // v3.104 — Pix ≈ cheio (diferença < 1 centavo) nunca é divergência, mesmo com
+  // flag antiga ou obs falando em OCR/outlier: o dinheiro bate, não há o que confirmar.
   const pix = pixDaOferta(of), cheio = Number(of.preco_cheio);
+  if (pix > 0 && cheio > 0 && Math.abs(pix - cheio) < 0.01) return false;
+  if (of.preco_divergente || of.preco_pix_descartado != null) return true;
   if (!(pix > 0) || !(cheio > 0)) return false;
   if (pix < cheio * (1 - PIX_DIVERGENCIA_MAX)) return true;
   return /ocr|outlier/i.test(String(of.obs || ""));

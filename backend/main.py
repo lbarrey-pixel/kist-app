@@ -120,7 +120,8 @@ from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_
 # v3.101 — dois achados testando o disparo do Dwight de verdade: (1) a chave de API que o monitor de e-mail usava tinha o prefixo errado ("kist_" em vez de "kist_sk_", exigido por API_KEY_PREFIXO) — todo disparo falhava 401 em silêncio, nenhuma das propostas automáticas tinha pesquisa rodando; corrigido o hash da chave. (2) regra do Leonardo: automação sempre usa o motor KistBot Dwight (/pesquisa-kistbot-dwight), não o Dwight "normal" (/pesquisa-dwight) — email_monitor.py corrigido pro motor certo.
 # v3.102 — regra do Leonardo: motor Dwight "normal" desativado em toda a Cabine (não removido — DWIGHT_MOTOR_ATIVO=1 no Render liga de volta sem mexer em código). `_motores()` reporta url/key vazios pra ele, então a tela já desativa o botão sozinha (mesmo mecanismo do KistBot antes do túnel) e qualquer disparo direto na API cai no 503 de "não configurada". Frontend: botão "Dwight" cinza, pesquisa por item individual e o padrão da função passaram a usar KistBot.
 # v3.103 — só frontend: badge "✉ Revisar" (Propostas) ficava presa depois de exportar pro Tiny, porque checava `status === "rascunho"` — exportar não muda o status, quem muda é `tiny_numero`. Badge e filtro "Só pra revisar" passaram a checar `!tiny_numero`. `assunto_email` das 4 propostas de hoje (criadas antes desse campo existir) preenchido retroativamente a partir do log do monitor.
-VERSAO_BACKEND = "3.103"
+# v3.104 — chamado #21 (Leonardo): dois bugs. (1) Pix ≈ cheio (diferença < 1 centavo, caso real 860/860 com obs "[preço: ocr]") ainda entrava como "Pix e cheio divergentes" e travava o auto-load de custo — `precoDivergente`/`_preco_divergente` (espelho) agora checam a igualdade ANTES da flag/regra de 35%/OCR-outlier. (2) `sku_fornecedor` (pode ser MLB*/SKU de marketplace, ex. prévia 1051038 -> codigo=MLB25347515) ia pro `item.codigo` da proposta Tiny, visível no PDF/portal do cliente — `_sku_tiny` agora usa `codigo_cliente` (código do item no ERP do cliente) ou a descrição; `sku_fornecedor` fica só interno da Cabine, nunca mais vai ao Tiny.
+VERSAO_BACKEND = "3.104"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -2065,10 +2066,13 @@ def tiny_teste(caminho: str = "/contatos", cru: int = 0, limite: int = 1,
 # Prévia e exportação usam a MESMA modelagem — o que a prévia mostra é o que sai.
 
 def _sku_tiny(it: dict, i: int) -> str:
-    """Código do produto no Tiny. SKU do fornecedor vence; sem ele, deriva da
-    descrição — TRUNCADO: um código de 47 caracteres derrubou a proposta 1050862.
-    Derivado do ITEM (não do cliente) para o mesmo produto compartilhar código."""
-    s = (it.get("sku_fornecedor") or "").strip()
+    """Código do produto no Tiny. `codigo_cliente` (o código do item no ERP DO
+    CLIENTE) vence; sem ele, deriva da descrição — TRUNCADO: um código de 47
+    caracteres derrubou a proposta 1050862.
+    v3.104 (chamado #21, prévia 1051038 saiu com codigo=MLB25347515): `sku_fornecedor`
+    é interno da Cabine — pode ser MLB*/SKU de loja/marketplace — e NUNCA entra aqui:
+    este código vai pro PDF/portal que o cliente vê."""
+    s = (it.get("codigo_cliente") or "").strip()
     if s:
         return s[:30]
     base = _slug_agente(it.get("descricao_final") or it.get("descricao_original") or "")
@@ -2178,11 +2182,13 @@ _CAMPOS_TINY = [
      "obrigatorio": False, "limite": 6, "formato": "Sigla de até 6 letras. Em branco vira UN.",
      "exemplos": ["UN", "M", "PC", "CX", "KG", "RL"], "no_tiny": "Unidade do produto.",
      "prefixos_tiny": ["itens.unidade", "unidade"]},
-    {"campo": "itens[].sku_fornecedor", "rotulo": "Código (SKU) do item", "destino": "produto.sku",
+    {"campo": "itens[].codigo_cliente", "rotulo": "Código (SKU) do item", "destino": "produto.sku",
      "obrigatorio": False, "limite": 30,
-     "formato": "Até 30 caracteres. Em branco, a Cabine gera a partir da descrição. "
+     "formato": "Até 30 caracteres — só preencha com o código do item no ERP DO PRÓPRIO CLIENTE. "
+                "Em branco, a Cabine gera a partir da descrição. sku_fornecedor é interno da Cabine "
+                "e NUNCA vai para cá (pode ser MLB*/SKU de marketplace — apareceria no PDF do cliente). "
                 "Código repetido em itens diferentes ganha sufixo -2, -3.",
-     "exemplos": ["CAT6AZ", "A2883FS4PRO"], "no_tiny": "Código do produto no catálogo do Tiny.",
+     "exemplos": ["UC.107572", "MAT-4471"], "no_tiny": "Código do produto no catálogo do Tiny.",
      "prefixos_tiny": ["sku", "codigo"]},
 ]
 _CAMPOS_TINY_POR_NOME = {c["campo"]: c for c in _CAMPOS_TINY}
@@ -6140,6 +6146,10 @@ def _preco_divergente(pix, cheio, obs="") -> bool:
     except (TypeError, ValueError):
         return False
     if not (pix > 0 and cheio > 0):
+        return False
+    # v3.104 — Pix ≈ cheio (diferença < 1 centavo) nunca é divergência, mesmo com
+    # obs falando em OCR/outlier: o dinheiro bate, não há o que confirmar.
+    if abs(pix - cheio) < 0.01:
         return False
     if pix < cheio * (1 - _PIX_DIVERGENCIA_MAX):
         return True
