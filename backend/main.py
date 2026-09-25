@@ -113,7 +113,8 @@ from datetime import datetime as _dt_ext, timedelta as _td_ext, timezone as _tz_
 # v3.94 — /casar-po: número da PO também reconhece "PO_12345" (underscore, comum em assunto de e-mail) e "Pedido de Compra 12345" / "Pedido de Compra Nº 12345" (sem o prefixo "PO"), além do formato antigo.
 # v3.95 — só frontend (marcador de versão + auto-update forçado quando o bundle publicado muda); o número sobe para o deploy ser conferível.
 # v3.96 — só frontend: o badge de versão da v3.95 tava discreto demais (canto da tela, baixo contraste); virou texto no rodapé da sidebar do Cabine e no cabeçalho do CRM. Mesmo marcador levado ao crm-dashboard.
-VERSAO_BACKEND = "3.96"
+# v3.97 — monitor de e-mail de cotação (email_monitor.py): entra via IMAP nos domínios de cliente conhecido, filtra assunto de cotação (validado contra 146 assuntos reais), ignora reply de thread já vista, cria a proposta (mesmo núcleo do /extrair) e aciona o Dwight — fica em "rascunho" (criado_via=email_auto) esperando revisão do Leonardo. Desligado até KIST_IMAP_HOST/USER/PASSWORD existirem no Render.
+VERSAO_BACKEND = "3.97"
 
 _API_DESC = """
 API interna da Kist Soluções. Todas as rotas (fora `/health`, `/ping` e o webhook
@@ -10791,3 +10792,13 @@ def crm_painel(dono: str = "", usuario: str = Depends(verificar_token)):
         k = l.get("estagio_funil") or "frio"
         por_estagio[k] = por_estagio.get(k, 0) + 1
     return {"total": len(linhas), "por_estagio": por_estagio}
+
+
+# ── Monitor de e-mail de cotação (v3.97) ────────────────────────────────────
+# Import tardio, aqui no fim: email_monitor.py chama `from main import
+# _extrair_nucleo` quando processa um e-mail, e essa função já existe nesse
+# ponto do carregamento do módulo. `iniciar()` não faz nada (log e sai) se
+# faltar KIST_IMAP_HOST/USER/PASSWORD no ambiente — deploy sem essas
+# variáveis continua exatamente como antes.
+import email_monitor as _email_monitor
+_email_monitor.iniciar()
